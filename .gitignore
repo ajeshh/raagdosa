@@ -4,7 +4,7 @@
 
 # Logs and reports
 logs/
-logs/sessions/
+sessions/
 *.log
 
 # Tag cache
@@ -22,25 +22,52 @@ data/
 state/
 cache/
 
+# ─────────────────────────────
 # Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# ─────────────────────────────
 
-# Virtual envs
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing / coverage
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+
+# ─────────────────────────────
+# Virtual environments
+# ─────────────────────────────
+
 .venv/
 venv/
 env/
 
-# MacOS noise
-.DS_Store
+# ─────────────────────────────
+# macOS
+# ─────────────────────────────
 
-# Editor
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─────────────────────────────
+# Editors
+# ─────────────────────────────
+
 .vscode/
 .idea/
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
+# ─────────────────────────────
+# Misc
+# ─────────────────────────────
+
+*.swp
+*.swo
