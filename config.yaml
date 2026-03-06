@@ -7,7 +7,7 @@
 
 app:
   name: RaagDosa
-  version: "3.0"
+  version: "3.5.2"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROFILES
@@ -50,6 +50,7 @@ library:
 
   singles_folder:       _Singles
   va_folder:            _Various Artists
+  mixes_folder:         _Mixes
   unknown_artist_label: _Unknown
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -132,6 +133,18 @@ scan:
   # Follow symlinks when walking the source tree.
   # false = safe default; prevents scanning outside the intended source.
   follow_symlinks: false
+
+  # ── Performance ───────────────────────────────────────────────────────
+  # Parallel workers for the scan pass. Tag reading (mutagen) is I/O-bound
+  # so threads give a real speedup. Rule of thumb: set to your drive count
+  # times 4 for SSD, or 2–4 for spinning disk.
+  # Set to 1 to disable parallelism (useful for debugging).
+  workers: 8
+
+  # Persistent tag cache. On warm runs (files unchanged since last scan),
+  # mutagen is skipped entirely — tags served from cache.
+  # Stored at logs/tag_cache.json. Manage with `raagdosa cache`.
+  tag_cache_enabled: true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INCREMENTAL SCANNING (--since)
@@ -555,3 +568,95 @@ undo:
   allow_undo_by_id:            true
   allow_undo_by_original_path: true
   allow_undo_by_session:       true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EP DETECTION  (v3.5)
+# Folders with track count in [min_tracks, max_tracks] are classified as EPs.
+# EPs stay in Clean/Albums/ but get a [EP] label in the folder name (if format.label_eps is true).
+# ──────────────────────────────────────────────────────────────────────────────
+ep_detection:
+  enabled:    true
+  min_tracks: 3
+  max_tracks: 6
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MIX / CHART DETECTION  (v3.5)
+# Folders that match mix-related keywords OR have a high unique-artist ratio
+# get routed to Clean/_Mixes/ instead of Clean/Albums/.
+# ──────────────────────────────────────────────────────────────────────────────
+mix_detection:
+  enabled: true
+
+  # Folder name keywords that trigger mix classification (case-insensitive, word-boundary).
+  # These supplement the built-in patterns like "mixtape", "presents", "sessions", etc.
+  folder_name_keywords:
+    - "compiled by"
+    - "mixed by"
+    - "essentials"
+    - "selections"
+
+  # If the ratio of unique artists to total tracks exceeds this, classify as mix.
+  # 0.65 = more than 65% of tracks have distinct artists → likely a mix.
+  unique_artist_ratio_mix: 0.65
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TITLE CASE  (v3.5)
+# Controls intelligent capitalisation fixes applied to album names and titles.
+# Only fires when the input is ALL-CAPS or all-lowercase.
+# ──────────────────────────────────────────────────────────────────────────────
+title_case:
+  # Words that should never be capitalised (unless first word in the string).
+  # These are added to the built-in small-word list (a, an, the, and, but, or…).
+  never_cap:
+    - "feat."
+    - "vs."
+    - "b/w"
+
+  # Words that should always be in a specific case.
+  # Add DJ, MC, UK, etc. — the code will uppercase these when length ≤ 3.
+  always_cap:
+    - "DJ"
+    - "MC"
+    - "UK"
+    - "US"
+    - "NY"
+    - "LA"
+    - "EP"
+    - "LP"
+    - "II"
+    - "III"
+    - "IV"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FORMAT LABELLING  (v3.5 additions)
+# ──────────────────────────────────────────────────────────────────────────────
+format:
+  # Append "[EP]" to the proposed folder name when a folder is detected as an EP.
+  label_eps: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GARBAGE NAMING  (v3.5)
+# Controls how aggressively bracket stacks and noise tokens are removed from
+# album/folder names during proposal building.
+# ──────────────────────────────────────────────────────────────────────────────
+garbage_naming:
+  # Strip trailing noise/promo/format bracket groups from album names.
+  strip_bracket_stack: true
+
+  # Token flood threshold: flag names with this many parenthetical groups or more.
+  token_flood_threshold: 5
+
+  # Strip display-upload noise like "(Official Audio)", "[HD]", "(Lyrics)" from
+  # album and track titles.
+  strip_display_noise: true
+
+  # Strip disc/volume indicators from album names before voting.
+  # E.g. "Mezzanine - Disc 1" → "Mezzanine" for normalised comparison.
+  strip_disc_indicators: true
+
+  # Streaming batch size: how many folders to scan before starting to apply.
+  # Smaller = first moves appear sooner. Larger = fewer apply interruptions.
+  # 50 is a good default. Use 1 for maximum responsiveness (every folder
+  # is moved as soon as it is scanned). Use 0 or omit to disable streaming
+  # (scan-all-then-apply, legacy behaviour).
+  streaming_batch_size: 50

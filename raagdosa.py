@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-RaagDosa v3.0
+RaagDosa v3.5
 Deterministic library cleanup for DJ music folders — CLI-first, safe-by-default, undoable.
 
 Commands:
   go / run / scan / apply / folders / tracks / resume
   show / verify / learn / init / status / report
   profile / history / undo / doctor
+  orphans / artists / review-list / clean-report
+  extract / compare / diff
 """
 from __future__ import annotations
 
-import argparse, csv, dataclasses, datetime as dt, hashlib, html
+import argparse, csv, dataclasses, datetime as dt, fnmatch, hashlib, html
 import json, os, platform, re, shutil, signal, sys, unicodedata, uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
@@ -26,7 +30,7 @@ try:
 except Exception:
     MutagenFile = None
 
-APP_VERSION = "3.0"
+APP_VERSION = "3.5.2"
 
 # ─────────────────────────────────────────────
 # Output / colour / verbosity
@@ -75,16 +79,33 @@ class Progress:
     def __init__(self,total:int,label:str="Scanning"):
         self.total=total; self.current=0; self.label=label
         self._active=_IS_TTY and _verbosity>=NORMAL
+        self._lock=Lock()
+        self._start=dt.datetime.now()
     def tick(self,msg:str="")->None:
-        self.current+=1
-        if not self._active: return
-        pct=int(self.current/max(self.total,1)*100)
-        bw=22; filled=int(bw*self.current/max(self.total,1))
-        bar="█"*filled+"░"*(bw-filled)
-        line=f"\r{C.CYAN}{self.label}{C.RESET} [{bar}] {self.current}/{self.total} {pct}%  {C.DIM}{msg[:35]:<35}{C.RESET}"
-        print(line,end="",flush=True)
+        with self._lock:
+            self.current+=1
+            if not self._active: return
+            pct=int(self.current/max(self.total,1)*100)
+            bw=22; filled=int(bw*self.current/max(self.total,1))
+            bar="█"*filled+"░"*(bw-filled)
+            # ETA calculation
+            elapsed=(dt.datetime.now()-self._start).total_seconds()
+            rate=self.current/elapsed if elapsed>0 else 0
+            remaining=self.total-self.current
+            eta_s=remaining/rate if rate>0 else 0
+            if eta_s>3600:   eta=f"~{eta_s/3600:.0f}h"
+            elif eta_s>60:   eta=f"~{eta_s/60:.0f}m"
+            elif eta_s>0:    eta=f"~{eta_s:.0f}s"
+            else:            eta=""
+            rate_s=f"{rate:.0f}/s" if rate>=1 else f"{rate*60:.0f}/min"
+            line=(f"\r{C.CYAN}{self.label}{C.RESET} [{bar}] {self.current}/{self.total} {pct}%"
+                  f"  {C.DIM}{rate_s}  {eta}  {msg[:28]:<28}{C.RESET}")
+            print(line,end="",flush=True)
     def done(self)->None:
-        if self._active: print()
+        if self._active:
+            elapsed=(dt.datetime.now()-self._start).total_seconds()
+            rate=self.current/elapsed if elapsed>0 else 0
+            print(f"  {C.DIM}({elapsed:.1f}s, {rate:.0f} folders/s){C.RESET}")
 
 # ─────────────────────────────────────────────
 # Graceful stop (SIGINT)
@@ -166,6 +187,102 @@ def folder_mtime(path:Path)->float:
     try: return path.stat().st_mtime
     except Exception: return 0.0
 
+def file_mtime(path:Path)->float:
+    try: return path.stat().st_mtime
+    except Exception: return 0.0
+
+# ─────────────────────────────────────────────
+# Tag cache — persisted between runs
+# ─────────────────────────────────────────────
+# Cache key: absolute path string
+# Cache value: {"mtime": float, "tags": dict}
+# Invalidated whenever the file's mtime changes.
+# Written atomically after each scan pass.
+
+class TagCache:
+    """
+    Persistent tag cache. Keyed by absolute path → {mtime, tags}.
+    Thread-safe for concurrent reads/writes during parallel scan.
+    """
+    def __init__(self,cache_path:Path):
+        self._path=cache_path
+        self._lock=Lock()
+        self._dirty=False
+        self._data:Dict[str,Any]={}
+        self._load()
+
+    def _load(self)->None:
+        if not self._path.exists(): return
+        try:
+            raw=read_json(self._path)
+            # Support versioned format
+            self._data=raw.get("entries",raw) if isinstance(raw,dict) else {}
+        except Exception:
+            self._data={}
+
+    def get(self,path:Path)->Optional[Dict[str,Optional[str]]]:
+        """Return cached tags if file mtime matches, else None."""
+        key=str(path.resolve())
+        mtime=file_mtime(path)
+        with self._lock:
+            entry=self._data.get(key)
+        if entry and abs(entry.get("mtime",0)-mtime)<0.01:
+            return entry["tags"]
+        return None
+
+    def set(self,path:Path,tags:Dict[str,Optional[str]])->None:
+        """Store tags for path with current mtime."""
+        key=str(path.resolve())
+        mtime=file_mtime(path)
+        with self._lock:
+            self._data[key]={"mtime":mtime,"tags":tags}
+            self._dirty=True
+
+    def save(self)->None:
+        """Flush cache to disk if dirty. Atomic write via temp file."""
+        with self._lock:
+            if not self._dirty: return
+            tmp=self._path.with_suffix(".tmp")
+            try:
+                ensure_dir(self._path.parent)
+                payload={"version":APP_VERSION,"saved":now_iso(),"entries":self._data}
+                tmp.write_text(json.dumps(payload,ensure_ascii=False,separators=(',',':')),encoding="utf-8")
+                tmp.replace(self._path)
+                self._dirty=False
+            except Exception as e:
+                try: tmp.unlink(missing_ok=True)
+                except Exception: pass
+
+    def evict_missing(self)->int:
+        """Remove entries for files that no longer exist. Returns count removed."""
+        removed=0
+        with self._lock:
+            keys=list(self._data.keys())
+        for k in keys:
+            if not Path(k).exists():
+                with self._lock:
+                    self._data.pop(k,None); removed+=1
+                self._dirty=True
+        return removed
+
+    @property
+    def size(self)->int:
+        with self._lock: return len(self._data)
+
+# Module-level cache singleton — initialised in scan_folders
+_tag_cache:Optional["TagCache"]=None
+
+def _get_tag_cache(cfg:Dict[str,Any])->Optional["TagCache"]:
+    global _tag_cache
+    if _tag_cache is not None: return _tag_cache
+    if not cfg.get("scan",{}).get("tag_cache_enabled",True): return None
+    cache_path=Path(cfg.get("logging",{}).get("root_dir","logs"))/"tag_cache.json"
+    _tag_cache=TagCache(cache_path)
+    return _tag_cache
+
+def reset_tag_cache()->None:
+    global _tag_cache; _tag_cache=None
+
 # ─────────────────────────────────────────────
 # Artist normalisation
 # ─────────────────────────────────────────────
@@ -226,14 +343,447 @@ def artists_are_same(a:str,b:str,cfg:Dict[str,Any])->bool:
     return len(aset&bset)/len(aset|bset)>=thresh
 
 # ─────────────────────────────────────────────
+# Windows reserved filename sanitisation
+# ─────────────────────────────────────────────
+_WINDOWS_RESERVED = {
+    "CON","PRN","AUX","NUL",
+    "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+    "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9",
+}
+
+def sanitize_windows_reserved(name:str)->str:
+    """Append underscore if name (sans extension) is a Windows reserved word."""
+    stem=Path(name).stem.upper()
+    if stem in _WINDOWS_RESERVED: return name+"_"
+    return name
+
+# ─────────────────────────────────────────────
+# Extension case normalisation
+# ─────────────────────────────────────────────
+def normalise_extension(path:Path)->Optional[Path]:
+    """Return new Path with lowercase extension if it needs renaming, else None."""
+    if path.suffix and path.suffix != path.suffix.lower():
+        return path.with_suffix(path.suffix.lower())
+    return None
+
+# ─────────────────────────────────────────────
+# Empty parent cleanup
+# ─────────────────────────────────────────────
+def cleanup_empty_parents(start:Path,stop_at:Path)->None:
+    """Remove start and then any empty ancestor directories up to (not including) stop_at."""
+    current=start
+    while True:
+        if current==stop_at or current==current.parent: break
+        try:
+            if current.exists() and not any(current.iterdir()):
+                current.rmdir()
+                current=current.parent
+            else:
+                break
+        except Exception:
+            break
+
+# ─────────────────────────────────────────────
+# Bracket content classifier
+# ─────────────────────────────────────────────
+_BRACKET_YEAR   = re.compile(r'^(19|20)\d{2}$')
+_BRACKET_FORMAT = re.compile(r'\b(mp3|flac|aac|ogg|wav|aiff|320|256|192|128|lossless|hi.?res|24.?bit|vinyl|vinyl.?rip|web|cd|dvd)\b',re.I)
+_BRACKET_EDITION= re.compile(r'\b(deluxe|expanded|anniversary|remaster(ed)?|special|bonus|collector|limited|explicit|censored|edition|version|complete|extended|import|original)\b',re.I)
+_BRACKET_REMIX  = re.compile(r'\b(remix|edit|mix|rework|bootleg|mashup|vip|flip|dub|club|radio|instrumental|acapella|version)\b',re.I)
+_BRACKET_PROMO  = re.compile(r'www\.|\.com|\.net|\.org|free\s+download|promo\s+only|for\s+promo|not\s+for\s+sale|leaked|rip|ripped|uploaded|download',re.I)
+_BRACKET_NOISE  = re.compile(r'^\s*(hd|hq|\d+k|\d+\s*hz|\d+\s*kbps|stereo|mono|clean|dirty)\s*$',re.I)
+
+def classify_bracket(text:str)->str:
+    """Classify a bracket group's contents: year|format|edition|remix|promo|noise"""
+    t=text.strip()
+    if _BRACKET_YEAR.match(t):              return "year"
+    if _BRACKET_PROMO.search(t):            return "promo"
+    if _BRACKET_FORMAT.search(t):           return "format"
+    if _BRACKET_EDITION.search(t):          return "edition"
+    if _BRACKET_REMIX.search(t):            return "remix"
+    if _BRACKET_NOISE.match(t):             return "noise"
+    return "unknown"
+
+# ─────────────────────────────────────────────
+# Mojibake detection
+# ─────────────────────────────────────────────
+_MOJIBAKE_CHARS = set('ÃÂ€„†‡ˆ‰Šš›œžŸ¡¢£¤¥¦§¨©ª«¬\xad®¯°±²³´µ¶·¸¹º»¼½¾¿')
+_MOJIBAKE_SEQ   = re.compile(r'Ã[\x80-\xff]|Â[\x80-\xff]',re.S)
+
+def detect_mojibake(s:str)->bool:
+    """True if the string likely contains double-encoded or misencoded Unicode."""
+    if not s: return False
+    if _MOJIBAKE_SEQ.search(s): return True
+    return sum(1 for c in s if c in _MOJIBAKE_CHARS) >= 3
+
+# ─────────────────────────────────────────────
+# Garbage naming detection
+# ─────────────────────────────────────────────
+_PROMO_WATERMARK = re.compile(
+    r'www\.|\.com\b|\.net\b|\.org\b|free\s+download|promo\s+only|not\s+for\s+sale|'
+    r'leaked|visit\s+us|check\s+out|follow\s+us|\bvk\.com\b|\bsoundcloud\.com\b',
+    re.I)
+
+def detect_garbage_name(name:str)->List[str]:
+    """Return list of garbage reasons (empty = clean). Does not modify the name."""
+    reasons:List[str]=[]
+    # Token flood: 5+ parenthetical/bracket groups
+    groups=re.findall(r'[\[\(][^\[\]\(\)]*[\]\)]',name)
+    if len(groups)>=5: reasons.append("token_flood")
+    # Promo watermarks
+    if _PROMO_WATERMARK.search(name): reasons.append("promo_watermark")
+    # Mojibake
+    if detect_mojibake(name): reasons.append("mojibake")
+    # All-caps + very long (shouting noise filenames)
+    words=[w for w in name.split() if w.isalpha()]
+    if len(words)>=4 and all(w.isupper() for w in words) and len(name)>60:
+        reasons.append("all_caps_long")
+    return reasons
+
+def strip_bracket_stack(name:str,max_passes:int=8)->str:
+    """Repeatedly strip trailing bracket groups classified as noise/promo."""
+    result=name.strip()
+    for _ in range(max_passes):
+        m=re.search(r'\s*[\[\(]([^\[\]\(\)]*)[\]\)]\s*$',result)
+        if not m: break
+        cls=classify_bracket(m.group(1))
+        if cls in ("noise","promo","format"):
+            result=result[:m.start()].strip()
+        else:
+            break
+    return result
+
+# ─────────────────────────────────────────────
+# Display name noise stripping
+# ─────────────────────────────────────────────
+_DISPLAY_NOISE_PATTERNS=[
+    re.compile(r'\s*\[official\s+(?:audio|video|music\s+video)\]\s*$',re.I),
+    re.compile(r'\s*\(official\s+(?:audio|video|music\s+video)\)\s*$',re.I),
+    re.compile(r'\s*-\s*official\s+(?:audio|video|music\s+video)\s*$',re.I),
+    re.compile(r'\s*\[(?:hd|hq|4k|1080p|720p)\]\s*$',re.I),
+    re.compile(r'\s*\((?:lyrics?|lyric\s+video)\)\s*$',re.I),
+    re.compile(r'\s*\[(?:lyrics?|lyric\s+video)\]\s*$',re.I),
+    re.compile(r'\s*-\s*lyrics?\s*$',re.I),
+]
+
+def strip_display_noise(name:str)->str:
+    """Strip common display/upload noise suffixes from album/track names."""
+    result=name
+    for pat in _DISPLAY_NOISE_PATTERNS:
+        result=pat.sub('',result).strip()
+    return result
+
+# ─────────────────────────────────────────────
+# Disc indicator stripping from album names
+# ─────────────────────────────────────────────
+_DISC_INDICATOR=re.compile(r'\s*[-–—:,]\s*(?:disc|cd|disk|volume|vol\.?)\s*\d+\s*$',re.I)
+_DISC_INDICATOR2=re.compile(r'\s*\((?:disc|cd|disk|volume|vol\.?)\s*\d+\)\s*$',re.I)
+_DISC_INDICATOR3=re.compile(r'\s*\[(?:disc|cd|disk|volume|vol\.?)\s*\d+\]\s*$',re.I)
+
+def strip_disc_indicator(album_name:str)->str:
+    """Remove trailing disc/cd/vol indicators from an album name for unified matching."""
+    s=album_name
+    for pat in (_DISC_INDICATOR,_DISC_INDICATOR2,_DISC_INDICATOR3):
+        s=pat.sub('',s).strip()
+    return s
+
+# ─────────────────────────────────────────────
+# Capitalisation pathology fixes
+# ─────────────────────────────────────────────
+def apply_title_case(s:str,cfg:Dict[str,Any])->str:
+    """
+    Apply intelligent title-casing with configurable exceptions.
+    Handles: ALL CAPS, all lowercase, Every Word Capitalised (over-casing).
+    Respects title_case.never_cap and title_case.always_cap lists from config.
+    """
+    if not s: return s
+    tc=cfg.get("title_case",{})
+    never:Set[str]={w.lower() for w in (tc.get("never_cap",[]) or [])}
+    always:Set[str]={w.lower() for w in (tc.get("always_cap",[]) or [])}
+
+    # Default small words (never-cap unless first word)
+    _default_small={"a","an","the","and","but","or","for","nor","on","at","to","by","in","of","vs","via","feat","feat."}
+    never=never | _default_small
+
+    words=s.split()
+    if not words: return s
+
+    # Detect pathologies
+    alpha_words=[w for w in words if any(c.isalpha() for c in w)]
+    if not alpha_words: return s
+    is_all_caps=all(w.isupper() for w in alpha_words if len(w)>1)
+    is_all_lower=all(w.islower() for w in alpha_words)
+
+    if not (is_all_caps or is_all_lower): return s  # already mixed — leave alone
+
+    result=[]
+    for i,word in enumerate(words):
+        w_lower=word.lower()
+        # Strip leading/trailing punct to check the word
+        core=re.sub(r'^[^\w]+|[^\w]+$','',word)
+        core_lower=core.lower()
+        if core_lower in always:
+            result.append(word.upper() if len(core)<=3 else word[0:word.index(core)]+core.upper()+word[word.index(core)+len(core):])
+        elif i==0 or core_lower not in never:
+            # Capitalise
+            if core:
+                idx=word.index(core)
+                result.append(word[:idx]+core[0].upper()+core[1:].lower()+word[idx+len(core):])
+            else:
+                result.append(word)
+        else:
+            result.append(word.lower())
+    return " ".join(result)
+
+# ─────────────────────────────────────────────
+# Vinyl track notation (A1/B2/C3)
+# ─────────────────────────────────────────────
+_VINYL_RE=re.compile(r'^([A-Da-d])(\d{1,2})$')
+
+def parse_vinyl_track(s:str)->Optional[Tuple[str,int,int]]:
+    """
+    Parse vinyl side-track notation like A1, B2, C3.
+    Returns (side_letter, side_track_num, absolute_track_num) or None.
+    Absolute: A1=1, A2=2 … A8=8, B1=9 … B8=16, C1=17 …
+    """
+    m=_VINYL_RE.match((s or "").strip())
+    if not m: return None
+    side=m.group(1).upper(); n=int(m.group(2))
+    absolute=(ord(side)-ord('A'))*8+n
+    return side,n,absolute
+
+# ─────────────────────────────────────────────
+# EP detection
+# ─────────────────────────────────────────────
+def detect_ep(audio_files:List[Path],cfg:Dict[str,Any])->bool:
+    """True if file count falls in the EP range (default 3–6 tracks)."""
+    ep=cfg.get("ep_detection",{})
+    if not ep.get("enabled",True): return False
+    mn=int(ep.get("min_tracks",3)); mx=int(ep.get("max_tracks",6))
+    return mn<=len(audio_files)<=mx
+
+# ─────────────────────────────────────────────
+# Mix / chart folder classifier
+# ─────────────────────────────────────────────
+_MIX_FOLDER_KW=re.compile(
+    r'\b(mix(tape)?|presents|sessions?|podcast|promo\s+set|live\s+at|'
+    r'compiled\s+by|mixed\s+by|chart|top\s*\d+|best\s+of|'
+    r'greatest\s+hits|collection|discography|anthology)\b',re.I)
+
+def classify_folder_content(
+    audio_files:List[Path],
+    folder_name:str,
+    all_tags:List[Dict[str,Optional[str]]],
+    cfg:Dict[str,Any]
+)->str:
+    """
+    Returns one of: 'album' | 'va' | 'mix' | 'ep'
+    Priority: override > keyword > artist-ratio heuristic
+    """
+    mc=cfg.get("mix_detection",{}); enabled=mc.get("enabled",True)
+
+    # EP first
+    if detect_ep(audio_files,cfg): return "ep"
+
+    if not enabled: return "album"
+
+    # Folder-name keywords → mix
+    extra_kw=[k.lower() for k in (mc.get("folder_name_keywords",[]) or [])]
+    if _MIX_FOLDER_KW.search(folder_name) or any(k in folder_name.lower() for k in extra_kw):
+        return "mix"
+
+    tagged=[t for t in all_tags if any(v for v in t.values())]
+    if not tagged: return "album"
+
+    # High unique-artist ratio
+    artists=[t.get("artist","").strip().lower() for t in tagged if t.get("artist")]
+    if len(artists)>=3:
+        unique_ratio=len(set(artists))/len(artists)
+        if unique_ratio>=float(mc.get("unique_artist_ratio_mix",0.65)):
+            # Check for explicit VA albumartist tag
+            albumartists=[t.get("albumartist","").strip().lower() for t in tagged if t.get("albumartist")]
+            if albumartists:
+                aa_set=set(albumartists)
+                if any(x in aa_set for x in ["various artists","various","va","v/a"]): return "va"
+            return "mix"
+
+    return "album"
+
+# ─────────────────────────────────────────────
+# Named confidence factors
+# ─────────────────────────────────────────────
+def detect_track_gaps(track_nums:List[int])->List[int]:
+    """Return list of missing track numbers in the sequence."""
+    if len(track_nums)<2: return []
+    s=sorted(set(track_nums)); gaps=[]
+    for i in range(s[0],s[-1]+1):
+        if i not in set(s): gaps.append(i)
+    return gaps
+
+def detect_duplicate_track_numbers(track_nums:List[int])->List[int]:
+    """Return list of track numbers that appear more than once."""
+    c=Counter(track_nums)
+    return [n for n,cnt in c.items() if cnt>1]
+
+def compute_meaningful_title_ratio(titles:List[str])->float:
+    """Fraction of titles that look like real titles vs garbage/missing."""
+    if not titles: return 0.5
+    meaningful=0
+    for t in titles:
+        if not t or len(t.strip())<2: continue
+        g=detect_garbage_name(t)
+        if not g and not detect_mojibake(t): meaningful+=1
+    return meaningful/len(titles)
+
+def compute_filename_tag_consistency(
+    audio_files:List[Path],
+    all_tags:List[Dict[str,Optional[str]]]
+)->float:
+    """
+    Score 0–1 measuring how well filename stem content agrees with tag content.
+    Compares the 'Artist - Title' pattern from filenames against tags.
+    """
+    if not audio_files or not all_tags: return 0.5
+    scores:List[float]=[]
+    for f,tags in zip(audio_files,all_tags):
+        fn_artist,fn_title=_parse_fn_artitle(f.stem)
+        tag_title=(tags.get("title") or "").strip()
+        tag_artist=(tags.get("artist") or "").strip()
+        if fn_title and tag_title:
+            scores.append(string_similarity(fn_title,tag_title))
+        elif not fn_title and not tag_title:
+            scores.append(0.5)
+    return sum(scores)/len(scores) if scores else 0.5
+
+def _parse_fn_artitle(stem:str)->Tuple[Optional[str],Optional[str]]:
+    """Quick filename stem → (artist, title) without full cleanup overhead."""
+    s=re.sub(r'_-_',' - ',stem).replace('_',' ')
+    s=re.sub(r'^\d{1,3}\s*[-–—\.]\s*','',s)
+    parts=[p.strip() for p in re.split(r'\s*[-–—]\s*',s,maxsplit=1) if p.strip()]
+    if len(parts)>=2: return parts[0],parts[1]
+    return None,parts[0] if parts else None
+
+def compute_albumartist_consistency(all_tags:List[Dict[str,Optional[str]]])->float:
+    """Fraction of tagged tracks sharing the dominant albumartist."""
+    tagged=[t for t in all_tags if t.get("albumartist")]
+    if not tagged: return 0.5
+    c=Counter(t["albumartist"].strip().lower() for t in tagged)
+    _,dom_share,_=compute_dominant(c)
+    return dom_share
+
+def compute_folder_alignment_bonus(folder_name:str,proposed_name:str)->float:
+    """
+    0.0–1.0 bonus based on how closely folder_name already matches proposed_name.
+    Perfect match = 1.0, partial = proportional.
+    """
+    fn=normalize_unicode(folder_name.strip().lower())
+    pn=normalize_unicode(proposed_name.strip().lower())
+    if fn==pn: return 1.0
+    return string_similarity(fn,pn)
+
+def compute_confidence_factors(
+    audio_files:List[Path],
+    tagged:int,
+    alb_share:float,
+    aa_share:float,
+    art_share:float,
+    used_heuristic:bool,
+    folder_name:str,
+    proposed_name:str,
+    all_tags:List[Dict[str,Optional[str]]],
+)->Dict[str,float]:
+    """
+    Compute named confidence factors that replace/complement the legacy single float.
+    Returns a dict of factor_name → value (0–1 each).
+    """
+    total=len(audio_files)
+    factors:Dict[str,float]={}
+
+    # tag_coverage: what fraction of tracks have any tags
+    factors["tag_coverage"]=tagged/total if total else 0.0
+
+    # dominance: core voting quality
+    if aa_share>0:
+        factors["dominance"]=alb_share*0.60+aa_share*0.40
+    else:
+        factors["dominance"]=alb_share*0.70+art_share*0.30
+
+    # title_quality: meaningful title ratio
+    titles=[t.get("title","") for t in all_tags if t.get("title")]
+    factors["title_quality"]=compute_meaningful_title_ratio(titles) if titles else 0.5
+
+    # filename_consistency: filename stems vs tag content
+    factors["filename_consistency"]=compute_filename_tag_consistency(audio_files,all_tags)
+
+    # completeness: penalise track-number gaps and duplicates
+    track_nums:List[int]=[]
+    for t in all_tags:
+        raw=t.get("tracknumber") or ""
+        # Handle vinyl notation
+        vt=parse_vinyl_track(raw.split("/")[0].strip())
+        n=vt[2] if vt else parse_int_prefix(raw)
+        if n: track_nums.append(n)
+    gaps=detect_track_gaps(track_nums)
+    dupes=detect_duplicate_track_numbers(track_nums)
+    gap_pen=min(0.30,len(gaps)*0.06)
+    dup_pen=min(0.20,len(dupes)*0.07)
+    factors["completeness"]=max(0.0,1.0-gap_pen-dup_pen)
+    factors["track_gaps"]=len(gaps)    # informational integer stored as float
+    factors["track_dupes"]=len(dupes)
+
+    # albumartist_consistency
+    factors["aa_consistency"]=compute_albumartist_consistency(all_tags)
+
+    # folder_alignment: bonus if folder already matches proposed
+    factors["folder_alignment"]=compute_folder_alignment_bonus(folder_name,proposed_name)
+
+    return factors
+
+def confidence_from_factors(factors:Dict[str,float],used_heuristic:bool)->float:
+    """Compute a single 0–1 confidence score from the factor dict."""
+    weights={"dominance":0.40,"tag_coverage":0.15,"title_quality":0.12,
+             "filename_consistency":0.10,"completeness":0.12,
+             "aa_consistency":0.06,"folder_alignment":0.05}
+    score=sum(factors.get(k,0.5)*w for k,w in weights.items())
+    if used_heuristic: score*=0.60
+    return min(1.0,max(0.0,score))
+
+# ─────────────────────────────────────────────
+# Per-folder .raagdosa override file
+# ─────────────────────────────────────────────
+def load_folder_override(folder:Path)->Optional[Dict[str,Any]]:
+    """
+    Load a .raagdosa YAML override from inside a folder.
+    Supported keys: name, artist, album, year, skip, force_clean, confidence_boost
+    """
+    p=folder/".raagdosa"
+    if not p.exists(): return None
+    if yaml is None: return None
+    try:
+        data=yaml.safe_load(p.read_text(encoding="utf-8"))
+        return data if isinstance(data,dict) else None
+    except Exception: return None
+
+# ─────────────────────────────────────────────
+# ignore_folder_names glob support
+# ─────────────────────────────────────────────
+def folder_matches_ignore(folder_name:str,patterns:List[str])->bool:
+    """True if folder_name matches any pattern (exact or glob)."""
+    for pat in patterns:
+        if folder_name==pat or fnmatch.fnmatch(folder_name,pat): return True
+    return False
+
+# ─────────────────────────────────────────────
 # Library path template
 # ─────────────────────────────────────────────
 def resolve_library_path(base:Path,artist:str,album:str,year:Optional[int],
-                          is_flac_only:bool,is_va:bool,is_single:bool,cfg:Dict[str,Any])->Path:
+                          is_flac_only:bool,is_va:bool,is_single:bool,
+                          is_mix:bool,cfg:Dict[str,Any])->Path:
     lib=cfg.get("library",{})
     template=lib.get("template","{artist}/{album}")
     va_folder=lib.get("va_folder","_Various Artists")
     singles_folder=lib.get("singles_folder","_Singles")
+    mixes_folder=lib.get("mixes_folder","_Mixes")
     unknown=lib.get("unknown_artist_label","_Unknown")
     flac_seg=bool(lib.get("flac_segregation",False))
 
@@ -241,7 +791,8 @@ def resolve_library_path(base:Path,artist:str,album:str,year:Optional[int],
     album_c =sanitize_name(album  or "_Untitled")
     album_y =f"{album_c} ({year})" if year else album_c
 
-    if is_va:   return base/va_folder/album_y
+    if is_mix:    return base/mixes_folder/album_y
+    if is_va:     return base/va_folder/album_y
     if is_single: return base/artist_c/singles_folder
     if flac_seg and is_flac_only: return base/artist_c/"FLAC"/album_c
 
@@ -348,7 +899,49 @@ def check_folder_locked(folder:Path,exts:List[str])->List[Path]:
 
 def check_path_length(path:Path,limit:int=260)->bool: return len(str(path))<=limit
 
-def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->None:
+def _same_device(a:Path,b:Path)->bool:
+    """True if two paths are on the same filesystem device.
+    Walks up b's ancestry until finding an existing path (dest may not exist yet)."""
+    try:
+        pb=b
+        while not pb.exists():
+            parent=pb.parent
+            if parent==pb: return False  # hit filesystem root
+            pb=parent
+        return a.stat().st_dev==pb.stat().st_dev
+    except Exception:
+        return False
+
+def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->Tuple[str,float]:
+    """
+    Move src folder to dst.
+
+    Fast path (same filesystem):
+      Uses os.rename() — atomic, ~1ms regardless of folder size.
+      No copy, no verify needed (rename is guaranteed consistent by the OS).
+
+    Slow path (cross-device):
+      copytree → count+size verify → optional checksum → rmtree.
+      Only triggered when source and destination are on different drives.
+
+    Returns (method, elapsed_seconds).
+    """
+    t0=dt.datetime.now().timestamp()
+
+    if _same_device(src,dst):
+        # ── Fast path: atomic rename ──────────────────────────────────────
+        # Ensure destination parent exists
+        ensure_dir(dst.parent)
+        try:
+            src.rename(dst)
+        except OSError:
+            # rename() can still fail cross-mount even with same st_dev on some
+            # network/virtual filesystems — fall through to copy path
+            pass
+        else:
+            return "rename", dt.datetime.now().timestamp()-t0
+
+    # ── Slow path: copy → verify → delete ────────────────────────────────
     shutil.copytree(str(src),str(dst))
     sf=sorted([f for f in src.rglob("*") if f.is_file()])
     df=sorted([f for f in dst.rglob("*") if f.is_file()])
@@ -365,6 +958,7 @@ def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->None:
                 shutil.rmtree(str(dst),ignore_errors=True)
                 raise RuntimeError(f"Checksum mismatch: {s.name}")
     shutil.rmtree(str(src))
+    return "copy", dt.datetime.now().timestamp()-t0
 
 # ─────────────────────────────────────────────
 # DJ database detection
@@ -460,12 +1054,20 @@ def mutagen_first(tag_obj:Any,keys:List[str])->Optional[str]:
     return None
 
 def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
+    # Cache check — skip mutagen entirely for unchanged files
+    cache=_tag_cache
+    if cache is not None:
+        cached=cache.get(path)
+        if cached is not None: return cached
+
     keys=cfg.get("tags",{})
     result:Dict[str,Optional[str]]={k:None for k in ["album","albumartist","artist","title","tracknumber","discnumber","year","bpm","key"]}
     if MutagenFile is None: return result
     try:
         mf=MutagenFile(str(path),easy=True)
-        if not mf or not getattr(mf,"tags",None): return result
+        if not mf or not getattr(mf,"tags",None):
+            if cache is not None: cache.set(path,result)
+            return result
         t=mf.tags
         result["album"]      =mutagen_first(t,keys.get("album_keys",["album"]))
         result["albumartist"]=mutagen_first(t,keys.get("albumartist_keys",["albumartist"]))
@@ -482,6 +1084,7 @@ def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
                     m=re.search(r"(\d{4})",str(yv))
                     if m: result["year"]=m.group(1); break
     except Exception: pass
+    if cache is not None: cache.set(path,result)
     return result
 
 def detect_bpm_dj_encoding(stem:str)->bool:
@@ -590,20 +1193,30 @@ def pick_year(year_counts:Counter,tracks_with_year:int,total:int,cfg:Dict[str,An
     return y,{"included":True,"presence_ratio":pres,"agreement":ys}
 
 def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,profile:Dict[str,Any],cfg:Dict[str,Any])->Optional[FolderProposal]:
+    # ── per-folder override ──────────────────────────────────────────────
+    override=load_folder_override(folder)
+    if override and override.get("skip"): return None
+
     albums_norm:Counter=Counter(); albumartists_norm:Counter=Counter(); track_artists_norm:Counter=Counter(); years:Counter=Counter()
     albums_raw:Dict[str,Counter]={}; albumartists_raw:Dict[str,Counter]={}
     tracks_with_year=0; tagged=0; unreadable=0
     extensions:Counter=Counter(p.suffix.lower() for p in audio_files)
+    all_tags:List[Dict[str,Optional[str]]]=[]
 
     for f in audio_files:
         tags=read_audio_tags(f,cfg)
+        all_tags.append(tags)
         if all(v is None for v in tags.values()): unreadable+=1; continue
         alb_r=(tags.get("album") or "").strip(); aa_r=(tags.get("albumartist") or "").strip()
         art_r=(tags.get("artist") or "").strip(); yr_r=(tags.get("year") or "").strip()
-        alb_n=normalize_for_vote(alb_r,cfg) if alb_r else ""
-        aa_n =normalize_for_vote(aa_r,cfg)  if aa_r  else ""
-        art_n=normalize_for_vote(art_r,cfg) if art_r else ""
-        if alb_n: albums_norm[alb_n]+=1; albums_raw.setdefault(alb_n,Counter())[alb_r]+=1
+
+        # Strip display noise and disc indicators from album for voting
+        alb_r_clean=strip_disc_indicator(strip_display_noise(alb_r)) if alb_r else alb_r
+
+        alb_n=normalize_for_vote(alb_r_clean,cfg) if alb_r_clean else ""
+        aa_n =normalize_for_vote(aa_r,cfg)         if aa_r         else ""
+        art_n=normalize_for_vote(art_r,cfg)        if art_r        else ""
+        if alb_n: albums_norm[alb_n]+=1; albums_raw.setdefault(alb_n,Counter())[alb_r_clean or alb_r]+=1
         if aa_n:  albumartists_norm[aa_n]+=1; albumartists_raw.setdefault(aa_n,Counter())[aa_r]+=1
         if art_n: track_artists_norm[art_n]+=1
         if yr_r:
@@ -625,8 +1238,23 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         used_heuristic=True
         if not tracks_with_year and parsed.get("year"): years[parsed["year"]]=1; tracks_with_year=1
 
+    # ── override: force name / artist ───────────────────────────────────
+    if override:
+        if override.get("album"):  dom_alb=str(override["album"])
+        if override.get("artist") or override.get("albumartist"):
+            dom_aa=str(override.get("albumartist") or override.get("artist"))
+        if override.get("year"):
+            try: years[str(int(override["year"]))]=total; tracks_with_year=total
+            except Exception: pass
+
     va_label=cfg.get("various_artists",{}).get("label","VA")
     is_va=detect_va(dom_aa_n or "",list(track_artists_norm.keys()),cfg)
+
+    # ── folder content type ─────────────────────────────────────────────
+    folder_type=classify_folder_content(audio_files,folder.name,all_tags,cfg)
+    is_mix=(folder_type=="mix")
+    is_ep =(folder_type=="ep")
+    if is_va and folder_type not in ("mix",): folder_type="va"
 
     if is_va:
         artist_for_folder:Optional[str]=va_label
@@ -640,12 +1268,22 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
 
     if not dom_alb or not artist_for_folder: return None
 
+    # ── apply title-case fix to album name ──────────────────────────────
+    dom_alb=apply_title_case(dom_alb,cfg)
+    # Strip residual display noise from voted album name
+    dom_alb=strip_display_noise(dom_alb)
+    # Strip garbage bracket stack from album name
+    garbage=detect_garbage_name(dom_alb)
+    if garbage: dom_alb=strip_bracket_stack(dom_alb)
+
     year_val,year_meta=pick_year(years,tracks_with_year,max(total,1) if used_heuristic else total,cfg)
 
     fmt=cfg.get("format",{})
+    ep_suffix=" [EP]" if is_ep and fmt.get("label_eps",True) else ""
     pat=fmt.get("pattern_with_year" if year_val else "pattern_no_year","{albumartist} - {album}")
-    proposed=pat.format(albumartist=artist_for_folder,album=dom_alb,year=year_val or "")
+    proposed=pat.format(albumartist=artist_for_folder,album=dom_alb+ep_suffix,year=year_val or "")
     proposed=sanitize_name(proposed,repl=fmt.get("replace_illegal_chars_with"," - "))
+    proposed=sanitize_windows_reserved(proposed)
 
     sfx=cfg.get("format_suffix",{})
     if sfx.get("enabled",True) and sfx.get("only_if_all_same_extension",True) and len(extensions)==1:
@@ -655,18 +1293,29 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
 
     is_flac_only=set(extensions.keys())=={".flac"}
     clean_albums=derive_clean_albums_root(profile,source_root)
-    target_dir=resolve_library_path(clean_albums,artist_for_folder,dom_alb,year_val,is_flac_only,is_va,False,cfg)
+    target_dir=resolve_library_path(clean_albums,artist_for_folder,dom_alb,year_val,
+                                     is_flac_only,is_va,False,is_mix,cfg)
 
-    confidence=(alb_share*0.60+aa_share*0.40) if dom_aa and not is_va else (alb_share*0.70+art_share*0.30*0.85)
-    if used_heuristic: confidence*=0.60
+    # ── named confidence factors ─────────────────────────────────────────
+    conf_factors=compute_confidence_factors(
+        audio_files,tagged,alb_share,aa_share,art_share,
+        used_heuristic,folder.name,proposed,all_tags)
+    confidence=confidence_from_factors(conf_factors,used_heuristic)
+
+    # Override confidence boost from .raagdosa
+    if override and override.get("confidence_boost"):
+        confidence=min(1.0,confidence+float(override["confidence_boost"]))
 
     fmt_dupes=detect_format_dupes(audio_files)
     decision={
         "dominant_album":dom_alb_n,"dominant_album_display":dom_alb,"dominant_album_share":alb_share,
         "dominant_albumartist":dom_aa_n,"dominant_albumartist_display":dom_aa,"dominant_albumartist_share":aa_share,
         "dominant_artist":dom_art_n,"dominant_artist_share":art_share,
-        "is_va":is_va,"albumartist_display":artist_for_folder,"year":year_val,"year_meta":year_meta,
-        "unreadable_ratio":(unreadable/total) if total else 0.0,"used_heuristic":used_heuristic,"is_flac_only":is_flac_only,
+        "is_va":is_va,"is_mix":is_mix,"is_ep":is_ep,"folder_type":folder_type,
+        "albumartist_display":artist_for_folder,"year":year_val,"year_meta":year_meta,
+        "unreadable_ratio":(unreadable/total) if total else 0.0,
+        "used_heuristic":used_heuristic,"is_flac_only":is_flac_only,
+        "garbage_reasons":garbage,"confidence_factors":conf_factors,
     }
     stats=FolderStats(tracks_total=total,tracks_tagged=tagged,tracks_unreadable=unreadable,extensions=dict(extensions),format_duplicates=fmt_dupes)
     return FolderProposal(folder_path=str(folder),folder_name=folder.name,proposed_folder_name=proposed,
@@ -688,7 +1337,10 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     sc=cfg.get("scan",{}); exts=[e.lower() for e in sc.get("audio_extensions",[".mp3",".flac",".m4a"])]
     min_tracks=int(sc.get("min_tracks",3)); follow_sym=bool(sc.get("follow_symlinks",False))
     leaf_only=bool(sc.get("leaf_folders_only",True))
-    ignore_names:Set[str]=set(cfg.get("ignore",{}).get("ignore_folder_names",[]))
+    ignore_patterns:List[str]=list(cfg.get("ignore",{}).get("ignore_folder_names",[]) or [])
+
+    # Initialise tag cache for this scan run
+    _get_tag_cache(cfg)
 
     # Collect candidates with progress
     candidates:List[Path]=[]
@@ -702,17 +1354,60 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
         candidates=[f for f in candidates if dt.datetime.fromtimestamp(folder_mtime(f))>=since]
         out(f"  --since: {len(candidates)} folders modified after {since.strftime('%Y-%m-%d %H:%M')}",level=VERBOSE)
 
-    proposals:List[FolderProposal]=[]; prog=Progress(len(candidates),"Scanning")
+    # Filter ignores before submitting to workers
+    candidates=[rp for rp in candidates if not folder_matches_ignore(rp.name,ignore_patterns)]
 
-    for rp in candidates:
-        if should_stop(): out(f"\n{C.YELLOW}Stopped after scanning {len(proposals)} folders.{C.RESET}"); break
-        if rp.name in ignore_names: prog.tick(rp.name); continue
+    # ── Parallel scan ────────────────────────────────────────────────────
+    # Tag reading (mutagen) is I/O-bound → threads are the right tool.
+    # Each worker is independent — they share the tag cache (thread-safe)
+    # but build their own local vote counters.
+    workers=int(sc.get("workers", min(8, (os.cpu_count() or 4))))
+    out(f"  Scanning {len(candidates)} folder(s) with {workers} worker(s)…",level=VERBOSE)
+
+    proposals_raw:List[FolderProposal]=[]; proposals_lock=Lock()
+    prog=Progress(len(candidates),"Scanning")
+
+    def _scan_one(rp:Path)->Optional[FolderProposal]:
+        if should_stop(): return None
         audio_files=list_audio_files(rp,exts,follow_sym)
-        if len(audio_files)<min_tracks: prog.tick(rp.name); continue
+        if len(audio_files)<min_tracks:
+            prog.tick(rp.name); return None
         prog.tick(rp.name)
-        prop=build_folder_proposal(rp,audio_files,source_root,profile,cfg)
-        if prop: proposals.append(prop)
+        return build_folder_proposal(rp,audio_files,source_root,profile,cfg)
+
+    if workers<=1 or len(candidates)<=4:
+        # Single-threaded path (avoids thread overhead for small runs)
+        for rp in candidates:
+            if should_stop(): out(f"\n{C.YELLOW}Stopped after scanning {len(proposals_raw)} folders.{C.RESET}"); break
+            prop=_scan_one(rp)
+            if prop: proposals_raw.append(prop)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures={pool.submit(_scan_one,rp):rp for rp in candidates}
+            for fut in as_completed(futures):
+                if should_stop():
+                    # Cancel pending (best-effort — running tasks will complete)
+                    for f in futures:
+                        if not f.done(): f.cancel()
+                    out(f"\n{C.YELLOW}Stop requested — waiting for in-flight tasks…{C.RESET}")
+                    break
+                try:
+                    prop=fut.result()
+                    if prop:
+                        with proposals_lock: proposals_raw.append(prop)
+                except Exception as e:
+                    rp=futures[fut]; err(f"  scan error in {rp.name}: {e}")
+
     prog.done()
+
+    # Preserve input order (as_completed returns in completion order)
+    # Sort by original path for deterministic proposals/reports
+    proposals=sorted(proposals_raw,key=lambda p:p.folder_path)
+
+    # Save tag cache to disk after scan completes
+    if _tag_cache is not None:
+        _tag_cache.save()
+        out(f"  Tag cache: {_tag_cache.size} entries",level=VERBOSE)
 
     # Routing
     rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
@@ -726,12 +1421,19 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
         except Exception: pass
     manifest_entries:Set[str]=set(read_manifest(cfg).get("entries",{}).keys())
 
+    # Build mixes root
+    lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
+    mixes_root=clean_albums.parent/mixes_folder
+
     for p in proposals:
         reasons:List[str]=[]; dest="clean"
         if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
             dest="review"; reasons.append("low_confidence")
         if rr.get("route_duplicates",True) and within_run[p.proposed_folder_name]>1:
-            dest="duplicate"; reasons.append("duplicate_in_run")
+            dest="duplicate"
+            # Find the other colliding folder name for detail
+            colliders=[q.folder_name for q in proposals if q.proposed_folder_name==p.proposed_folder_name and q is not p]
+            reasons.append(f"duplicate_in_run:{colliders[0][:40] if colliders else '?'}")
         norm_prop=normalize_unicode(p.proposed_folder_name)
         if rr.get("route_cross_run_duplicates",True) and (norm_prop in existing_clean or norm_prop in manifest_entries):
             dest="duplicate"; reasons.append("already_in_clean")
@@ -741,6 +1443,13 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
             if dest=="clean": dest="review"
             reasons.append("heuristic_fallback")
         if p.stats.format_duplicates: reasons.append(f"format_dupes({len(p.stats.format_duplicates)})")
+        # EP stays in clean unless confidence too low
+        if p.decision.get("is_ep"): reasons.append("ep")
+        # Mix: route to mixes folder (clean side)
+        if p.decision.get("is_mix") and dest=="clean":
+            reasons.append("mix_folder")
+            ensure_dir(mixes_root)
+            p.target_path=str(mixes_root/p.proposed_folder_name)
         p.destination=dest; p.decision["route_reasons"]=reasons
         if dest=="review":    p.target_path=str(review_albums/p.proposed_folder_name)
         elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
@@ -838,7 +1547,8 @@ def collision_resolve(dst:Path,policy:str,suffix_fmt:str)->Optional[Path]:
         n+=1
 
 def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interactive:bool,
-                       auto_above:Optional[float],dry_run:bool,session_id:str)->List[Dict[str,Any]]:
+                       auto_above:Optional[float],dry_run:bool,session_id:str,
+                       source_root:Optional[Path]=None)->List[Dict[str,Any]]:
     mc=cfg.get("move",{})
     if not mc.get("enabled",True): return []
     policy=mc.get("on_collision","suffix"); sfmt=mc.get("suffix_format"," ({n})"); use_cs=bool(mc.get("use_checksum",False))
@@ -887,10 +1597,12 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
             if input("  Apply? [y/N] ").strip().lower()!="y":
                 append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"user_skipped","src":str(src)}); continue
         if dry_run:
-            out(f"  {C.DIM}[dry-run]{C.RESET} {src.name}  →  {dst2.name}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}")
+            same=_same_device(src,dst2)
+            method_note=f"{C.DIM}[rename]{C.RESET}" if same else f"{C.DIM}[copy]{C.RESET}"
+            out(f"  {C.DIM}[dry-run]{C.RESET} {method_note} {src.name}  →  {dst2.name}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}")
             append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dry_run","src":str(src),"dst":str(dst2)}); continue
         ensure_dir(dst2.parent)
-        try: safe_move_folder(src,dst2,use_checksum=use_cs)
+        try: move_method,move_elapsed=safe_move_folder(src,dst2,use_checksum=use_cs)
         except RuntimeError as e:
             err(f"⛔ Move failed ({src.name}): {e}")
             append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":f"move_failed:{e}","src":str(src)}); continue
@@ -898,11 +1610,27 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
         entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
                "original_path":str(src),"original_parent":str(src.parent),"original_folder_name":src.name,
                "target_path":str(dst2),"target_parent":str(dst2.parent),"target_folder_name":dst2.name,
-               "destination":p.destination,"confidence":p.confidence,"decision":p.decision}
+               "destination":p.destination,"confidence":p.confidence,"decision":p.decision,
+               "move_method":move_method}
         append_jsonl(hist_path,entry); applied.append(entry)
         if p.destination=="clean": manifest_add(cfg,dst2.name,{"original_path":str(src),"confidence":p.confidence,"session_id":session_id})
-        out(f"  MOVED {status_tag(p.destination)} {C.DIM}{src.name}{C.RESET}  →  {dst2.name}  conf={conf_color(p.confidence)}")
+        method_tag=f"  {C.DIM}[{move_method} {move_elapsed*1000:.0f}ms]{C.RESET}" if _verbosity>=VERBOSE else ""
+        out(f"  MOVED {status_tag(p.destination)} {C.DIM}{src.name}{C.RESET}  →  {dst2.name}  conf={conf_color(p.confidence)}{method_tag}")
+        # Clean up empty parent directories left behind in source
+        if source_root:
+            try: cleanup_empty_parents(src,source_root)
+            except Exception: pass
     prog.done()
+    # Summary: show rename vs copy counts so user knows which path was taken
+    if applied:
+        renames=sum(1 for a in applied if a.get("move_method")=="rename")
+        copies =sum(1 for a in applied if a.get("move_method")=="copy")
+        if renames and copies:
+            out(f"  {C.DIM}Move methods: {renames} instant rename + {copies} cross-device copy{C.RESET}")
+        elif renames:
+            out(f"  {C.DIM}All {renames} folder(s) moved via instant rename (same filesystem){C.RESET}")
+        elif copies:
+            out(f"  {C.DIM}All {copies} folder(s) copied across devices{C.RESET}")
     return applied
 
 # ─────────────────────────────────────────────
@@ -981,7 +1709,12 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
     if artist and cfg.get("artists",{}).get("feature_handling",{}).get("normalize_tokens",True):
         artist=re.sub(r"\bfeaturing\b|\bft\.?\b|\bfeat\.?\b","feat.",artist,flags=re.IGNORECASE)
         artist=re.sub(r"\s+"," ",artist).strip()
-    track_n=parse_int_prefix(track_raw) if track_raw else None
+    # Try vinyl track notation first (A1, B2 etc.)
+    vinyl=parse_vinyl_track(track_raw.split("/")[0].strip()) if track_raw else None
+    if vinyl:
+        track_n=vinyl[2]; meta["vinyl_side"]=vinyl[0]; meta["track_src"]="vinyl_notation"
+    else:
+        track_n=parse_int_prefix(track_raw) if track_raw else None
     if track_n is None and trc.get("track_numbers",{}).get("fallback_to_filename_order",False):
         om=re.match(r"^(\d{1,3})",src.stem.strip())
         if om: track_n=int(om.group(1)); meta["track_src"]="filename_order"
@@ -1023,6 +1756,11 @@ def rename_tracks_in_clean_folder(cfg:Dict[str,Any],folder:Path,folder_decision:
     thist=Path(cfg["logging"]["track_history_log"]); tskip=Path(cfg["logging"]["track_skipped_log"])
     applied:List[Dict[str,Any]]=[]; skip_count=0
     for f in sorted(files):
+        # Extension case normalisation: .MP3 → .mp3
+        ext_fixed=normalise_extension(f)
+        if ext_fixed and not dry_run:
+            try: f.rename(ext_fixed); f=ext_fixed
+            except Exception: pass
         tags=read_audio_tags(f,cfg); new_name,conf,reason,meta=build_track_filename(classification,tags,f,cfg,folder_decision,disc_multi)
         if not new_name:
             out(f"    ↷ SKIP {f.name}  ({reason})",level=VERBOSE); skip_count+=1
@@ -1055,7 +1793,7 @@ def rename_tracks_in_clean_folder(cfg:Dict[str,Any],folder:Path,folder_decision:
 # ─────────────────────────────────────────────
 # show — single folder debug
 # ─────────────────────────────────────────────
-def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str)->None:
+def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str,show_tracks:bool=False)->None:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
@@ -1067,6 +1805,11 @@ def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str)->None:
     out(f"{C.BOLD}raagdosa show: {folder}{C.RESET}\n{'═'*60}")
     out(f"Audio files: {len(audio_files)}")
     if not audio_files: out("  None found."); return
+
+    # Check .raagdosa override
+    ov=load_folder_override(folder)
+    if ov: out(f"\n{C.CYAN}Override file (.raagdosa):{C.RESET} {ov}")
+
     out(f"\n{C.BOLD}Tags (first 8 files):{C.RESET}")
     for f in sorted(audio_files)[:8]:
         tags=read_audio_tags(f,cfg); has=any(v for k,v in tags.items() if k not in ("bpm","key") and v)
@@ -1084,12 +1827,32 @@ def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str)->None:
     out(f"  Proposed name:      {C.GREEN}{prop.proposed_folder_name}{C.RESET}")
     out(f"  Target path:        {prop.target_path}")
     out(f"  Confidence:         {conf_color(prop.confidence)}")
+    out(f"  Folder type:        {d.get('folder_type','album')}{'  [EP]' if d.get('is_ep') else ''}{'  [MIX]' if d.get('is_mix') else ''}")
     out(f"  album tag:          '{d.get('dominant_album_display')}' ({d.get('dominant_album_share',0):.0%} dominance)")
     out(f"  albumartist tag:    '{d.get('dominant_albumartist_display')}' ({d.get('dominant_albumartist_share',0):.0%} dominance)")
     out(f"  year:               {d.get('year') or 'not included'}")
     out(f"  VA:                 {'yes' if d.get('is_va') else 'no'}")
     out(f"  FLAC only:          {'yes' if d.get('is_flac_only') else 'no'}")
     out(f"  heuristic:          {'yes (no tags found)' if d.get('used_heuristic') else 'no'}")
+
+    # Confidence factor breakdown
+    cf=d.get("confidence_factors",{})
+    if cf:
+        out(f"\n{C.BOLD}Confidence factors:{C.RESET}")
+        factor_labels={"dominance":"Vote dominance","tag_coverage":"Tag coverage",
+                       "title_quality":"Title quality","filename_consistency":"Filename/tag consistency",
+                       "completeness":"Track completeness","aa_consistency":"Albumartist consistency",
+                       "folder_alignment":"Folder name alignment"}
+        for key,label in factor_labels.items():
+            v=cf.get(key,0.0)
+            bar="█"*int(v*20)+"░"*(20-int(v*20))
+            col=C.GREEN if v>=0.85 else (C.YELLOW if v>=0.65 else C.RED)
+            out(f"  {label:<30} {col}[{bar}] {v:.2f}{C.RESET}")
+        gaps=int(cf.get("track_gaps",0)); dupes=int(cf.get("track_dupes",0))
+        if gaps:  warn(f"Track number gaps: {gaps} missing")
+        if dupes: warn(f"Duplicate track numbers: {dupes}")
+
+    if d.get("garbage_reasons"): warn(f"Garbage flags on album name: {', '.join(d['garbage_reasons'])}")
     if prop.stats.format_duplicates: warn(f"Format duplicates: {', '.join(prop.stats.format_duplicates)}")
     rr_cfg=cfg.get("review_rules",{}); min_conf=float(rr_cfg.get("min_confidence_for_clean",0.85))
     in_mf=manifest_has(cfg,prop.proposed_folder_name)
@@ -1101,6 +1864,25 @@ def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str)->None:
         out(f"\n{C.YELLOW}Tips to reach Clean:{C.RESET}")
         out(f"  • Ensure consistent album/albumartist tags across all tracks")
         out(f"  • Or lower review_rules.min_confidence_for_clean below {prop.confidence:.2f} in config")
+
+    # --tracks: show per-track proposed renames
+    if show_tracks:
+        out(f"\n{C.BOLD}Track rename preview:{C.RESET}")
+        allowed={e.lower() for e in cfg.get("track_rename",{}).get("allowed_extensions",[".mp3",".flac",".m4a"])}
+        tr_files=[p for p in sorted(audio_files) if p.suffix.lower() in allowed]
+        if not tr_files: out("  No renamable tracks found.")
+        else:
+            cls=classify_folder_for_tracks(prop.decision,cfg)
+            disc_multi=folder_is_multidisc(tr_files,cfg)
+            for f in tr_files:
+                tags=read_audio_tags(f,cfg)
+                new_name,conf,reason,meta=build_track_filename(cls,tags,f,cfg,prop.decision,disc_multi)
+                if new_name:
+                    changed=normalize_unicode(new_name)!=normalize_unicode(f.name)
+                    sym=f"{C.GREEN}→{C.RESET}" if changed else f"{C.DIM}={C.RESET}"
+                    out(f"  {C.DIM}{f.name:<50}{C.RESET} {sym} {new_name}  {conf_color(conf)}")
+                else:
+                    out(f"  {C.DIM}{f.name:<50}{C.RESET} {C.YELLOW}SKIP ({reason}){C.RESET}")
 
 # ─────────────────────────────────────────────
 # verify — library audit
@@ -1214,6 +1996,342 @@ def cmd_learn(cfg_path:Path,cfg:Dict[str,Any],session_id:Optional[str])->None:
         for c in applied_changes: out(f"  ✓ {c}")
         out(f"\n{C.DIM}Saved: {cfg_path}{C.RESET}")
     else: out("No changes applied.")
+
+# ─────────────────────────────────────────────
+# orphans — find loose audio files
+# ─────────────────────────────────────────────
+def cmd_orphans(cfg:Dict[str,Any],profile_name:str)->None:
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    roots=ensure_roots(profile,source_root)
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+    orphans:List[Path]=[]
+    for root_key in ("clean_albums","review_albums"):
+        base=roots[root_key]
+        if not base.exists(): continue
+        # Files directly in the Albums/ root (no subfolder)
+        for p in base.iterdir():
+            if p.is_file() and p.suffix.lower() in exts and not is_hidden_file(p):
+                orphans.append(p)
+        # Files in artist-level folder (one level deep) but no album subfolder
+        for artist_dir in base.iterdir():
+            if not artist_dir.is_dir(): continue
+            for p in artist_dir.iterdir():
+                if p.is_file() and p.suffix.lower() in exts and not is_hidden_file(p):
+                    orphans.append(p)
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa orphans — {profile_name}{C.RESET}\n{'═'*60}")
+    if not orphans:
+        ok_msg("No orphan audio files found — library looks tidy.")
+        return
+    out(f"\n{C.YELLOW}Found {len(orphans)} orphan file(s):{C.RESET}")
+    for p in sorted(orphans): out(f"  {C.DIM}{p}{C.RESET}")
+    out(f"\n{C.DIM}Orphans can be moved to '{profile.get('orphans_folder_name','Orphans')}' manually or by adding them to an album folder.{C.RESET}")
+
+# ─────────────────────────────────────────────
+# artists — list/find artists in Clean
+# ─────────────────────────────────────────────
+def cmd_artists(cfg:Dict[str,Any],profile_name:str,list_mode:bool,find_query:Optional[str])->None:
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa artists — {profile_name}{C.RESET}\n{'═'*60}")
+
+    if not clean_albums.exists(): out("Clean/Albums not found."); return
+    lib=cfg.get("library",{}); template=lib.get("template","{artist}/{album}")
+
+    # Collect artist directories (top-level subdirs of clean_albums, excluding _* special folders)
+    if "{artist}" in template:
+        # Artist folders are direct children
+        artist_dirs=sorted([d for d in clean_albums.iterdir() if d.is_dir() and not d.name.startswith("_")])
+    else:
+        # Flat template — read albumartist from tags
+        artist_dirs=[]
+
+    if find_query:
+        q=find_query.strip().lower()
+        matches=[(d,string_similarity(d.name.lower(),q)) for d in artist_dirs]
+        matches=sorted([(d,s) for d,s in matches if s>=0.3],key=lambda x:x[1],reverse=True)
+        if not matches: out(f"No artists matching '{find_query}'."); return
+        out(f"\nMatches for '{find_query}':")
+        for d,score in matches[:20]:
+            albums=len([x for x in d.iterdir() if x.is_dir()]) if d.is_dir() else 0
+            out(f"  {C.GREEN}{d.name:<40}{C.RESET}  {score:.0%} match  {albums} album(s)  {C.DIM}{d}{C.RESET}")
+    else:
+        if not list_mode: out(f"\n{len(artist_dirs)} artist(s) in Clean:"); list_mode=True
+        for d in artist_dirs:
+            albums=len([x for x in d.iterdir() if x.is_dir()]) if d.is_dir() else 0
+            tracks=sum(len(list_audio_files(x,exts)) for x in d.rglob("*") if x.is_dir())
+            out(f"  {d.name:<45}  {albums:3d} album(s)  {tracks:4d} tracks")
+        out(f"\n{C.DIM}Total: {len(artist_dirs)} artists{C.RESET}")
+
+# ─────────────────────────────────────────────
+# review-list — summarise Review folder
+# ─────────────────────────────────────────────
+def cmd_review_list(cfg:Dict[str,Any],profile_name:str,older_than_days:Optional[int])->None:
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    roots=ensure_roots(profile,source_root); review_albums=roots["review_albums"]
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa review-list — {profile_name}{C.RESET}\n{'═'*60}")
+    if not review_albums.exists(): out("Review/Albums not found — empty."); return
+
+    now=dt.datetime.now()
+    cutoff=now-dt.timedelta(days=older_than_days) if older_than_days else None
+
+    # Build a lookup from session proposals for confidence/reason data
+    conf_map:Dict[str,float]={}; reason_map:Dict[str,str]={}
+    sdir=Path(cfg["logging"]["session_dir"])
+    if sdir.exists():
+        for sd in sorted(sdir.iterdir(),key=lambda p:p.name,reverse=True)[:10]:
+            pf=sd/"proposals.json"
+            if not pf.exists(): continue
+            try:
+                pl=read_json(pf)
+                for fp in pl.get("folder_proposals",[]):
+                    nm=fp.get("proposed_folder_name","")
+                    if nm and nm not in conf_map:
+                        conf_map[nm]=float(fp.get("confidence",0.0))
+                        reason_map[nm]=", ".join(fp.get("decision",{}).get("route_reasons",[]))
+            except Exception: continue
+
+    folders=sorted([d for d in review_albums.rglob("*") if d.is_dir()
+                    and any(f.suffix.lower() in exts for f in d.iterdir() if f.is_file())],
+                   key=lambda d:folder_mtime(d))
+
+    if cutoff:
+        folders=[d for d in folders if dt.datetime.fromtimestamp(folder_mtime(d))<=cutoff]
+
+    if not folders: out(f"No Review folders{' older than '+str(older_than_days)+' days' if older_than_days else ''}."); return
+    out(f"\n{'Folder':<45} {'Age':>7}  {'Conf':>6}  Reason")
+    out("─"*90)
+    for d in folders:
+        mtime=dt.datetime.fromtimestamp(folder_mtime(d))
+        age=(now-mtime).days
+        conf=conf_map.get(d.name)
+        reason=reason_map.get(d.name,"")
+        conf_s=conf_color(conf) if conf else f"{C.DIM}n/a{C.RESET}"
+        age_col=C.RED if age>60 else (C.YELLOW if age>14 else C.DIM)
+        out(f"  {d.name[:43]:<43}  {age_col}{age:>5}d{C.RESET}  {conf_s}  {C.DIM}{reason[:50]}{C.RESET}")
+    out(f"\n{C.DIM}Total: {len(folders)} folder(s) in Review{C.RESET}")
+
+# ─────────────────────────────────────────────
+# cache — manage the tag cache
+# ─────────────────────────────────────────────
+def cmd_cache(cfg:Dict[str,Any],action:str)->None:
+    cache_path=Path(cfg.get("logging",{}).get("root_dir","logs"))/"tag_cache.json"
+    out(f"\n{C.BOLD}{'═'*50}{C.RESET}\n{C.BOLD}raagdosa cache{C.RESET}\n{'═'*50}")
+    if action=="status":
+        if not cache_path.exists():
+            out("No tag cache found. It will be created on the next scan.")
+            return
+        try:
+            raw=read_json(cache_path)
+            entries=raw.get("entries",raw) if isinstance(raw,dict) else {}
+            saved=raw.get("saved","unknown") if isinstance(raw,dict) else "unknown"
+            size_kb=cache_path.stat().st_size/1024
+            out(f"  Path:     {cache_path}")
+            out(f"  Entries:  {len(entries):,}")
+            out(f"  Size:     {size_kb:.0f} KB")
+            out(f"  Saved:    {saved}")
+            out(f"\n{C.DIM}Warm scans skip mutagen for cached files — near-zero tag-read cost.{C.RESET}")
+        except Exception as e:
+            err(f"Could not read cache: {e}")
+    elif action=="clear":
+        if not cache_path.exists(): out("No cache to clear."); return
+        if input("Clear tag cache? This forces a full re-read on next scan. [y/N] ").strip().lower()!="y":
+            out("Aborted."); return
+        cache_path.unlink(); reset_tag_cache(); ok_msg("Tag cache cleared.")
+    elif action=="evict":
+        tc=TagCache(cache_path)
+        removed=tc.evict_missing()
+        tc.save()
+        ok_msg(f"Evicted {removed} stale entries.")
+    else:
+        err(f"Unknown cache action: {action}")
+
+# ─────────────────────────────────────────────
+# clean-report — audit Clean library
+# ─────────────────────────────────────────────
+def cmd_clean_report(cfg:Dict[str,Any],profile_name:str)->None:
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa clean-report — {profile_name}{C.RESET}\n{'═'*60}")
+    if not clean_albums.exists(): out("Clean/Albums not found."); return
+
+    album_dirs:List[Path]=[]; total_tracks=0; ext_counts:Counter=Counter()
+    tagged_count=0; untagged_count=0; issues:List[str]=[]
+
+    for d in sorted(clean_albums.rglob("*")):
+        if not d.is_dir(): continue
+        files=list_audio_files(d,exts)
+        if not files: continue
+        album_dirs.append(d)
+        total_tracks+=len(files)
+        for f in files:
+            ext_counts[f.suffix.lower()]+=1
+            tags=read_audio_tags(f,cfg)
+            if any(v for k,v in tags.items() if k not in ("bpm","key") and v): tagged_count+=1
+            else: untagged_count+=1
+        # Detect issues in this album folder
+        track_nums:List[int]=[]
+        for f in files:
+            tags=read_audio_tags(f,cfg)
+            vt=parse_vinyl_track((tags.get("tracknumber") or "").split("/")[0].strip())
+            n=vt[2] if vt else parse_int_prefix(tags.get("tracknumber") or "")
+            if n: track_nums.append(n)
+        if detect_track_gaps(track_nums): issues.append(f"track_gaps: {d.name}")
+        if detect_duplicate_track_numbers(track_nums): issues.append(f"duplicate_track_nums: {d.name}")
+
+    out(f"\n{C.BOLD}Summary:{C.RESET}")
+    out(f"  Album folders:       {len(album_dirs)}")
+    out(f"  Total tracks:        {total_tracks}")
+    out(f"  Tagged tracks:       {C.GREEN}{tagged_count}{C.RESET}")
+    out(f"  Untagged tracks:     {C.RED}{untagged_count}{C.RESET}")
+    out(f"\n{C.BOLD}Format breakdown:{C.RESET}")
+    for ext,cnt in sorted(ext_counts.items(),key=lambda x:x[1],reverse=True):
+        pct=cnt/total_tracks*100 if total_tracks else 0
+        bar="█"*int(pct/2)
+        out(f"  {ext:<8} {cnt:5d} tracks  {C.DIM}[{bar:<50}] {pct:.0f}%{C.RESET}")
+    if issues:
+        out(f"\n{C.YELLOW}Issues found ({len(issues)}):{C.RESET}")
+        for i in issues[:30]: out(f"  {C.YELLOW}⚠{C.RESET}  {i}")
+        if len(issues)>30: out(f"  … and {len(issues)-30} more")
+    else:
+        ok_msg("No issues detected in Clean library.")
+
+# ─────────────────────────────────────────────
+# extract --by-artist — split VA/mix folder
+# ─────────────────────────────────────────────
+def cmd_extract_by_artist(cfg:Dict[str,Any],profile_name:str,folder_path:str,dry_run:bool)->None:
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    roots=ensure_roots(profile,source_root)
+    folder=Path(folder_path).expanduser().resolve()
+    if not folder.exists(): err(f"Folder not found: {folder}"); sys.exit(1)
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+    audio_files=list_audio_files(folder,exts)
+    if not audio_files: err("No audio files found."); sys.exit(1)
+
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa extract --by-artist: {folder.name}{C.RESET}\n{'═'*60}")
+
+    by_artist:Dict[str,List[Path]]={}
+    for f in sorted(audio_files):
+        tags=read_audio_tags(f,cfg)
+        artist=(tags.get("artist") or "").strip() or "_Unknown"
+        artist=normalize_artist_name(artist,cfg)
+        by_artist.setdefault(artist,[]).append(f)
+
+    if len(by_artist)<=1: out("Only one artist found — nothing to extract."); return
+    out(f"\nWould extract {len(by_artist)} artist group(s) into Clean/Albums:\n")
+    clean_albums=roots["clean_albums"]
+    for artist,files in sorted(by_artist.items()):
+        dest=clean_albums/sanitize_name(artist)/"_Singles"
+        out(f"  {C.GREEN}{artist:<40}{C.RESET}  {len(files):3d} track(s)  →  {dest}")
+    if dry_run: out(f"\n{C.DIM}[dry-run] No files moved.{C.RESET}"); return
+    if input("\nProceed? [y/N] ").strip().lower()!="y": out("Aborted."); return
+    moved=0
+    for artist,files in by_artist.items():
+        dest=clean_albums/sanitize_name(artist)/"_Singles"; ensure_dir(dest)
+        for f in files:
+            target=dest/f.name
+            if target.exists(): target=dest/(f.stem+" (extracted)"+f.suffix)
+            try: shutil.move(str(f),str(target)); moved+=1
+            except Exception as e: err(f"  Failed {f.name}: {e}")
+    ok_msg(f"Extracted {moved} tracks into artist folders.")
+
+# ─────────────────────────────────────────────
+# compare --folder — diff two folders
+# ─────────────────────────────────────────────
+def cmd_compare_folders(cfg:Dict[str,Any],folder_a:str,folder_b:str)->None:
+    fa=Path(folder_a).expanduser().resolve(); fb=Path(folder_b).expanduser().resolve()
+    for p,label in ((fa,"A"),(fb,"B")):
+        if not p.exists(): err(f"Folder {label} not found: {p}"); sys.exit(1)
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+    fa_files={f.name for f in list_audio_files(fa,exts)}
+    fb_files={f.name for f in list_audio_files(fb,exts)}
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}")
+    out(f"{C.BOLD}raagdosa compare{C.RESET}")
+    out(f"  A: {fa}  ({len(fa_files)} tracks)")
+    out(f"  B: {fb}  ({len(fb_files)} tracks)\n{'─'*60}")
+    only_a=sorted(fa_files-fb_files); only_b=sorted(fb_files-fa_files); common=sorted(fa_files&fb_files)
+    out(f"\n{C.GREEN}Common ({len(common)}):{C.RESET}")
+    for n in common[:20]: out(f"  {n}")
+    if len(common)>20: out(f"  … and {len(common)-20} more")
+    if only_a:
+        out(f"\n{C.YELLOW}Only in A ({len(only_a)}):{C.RESET}")
+        for n in only_a: out(f"  {C.YELLOW}{n}{C.RESET}")
+    if only_b:
+        out(f"\n{C.CYAN}Only in B ({len(only_b)}):{C.RESET}")
+        for n in only_b: out(f"  {C.CYAN}{n}{C.RESET}")
+    # Tag comparison on common files
+    if common:
+        out(f"\n{C.BOLD}Tag comparison (first 5 common):{C.RESET}")
+        for name in sorted(common)[:5]:
+            ta=read_audio_tags(fa/name,cfg); tb=read_audio_tags(fb/name,cfg)
+            diffs=[k for k in ("album","albumartist","artist","title","tracknumber","year") if (ta.get(k) or "")!=(tb.get(k) or "")]
+            if diffs:
+                out(f"  {C.DIM}{name}{C.RESET}")
+                for k in diffs: out(f"    {k}: A={ta.get(k)!r}  B={tb.get(k)!r}")
+            else:
+                out(f"  {C.DIM}{name}{C.RESET}  {C.GREEN}tags match{C.RESET}")
+
+# ─────────────────────────────────────────────
+# diff — compare two session reports
+# ─────────────────────────────────────────────
+def cmd_diff(cfg:Dict[str,Any],session_a:str,session_b:str)->None:
+    sdir=Path(cfg["logging"]["session_dir"])
+    def _load(sid:str)->Dict[str,Any]:
+        # Support "last" / "prev" shortcuts
+        all_s=sorted([p for p in sdir.iterdir() if p.is_dir()],key=lambda p:p.name,reverse=True) if sdir.exists() else []
+        if sid=="last" and all_s: sid=all_s[0].name
+        elif sid=="prev" and len(all_s)>1: sid=all_s[1].name
+        p=sdir/sid/"proposals.json"
+        if not p.exists(): err(f"Session not found: {sid}"); sys.exit(1)
+        pl=read_json(p); pl["_session_id"]=sid; return pl
+    pa=_load(session_a); pb=_load(session_b)
+    props_a={fp["proposed_folder_name"]:fp for fp in pa.get("folder_proposals",[])}
+    props_b={fp["proposed_folder_name"]:fp for fp in pb.get("folder_proposals",[])}
+    names_a=set(props_a); names_b=set(props_b)
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}")
+    out(f"{C.BOLD}raagdosa diff{C.RESET}")
+    out(f"  A: {pa['_session_id']}  ({len(props_a)} proposals)")
+    out(f"  B: {pb['_session_id']}  ({len(props_b)} proposals)\n{'─'*60}")
+    only_a=sorted(names_a-names_b); only_b=sorted(names_b-names_a); common=sorted(names_a&names_b)
+    if only_a:
+        out(f"\n{C.YELLOW}Only in A ({len(only_a)}):{C.RESET}")
+        for n in only_a: out(f"  {C.YELLOW}{n}{C.RESET}")
+    if only_b:
+        out(f"\n{C.CYAN}Only in B ({len(only_b)}):{C.RESET}")
+        for n in only_b: out(f"  {C.CYAN}{n}{C.RESET}")
+    changed_dest=[]; changed_conf=[]
+    for n in common:
+        fa=props_a[n]; fb=props_b[n]
+        if fa.get("destination")!=fb.get("destination"):
+            changed_dest.append((n,fa.get("destination"),fb.get("destination"),fa.get("confidence",0),fb.get("confidence",0)))
+        elif abs(float(fa.get("confidence",0))-float(fb.get("confidence",0)))>0.05:
+            changed_conf.append((n,float(fa.get("confidence",0)),float(fb.get("confidence",0))))
+    if changed_dest:
+        out(f"\n{C.BOLD}Destination changes ({len(changed_dest)}):{C.RESET}")
+        for n,da,db,ca,cb in changed_dest:
+            out(f"  {n[:50]:<50}  {da}→{db}  conf {ca:.2f}→{cb:.2f}")
+    if changed_conf:
+        out(f"\n{C.BOLD}Confidence changes >5% ({len(changed_conf)}):{C.RESET}")
+        for n,ca,cb in changed_conf:
+            delta=cb-ca; sym="↑" if delta>0 else "↓"
+            out(f"  {n[:50]:<50}  {conf_color(ca)} {sym} {conf_color(cb)}")
+    if not only_a and not only_b and not changed_dest and not changed_conf:
+        ok_msg("Sessions are identical.")
 
 # ─────────────────────────────────────────────
 # report
@@ -1385,13 +2503,225 @@ def cmd_apply(cfg:Dict[str,Any],proposals_path:Path,interactive:bool,auto_above:
                 rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),a.get("decision",{}),interactive=interactive,dry_run=dry_run,session_id=session_id)
 
 def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since_str:Optional[str])->None:
+    """
+    Streaming pipeline: scan a batch → apply that batch → scan next batch in parallel.
+
+    Architecture:
+      - Candidate folders are split into batches (default 50 folders each).
+      - A scanner thread fills a queue with completed FolderProposal batches.
+      - The main thread drains the queue, routes proposals, and applies moves.
+      - While the main thread is applying batch N, the scanner is already
+        reading tags for batch N+1.
+      - Within-run duplicate tracking is maintained across batches via a
+        shared seen_names set that grows as each batch is committed.
+
+    Result: first folder moves within seconds of starting even on huge libraries.
+    On same-filesystem setups each move is a ~1ms rename, so apply is nearly
+    instant and the scanner is always ahead.
+    """
+    import queue as _queue
+
     for lk in ["history_log","track_history_log"]:
         lp=Path(cfg.get("logging",{}).get(lk,""))
         if lp.name: rotate_log_if_needed(lp,float(cfg.get("logging",{}).get("rotate_log_max_mb",10.0)))
     register_stop_handler()
-    sid,sdir,_=scan_folders(cfg,profile,since=_parse_since(since_str,cfg))
-    pp=Path(cfg["logging"]["session_dir"])/sid/"proposals.json"
-    cmd_apply(cfg,pp,interactive=interactive,auto_above=None,dry_run=dry_run)
+
+    profiles=cfg.get("profiles",{}); profile_obj=profiles[profile]
+    source_root=Path(profile_obj["source_root"]).expanduser()
+    if not source_root.exists(): raise FileNotFoundError(f"source_root missing: {source_root}")
+
+    roots=ensure_roots(profile_obj,source_root)
+    clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
+    clean_root_str =str(roots["clean_root"].resolve())+os.sep
+    review_root_str=str(roots["review_root"].resolve())+os.sep
+
+    sc=cfg.get("scan",{}); exts=[e.lower() for e in sc.get("audio_extensions",[".mp3",".flac",".m4a"])]
+    min_tracks=int(sc.get("min_tracks",3)); follow_sym=bool(sc.get("follow_symlinks",False))
+    leaf_only=bool(sc.get("leaf_folders_only",True))
+    ignore_patterns:List[str]=list(cfg.get("ignore",{}).get("ignore_folder_names",[]) or [])
+    workers=int(sc.get("workers", min(8,(os.cpu_count() or 4))))
+    batch_size=int(sc.get("streaming_batch_size",50))
+    since=_parse_since(since_str,cfg)
+
+    # Session setup
+    session_id=make_session_id()
+    session_dir=Path(cfg["logging"]["session_dir"])/session_id; ensure_dir(session_dir)
+    out(f"\n{C.BOLD}Session:{C.RESET}   {session_id}")
+    out(f"{C.DIM}Pipeline: streaming batches of {batch_size}, {workers} scan workers{C.RESET}",level=VERBOSE)
+
+    # Routing state — built incrementally across batches
+    rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
+    max_unread=float(sc.get("max_unreadable_track_ratio",0.25))
+    seen_names:Counter=Counter()   # accumulates proposed_folder_name counts across batches
+    existing_clean:Set[str]=set()
+    if clean_albums.exists():
+        try:
+            for item in clean_albums.rglob("*"):
+                if item.is_dir(): existing_clean.add(normalize_unicode(item.name))
+        except Exception: pass
+    manifest_entries:Set[str]=set(read_manifest(cfg).get("entries",{}).keys())
+    lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
+    mixes_root=clean_albums.parent/mixes_folder
+
+    # ── Phase 1: collect candidates (fast — just os.walk, no tag reads) ─
+    candidates:List[Path]=[]
+    for root,dirs,files in os.walk(source_root,followlinks=follow_sym):
+        rp=Path(root); rp_str=str(rp.resolve())+os.sep
+        if rp_str.startswith(clean_root_str) or rp_str.startswith(review_root_str): dirs[:]=[] ; continue
+        if leaf_only and dirs: continue
+        if sum(1 for f in files if Path(f).suffix.lower() in exts)>=min_tracks: candidates.append(rp)
+    if since:
+        candidates=[f for f in candidates if dt.datetime.fromtimestamp(folder_mtime(f))>=since]
+        out(f"  --since: {len(candidates)} folders modified after {since.strftime('%Y-%m-%d %H:%M')}",level=VERBOSE)
+    candidates=[rp for rp in candidates if not folder_matches_ignore(rp.name,ignore_patterns)]
+
+    out(f"{C.DIM}Candidates: {len(candidates)} folder(s){C.RESET}",level=VERBOSE)
+
+    # Initialise tag cache
+    _get_tag_cache(cfg)
+
+    # ── Streaming pipeline ───────────────────────────────────────────────
+    # scanner_queue carries completed batches: List[FolderProposal] | None (sentinel)
+    scanner_queue:_queue.Queue=_queue.Queue(maxsize=3)  # backpressure: don't scan too far ahead
+    all_proposals:List[FolderProposal]=[]
+    total_applied=0; total_clean=0; total_review=0; total_dup=0
+    prog=Progress(len(candidates),"Scanning")
+
+    def _scanner_worker():
+        """Background thread: scan candidates in batches, push to queue."""
+        batches=[candidates[i:i+batch_size] for i in range(0,len(candidates),batch_size)]
+        if not batches:
+            scanner_queue.put(None); return
+
+        for batch in batches:
+            if should_stop(): break
+            batch_proposals:List[FolderProposal]=[]
+            # Use thread pool within each batch for parallel tag reading
+            if workers>1 and len(batch)>1:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures={pool.submit(_scan_one_folder,rp,exts,follow_sym,min_tracks,source_root,profile_obj,cfg,prog):rp
+                             for rp in batch}
+                    for fut in as_completed(futures):
+                        if should_stop(): break
+                        try:
+                            prop=fut.result()
+                            if prop: batch_proposals.append(prop)
+                        except Exception as e:
+                            err(f"  scan error: {e}")
+            else:
+                for rp in batch:
+                    if should_stop(): break
+                    prop=_scan_one_folder(rp,exts,follow_sym,min_tracks,source_root,profile_obj,cfg,prog)
+                    if prop: batch_proposals.append(prop)
+
+            # Sort for determinism before pushing
+            batch_proposals.sort(key=lambda p:p.folder_path)
+            scanner_queue.put(batch_proposals)
+
+        scanner_queue.put(None)  # sentinel: scanner done
+        # Save cache after all scanning complete
+        if _tag_cache is not None:
+            _tag_cache.save()
+            out(f"  Tag cache: {_tag_cache.size} entries saved",level=VERBOSE)
+
+    def _scan_one_folder(rp,exts,follow_sym,min_tracks,source_root,profile_obj,cfg,prog):
+        if should_stop(): return None
+        audio_files=list_audio_files(rp,exts,follow_sym)
+        if len(audio_files)<min_tracks:
+            prog.tick(rp.name); return None
+        prog.tick(rp.name)
+        return build_folder_proposal(rp,audio_files,source_root,profile_obj,cfg)
+
+    def _route_batch(batch:List[FolderProposal])->List[FolderProposal]:
+        """Route a batch of proposals. Updates shared seen_names in-place."""
+        # Count within this batch first, then add to seen_names
+        batch_names=Counter(p.proposed_folder_name for p in batch)
+        for p in batch:
+            reasons:List[str]=[]; dest="clean"
+            if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
+                dest="review"; reasons.append("low_confidence")
+            # within-run duplicate: count across all batches seen so far + this batch
+            total_count=seen_names[p.proposed_folder_name]+batch_names[p.proposed_folder_name]
+            if rr.get("route_duplicates",True) and total_count>1:
+                dest="duplicate"
+                reasons.append(f"duplicate_in_run")
+            norm_prop=normalize_unicode(p.proposed_folder_name)
+            if rr.get("route_cross_run_duplicates",True) and (norm_prop in existing_clean or norm_prop in manifest_entries):
+                dest="duplicate"; reasons.append("already_in_clean")
+            if p.decision.get("unreadable_ratio",0.0)>max_unread:
+                dest="review"; reasons.append("unreadable_ratio_high")
+            if p.decision.get("used_heuristic",False):
+                if dest=="clean": dest="review"
+                reasons.append("heuristic_fallback")
+            if p.stats.format_duplicates: reasons.append(f"format_dupes({len(p.stats.format_duplicates)})")
+            if p.decision.get("is_ep"): reasons.append("ep")
+            if p.decision.get("is_mix") and dest=="clean":
+                reasons.append("mix_folder"); ensure_dir(mixes_root)
+                p.target_path=str(mixes_root/p.proposed_folder_name)
+            p.destination=dest; p.decision["route_reasons"]=reasons
+            if dest=="review":     p.target_path=str(review_albums/p.proposed_folder_name)
+            elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
+        # Update global seen_names after routing this batch
+        seen_names.update(p.proposed_folder_name for p in batch)
+        return batch
+
+    # Start scanner in background thread
+    import threading as _threading
+    scanner_thread=_threading.Thread(target=_scanner_worker,daemon=True)
+    scanner_thread.start()
+
+    trc=cfg.get("track_rename",{})
+    do_tracks=(trc.get("enabled",True) and trc.get("scope","clean_only") in ("clean_only","both"))
+
+    # Main thread: drain queue → route → apply → track rename
+    while True:
+        batch=scanner_queue.get()
+        if batch is None: break   # sentinel
+        if not batch: continue
+        if should_stop():
+            out(f"\n{C.YELLOW}Stop requested — flushing remaining queue…{C.RESET}")
+            # Drain remaining batches without applying
+            while True:
+                b=scanner_queue.get()
+                if b is None: break
+            break
+
+        routed=_route_batch(batch)
+        all_proposals.extend(routed)
+
+        # Apply this batch immediately
+        applied=apply_folder_moves(cfg,routed,interactive=interactive,auto_above=None,
+                                    dry_run=dry_run,session_id=session_id,source_root=source_root)
+        total_applied+=len(applied)
+        total_clean +=sum(1 for a in applied if a.get("destination")=="clean")
+        total_review +=sum(1 for a in applied if a.get("destination")=="review")
+        total_dup    +=sum(1 for a in applied if a.get("destination")=="duplicate")
+
+        # Track rename immediately for clean folders in this batch
+        if do_tracks:
+            for a in applied:
+                if a.get("destination")=="clean":
+                    rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),
+                                                   a.get("decision",{}),
+                                                   interactive=interactive,dry_run=dry_run,
+                                                   session_id=session_id)
+
+    prog.done()
+    scanner_thread.join(timeout=5)
+
+    # Write consolidated session report
+    payload={"app":cfg.get("app",{}),"session_id":session_id,"timestamp":now_iso(),"profile":profile,
+             "source_root":str(source_root),"since":since.isoformat() if since else None,
+             "folder_proposals":[dataclasses.asdict(p) for p in all_proposals]}
+    write_json(session_dir/"proposals.json",payload)
+    _write_session_reports(session_id,profile,source_root,all_proposals,session_dir,cfg)
+
+    clean_n=sum(1 for p in all_proposals if p.destination=="clean")
+    rev_n  =sum(1 for p in all_proposals if p.destination=="review")
+    dup_n  =sum(1 for p in all_proposals if p.destination=="duplicate")
+    out(f"\n{C.BOLD}Results:{C.RESET}   {len(all_proposals)} proposals | {C.GREEN}Clean: {clean_n}{C.RESET} | {C.YELLOW}Review: {rev_n}{C.RESET} | {C.RED}Dupes: {dup_n}{C.RESET}")
+    out(f"{C.DIM}Reports:   {session_dir}/report.{{txt,csv,html}}{C.RESET}")
+
     manifest_set_last_run(cfg)
 
 def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str])->None:
@@ -1580,18 +2910,28 @@ def build_parser()->argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="raagdosa",description=f"RaagDosa v{APP_VERSION} — deterministic music library cleanup.",
         formatter_class=argparse.RawDescriptionHelpFormatter,epilog="""
 Examples:
-  raagdosa init                       # guided first-time setup
-  raagdosa doctor                     # verify config, deps, disk
-  raagdosa go --dry-run               # preview — nothing moves
-  raagdosa go                         # scan + move folders + rename tracks
-  raagdosa go --since last_run        # only new folders since last run
-  raagdosa go --interactive           # confirm each folder
-  raagdosa show "/path/to/folder"     # debug a single folder
-  raagdosa status                     # library overview
-  raagdosa verify                     # audit Clean library health
-  raagdosa learn                      # suggest config improvements
-  raagdosa report --format html       # open last session report
-  raagdosa undo --session <id>        # undo a whole session
+  raagdosa init                            # guided first-time setup
+  raagdosa doctor                          # verify config, deps, disk
+  raagdosa go --dry-run                    # preview — nothing moves
+  raagdosa go                              # scan + move folders + rename tracks
+  raagdosa go --since last_run             # only new folders since last run
+  raagdosa go --interactive                # confirm each folder
+  raagdosa show "/path/to/folder"          # debug a single folder
+  raagdosa show "/path/to/folder" --tracks # also show per-track renames
+  raagdosa status                          # library overview
+  raagdosa verify                          # audit Clean library health
+  raagdosa learn                           # suggest config improvements
+  raagdosa report --format html            # open last session report
+  raagdosa undo --session <id>             # undo a whole session
+  raagdosa orphans                         # find loose audio files
+  raagdosa artists --list                  # list all artists in Clean
+  raagdosa artists --find "portishead"     # fuzzy-find an artist
+  raagdosa review-list                     # see what's waiting in Review
+  raagdosa review-list --older-than 30     # Review folders >30 days old
+  raagdosa clean-report                    # stats on your Clean library
+  raagdosa extract "/path/to/mix" --by-artist   # split mix by artist
+  raagdosa compare --folder A B            # diff two folders
+  raagdosa diff last prev                  # compare last two sessions
 """)
     p.add_argument("--config",default="config.yaml"); p.add_argument("--version",action="version",version=f"raagdosa {APP_VERSION}")
     p.add_argument("--verbose",action="store_true"); p.add_argument("--quiet",action="store_true")
@@ -1612,13 +2952,28 @@ Examples:
     tr=sub.add_parser("tracks",help="Track rename pass"); tr.add_argument("--profile"); tr.add_argument("--interactive",action="store_true"); tr.add_argument("--dry-run",action="store_true")
     sub.add_parser("status",help="Library overview").add_argument("--profile")
     rs=sub.add_parser("resume",help="Resume interrupted session"); rs.add_argument("session_id"); rs.add_argument("--interactive",action="store_true"); rs.add_argument("--dry-run",action="store_true")
-    sh=sub.add_parser("show",help="Debug a single folder"); sh.add_argument("folder"); sh.add_argument("--profile")
+    sh=sub.add_parser("show",help="Debug a single folder"); sh.add_argument("folder"); sh.add_argument("--profile"); sh.add_argument("--tracks",action="store_true",help="Also show per-track rename preview")
     sub.add_parser("verify",help="Audit Clean library health").add_argument("--profile")
     le=sub.add_parser("learn",help="Suggest config improvements"); le.add_argument("--session")
     rp=sub.add_parser("report",help="View session report"); rp.add_argument("--session"); rp.add_argument("--format",default="txt",choices=["txt","csv","html"])
     sub.add_parser("doctor",help="Check config, deps, disk, DJ databases")
     hi=sub.add_parser("history",help="Show history"); hi.add_argument("--last",type=int,default=50); hi.add_argument("--session"); hi.add_argument("--match"); hi.add_argument("--tracks",action="store_true")
     un=sub.add_parser("undo",help="Undo moves or renames"); un.add_argument("--id"); un.add_argument("--session"); un.add_argument("--from-path"); un.add_argument("--tracks",action="store_true"); un.add_argument("--folder")
+    # v3.5 commands
+    sub.add_parser("orphans",help="Find loose audio files in Clean/Review").add_argument("--profile")
+    ar=sub.add_parser("artists",help="List or find artists in Clean library"); ar.add_argument("--profile")
+    ar.add_argument("--list",dest="list_mode",action="store_true",help="List all artists")
+    ar.add_argument("--find",dest="find_query",metavar="QUERY",help="Fuzzy-find an artist")
+    rl=sub.add_parser("review-list",help="Summarise Review folder contents"); rl.add_argument("--profile")
+    rl.add_argument("--older-than",type=int,metavar="DAYS",help="Only show folders older than N days")
+    sub.add_parser("clean-report",help="Stats and health report for Clean library").add_argument("--profile")
+    ex=sub.add_parser("extract",help="Extract tracks from a VA/mix folder"); ex.add_argument("folder"); ex.add_argument("--profile")
+    ex.add_argument("--by-artist",action="store_true",required=True,help="Group tracks by artist tag")
+    ex.add_argument("--dry-run",action="store_true")
+    cp=sub.add_parser("compare",help="Compare two folders"); cp.add_argument("--folder",nargs=2,metavar="FOLDER",required=True)
+    df=sub.add_parser("diff",help="Diff two session reports"); df.add_argument("session_a",metavar="SESSION_A"); df.add_argument("session_b",metavar="SESSION_B")
+    ca=sub.add_parser("cache",help="Manage the tag cache (status/clear/evict)")
+    ca.add_argument("action",nargs="?",default="status",choices=["status","clear","evict"])
     return p
 
 def main()->None:
@@ -1650,13 +3005,22 @@ def main()->None:
     elif cmd=="tracks":   cmd_tracks_only(cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run))
     elif cmd=="status":   cmd_status(cfg,gp())
     elif cmd=="resume":   cmd_resume(cfg,args.session_id,interactive=bool(args.interactive),dry_run=bool(args.dry_run))
-    elif cmd=="show":     cmd_show(cfg,args.folder,getattr(args,"profile",None) or cfg.get("active_profile",""))
+    elif cmd=="show":     cmd_show(cfg,args.folder,getattr(args,"profile",None) or cfg.get("active_profile",""),show_tracks=bool(getattr(args,"tracks",False)))
     elif cmd=="verify":   cmd_verify(cfg,gp())
     elif cmd=="learn":    cmd_learn(cfg_path,cfg,getattr(args,"session",None))
     elif cmd=="report":   cmd_report(cfg,getattr(args,"session",None),args.format)
     elif cmd=="doctor":   cmd_doctor(cfg_path,cfg)
     elif cmd=="history":  cmd_history(cfg,last=args.last,session=args.session,match=args.match,tracks=bool(args.tracks))
     elif cmd=="undo":     cmd_undo(cfg,action_id=args.id,session_id=args.session,from_path=args.from_path,tracks=bool(args.tracks),folder=args.folder)
+    # v3.5 commands
+    elif cmd=="orphans":      cmd_orphans(cfg,gp())
+    elif cmd=="artists":      cmd_artists(cfg,gp(),list_mode=bool(getattr(args,"list_mode",False)),find_query=getattr(args,"find_query",None))
+    elif cmd=="review-list":  cmd_review_list(cfg,gp(),older_than_days=getattr(args,"older_than",None))
+    elif cmd=="clean-report": cmd_clean_report(cfg,gp())
+    elif cmd=="extract":      cmd_extract_by_artist(cfg,gp(),args.folder,dry_run=bool(getattr(args,"dry_run",False)))
+    elif cmd=="compare":      cmd_compare_folders(cfg,args.folder[0],args.folder[1])
+    elif cmd=="diff":         cmd_diff(cfg,args.session_a,args.session_b)
+    elif cmd=="cache":        cmd_cache(cfg,args.action)
     else: parser.error(f"Unknown: {cmd}")
 
 if __name__=="__main__":
