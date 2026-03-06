@@ -1,10 +1,10 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "raagdosa"
-version = "3.0.0"
+version = "3.5.2"
 description = "Deterministic music library cleanup for DJs and collectors — CLI-first, safe-by-default, undoable."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -20,10 +20,12 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Multimedia :: Sound/Audio",
   "Topic :: Utilities",
 ]
@@ -39,10 +41,10 @@ dev = ["pytest>=7", "pytest-cov"]
 raagdosa = "raagdosa:main"
 
 [project.urls]
-Homepage    = "https://github.com/YOUR_USERNAME/raagdosa"
-Repository  = "https://github.com/YOUR_USERNAME/raagdosa"
-"Bug Tracker" = "https://github.com/YOUR_USERNAME/raagdosa/issues"
-Changelog   = "https://github.com/YOUR_USERNAME/raagdosa/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/ajeshh/raagdosa"
+Repository = "https://github.com/ajeshh/raagdosa"
+"Bug Tracker" = "https://github.com/ajeshh/raagdosa/issues"
+Changelog = "https://github.com/ajeshh/raagdosa/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 py-modules = ["raagdosa"]
