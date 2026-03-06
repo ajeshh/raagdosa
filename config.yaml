@@ -1,0 +1,557 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RaagDosa v3.0 — Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+# Run `raagdosa init` to generate this file interactively.
+# Run `raagdosa doctor` to validate it.
+# ──────────────────────────────────────────────────────────────────────────────
+
+app:
+  name: RaagDosa
+  version: "3.0"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PROFILES
+# Each profile is an independent source + destination configuration.
+# Switch between profiles with: raagdosa profile use <name>
+# ──────────────────────────────────────────────────────────────────────────────
+profiles:
+  incoming:
+    # Where your messy music lives. Never modified by RaagDosa.
+    source_root: ~/Music/Incoming
+
+    # clean_mode: inside_root  → Clean/ and Review/ are inside source_root
+    #             inside_parent → Clean/ and Review/ are siblings of source_root
+    clean_mode: inside_root
+
+    clean_folder_name:         Clean
+    review_folder_name:        Review
+    clean_albums_folder_name:  Albums
+    clean_tracks_folder_name:  Tracks
+    review_albums_folder_name: Albums
+    duplicates_folder_name:    Duplicates
+    orphans_folder_name:       Orphans
+
+active_profile: incoming
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LIBRARY STRUCTURE
+# How Clean/Albums/ is organised on disk.
+# ──────────────────────────────────────────────────────────────────────────────
+library:
+  # Folder template. Supported tokens: {artist}, {album}, {year}, {album_year}
+  # Presets:
+  #   "{artist}/{album}"              ← recommended (no genre trust required)
+  #   "{album}"                       ← flat — everything under Clean/Albums/
+  template: "{artist}/{album}"
+
+  # FLAC masters get their own subfolder: artist/FLAC/album/
+  # Set true if you want physical separation of lossless masters from MP3 albums.
+  flac_segregation: false
+
+  singles_folder:       _Singles
+  va_folder:            _Various Artists
+  unknown_artist_label: _Unknown
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ARTIST NORMALISATION
+# Fuzzy logic for cleaning up artist name variants before using them as
+# folder names. All settings are hot-editable — re-run after changes.
+# ──────────────────────────────────────────────────────────────────────────────
+artist_normalization:
+  enabled: true
+
+  # "The" prefix policy:
+  #   keep-front   → The Beatles  (default — natural sort order)
+  #   move-to-end  → Beatles, The (library-style filing)
+  #   strip        → Beatles      (minimal — removes "The" entirely)
+  the_prefix: keep-front
+
+  # Normalise typographic hyphen variants (en-dash, em-dash) to ASCII hyphen.
+  # Keeps "Jay-Z" consistent regardless of how it was encoded in the tag.
+  normalize_hyphens: true
+
+  # Jaccard word-set threshold for fuzzy artist deduplication.
+  # 0.92 = "The XX" and "XX" are the same; "Jay-Z" and "Jay Z" are the same.
+  fuzzy_dedup_threshold: 0.92
+
+  # Unicode character map: applied before alias lookup.
+  # Use this for artists whose names contain non-ASCII characters that your
+  # filesystem or DJ software handles poorly.
+  # Example: Ø → O maps "MØ" → "MO" for folder naming.
+  # Leave empty to preserve original Unicode characters.
+  unicode_map: {}
+  #  "Ø": "O"
+  #  "ø": "o"
+  #  "æ": "ae"
+  #  "ß": "ss"
+
+  # Canonical alias map (case-insensitive key lookup).
+  # The key is any variant you've seen in your tags.
+  # The value is the canonical name to use as the folder name.
+  # This is the most powerful normalisation tool — add entries as you
+  # discover inconsistencies in your library.
+  aliases: {}
+  # Examples — uncomment and add your own:
+  #  "jay z":         "Jay-Z"
+  #  "jayz":          "Jay-Z"
+  #  "jay-z":         "Jay-Z"
+  #  "mos def":       "Yasiin Bey"
+  #  "p. diddy":      "Diddy"
+  #  "puff daddy":    "Diddy"
+  #  "biggie":        "The Notorious B.I.G."
+  #  "notorious big": "The Notorious B.I.G."
+  #  "mo":            "MØ"
+  #  "beatles":       "The Beatles"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SCAN
+# Controls which folders and files are considered candidates.
+# ──────────────────────────────────────────────────────────────────────────────
+scan:
+  audio_extensions:
+    - .mp3
+    - .flac
+    - .m4a
+    - .aiff
+    - .wav
+    - .ogg
+    - .opus
+    - .wma
+
+  # Only process leaf folders (folders that contain no sub-folders).
+  # Recommended: true. Prevents double-processing nested structures.
+  leaf_folders_only: true
+
+  # Minimum number of audio files to consider a folder a candidate.
+  # Folders below this threshold are skipped entirely.
+  min_tracks: 3
+
+  # Skip a folder if more than this ratio of its files are unreadable by mutagen.
+  max_unreadable_track_ratio: 0.25
+
+  # Follow symlinks when walking the source tree.
+  # false = safe default; prevents scanning outside the intended source.
+  follow_symlinks: false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INCREMENTAL SCANNING (--since)
+# RaagDosa tracks the timestamp of its last successful run in the manifest.
+# Use `raagdosa go --since last_run` to only process folders that have changed
+# since then. Any folder that has already been committed to Clean (tracked in
+# the manifest) is automatically excluded from all future scans regardless of
+# --since, so re-scanning is safe by design.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IGNORE
+# ──────────────────────────────────────────────────────────────────────────────
+ignore:
+  ignore_single_file_folders: true
+  min_audio_files_for_candidate: 4
+  # Folder names (exact match) to skip entirely during scanning.
+  ignore_folder_names:
+    - Singles
+    - One-Offs
+    - Dump
+    - _dump
+    - Unsorted
+    - Clean
+    - Review
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAG KEYS
+# Mutagen tag key names. The first key in each list that is present wins.
+# Extend these lists if you encounter non-standard tag formats.
+# ──────────────────────────────────────────────────────────────────────────────
+tags:
+  album_keys:
+    - album
+  albumartist_keys:
+    - albumartist
+    - album_artist
+    - album artist
+    - TPE2
+  artist_keys:
+    - artist
+    - TPE1
+  title_keys:
+    - title
+    - TIT2
+  tracknumber_keys:
+    - tracknumber
+    - track
+    - TRCK
+  discnumber_keys:
+    - discnumber
+    - disc
+    - TPOS
+  # Year keys tried in preference order. originaldate is preferred to
+  # capture the original release year rather than a remaster date.
+  year_keys_prefer:
+    - originaldate
+    - original_date
+    - date
+    - year
+    - TDRC
+    - TYER
+  bpm_keys:
+    - bpm
+    - tbpm
+    - TBPM
+  key_keys:
+    - initialkey
+    - key
+    - tkey
+    - TKEY
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NORMALISE (voting pre-processing)
+# Applied to tag values before dominant-value voting. These settings affect
+# which value "wins" — not how the final folder name looks.
+# ──────────────────────────────────────────────────────────────────────────────
+normalize:
+  lower_case: true
+  strip_whitespace: true
+  collapse_whitespace: true
+  # Strip (parenthetical) and [bracket] content before voting.
+  # e.g. "Settle [Deluxe]" and "Settle" vote as the same album.
+  strip_bracketed_phrases_for_voting: true
+  # Strip punctuation before voting (e.g. colons, slashes).
+  strip_punctuation_for_voting: true
+  # Suffixes stripped from the normalised value before voting.
+  # Add any patterns you see repeating in your Review folders.
+  strip_common_suffixes_for_voting:
+    - deluxe edition
+    - deluxe
+    - expanded edition
+    - remaster
+    - remastered
+    - reissue
+    - anniversary edition
+    - bonus tracks
+    - explicit
+    - explicit version
+    - clean version
+    - special edition
+    - collector's edition
+    - limited edition
+    - super deluxe
+    - complete edition
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FUZZY MATCHING
+# ──────────────────────────────────────────────────────────────────────────────
+fuzzy:
+  enabled: true
+  # Similarity threshold for matching folder name vs. album tag during heuristic parsing.
+  similarity_threshold: 0.88
+  # Below this threshold, a filename-derived artist vs. tag artist mismatch
+  # triggers a warning (not a block).
+  prompt_threshold: 0.75
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DECISION ENGINE
+# ──────────────────────────────────────────────────────────────────────────────
+decision:
+  # Minimum share of tracks that must agree on the album value to classify as album.
+  album_dominance_threshold: 0.75
+  albumartist_dominance_threshold: 0.60
+
+  # Fall back to track-level artist tag when albumartist is absent.
+  allow_artist_fallback: true
+
+  # Require interactive confirmation before applying any move.
+  require_confirmation: true
+
+  # Auto-approve moves above this confidence without prompting.
+  auto_approve_above: 0.92
+
+  # Below this confidence, always prompt even if require_confirmation is false.
+  interactive_below: 0.92
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VARIOUS ARTISTS
+# ──────────────────────────────────────────────────────────────────────────────
+various_artists:
+  label: VA
+  albumartist_matches:
+    - various artists
+    - various
+    - va
+    - v/a
+    - v.a.
+  enable_heuristics: true
+  # If unique track artists / total tracks exceeds this, classify as VA.
+  unique_artist_ratio_above: 0.50
+
+# ──────────────────────────────────────────────────────────────────────────────
+# YEAR
+# ──────────────────────────────────────────────────────────────────────────────
+year:
+  enabled: true
+  allowed_range:
+    min: 1900
+    max: 2030
+  # Minimum ratio of tracks that must have a year tag for year to be included.
+  require_presence_ratio: 0.50
+  # Minimum agreement ratio for the dominant year value.
+  agreement_threshold: 0.70
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FOLDER NAME FORMAT
+# Final folder name templates. {albumartist} is the normalized artist name.
+# ──────────────────────────────────────────────────────────────────────────────
+format:
+  pattern_no_year:    "{albumartist} - {album}"
+  pattern_with_year:  "{albumartist} - {album} ({year})"
+  replace_illegal_chars_with: " - "
+  trim_trailing_dots_spaces: true
+
+format_suffix:
+  # Append [FLAC], [AIFF] etc. to folder name when all files are the same
+  # non-MP3 format. Useful for distinguishing FLAC rips alongside MP3 copies.
+  enabled: true
+  only_if_all_same_extension: true
+  ignore_extension: .mp3   # MP3 is the default; no suffix added
+  style: brackets_upper    # brackets_upper → [FLAC] | brackets_lower → [flac]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROUTING
+# ──────────────────────────────────────────────────────────────────────────────
+review_rules:
+  # Confidence below this → Review/Albums/
+  min_confidence_for_clean: 0.85
+
+  # Duplicate within the same scan run → Review/Duplicates/
+  route_duplicates: true
+
+  # Already exists in Clean (manifest or disk scan) → Review/Duplicates/
+  route_cross_run_duplicates: true
+
+  # Low-confidence → Review/Albums/
+  route_questionable_to_review: true
+
+  # Tag-less folders that relied on folder name heuristic → Review/Albums/
+  route_heuristic_to_review: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOVE
+# ──────────────────────────────────────────────────────────────────────────────
+move:
+  enabled: true
+
+  # What to do when a folder with the proposed name already exists at the destination.
+  # suffix → append " (1)", " (2)" etc.
+  # skip   → leave source untouched and log as skipped
+  on_collision: suffix
+  suffix_format: " ({n})"
+
+  # MD5 checksum each file after copy before deleting source.
+  # Slower but byte-verified. Recommended for archival libraries.
+  use_checksum: false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DJ SAFETY
+# ──────────────────────────────────────────────────────────────────────────────
+dj_safety:
+  # Scan source folders for Rekordbox / Serato database files.
+  detect_dj_databases: true
+
+  # Print a warning when DJ databases are detected in a folder being processed.
+  # Moving/renaming files will break Rekordbox/Serato analysis data.
+  warn_on_dj_databases: true
+
+  # Skip folders that contain DJ databases entirely.
+  # false = warn and proceed (recommended: rebuild analysis after library overhaul)
+  # true  = stop and skip (safe if you want to protect existing analysis)
+  halt_on_dj_databases: false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TRACK RENAME
+# Runs on Clean/Albums/ folders after they have been moved.
+# ──────────────────────────────────────────────────────────────────────────────
+track_rename:
+  enabled: true
+  scope: clean_only   # clean_only | both
+
+  allowed_extensions:
+    - .mp3
+    - .flac
+    - .m4a
+  # Extensions that are present in a folder but should never be renamed.
+  skip_extensions:
+    - .wav
+    - .aiff
+
+  patterns:
+    # Standard album: "01 - Title.mp3"
+    album:   "{disc_prefix}{track:02d} - {title}{mix_suffix}{ext}"
+    # Various Artists: "01 - Artist - Title.mp3"
+    various: "{disc_prefix}{track:02d} - {artist} - {title}{mix_suffix}{ext}"
+    # Mixed/unclear: "Artist - Title.mp3"
+    mixed:   "{artist} - {title}{mix_suffix}{ext}"
+
+  disc:
+    enabled: true
+    only_if_multi_disc: true
+    format: "{disc}-"   # produces "1-01 - Title.mp3"
+
+  track_numbers:
+    required_for_album:    true
+    required_for_various:  true
+    pad_width: 2
+    # Derive track number from filename position when tag is missing.
+    fallback_to_filename_order: false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ARTIST FEATURE HANDLING
+# ──────────────────────────────────────────────────────────────────────────────
+artists:
+  feature_handling:
+    enabled: true
+    style: keep_in_artist    # keep_in_artist | move_to_title | strip
+    # Normalise "ft." / "featuring" / "feat" → "feat." in artist + title tags.
+    normalize_tokens: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MIX / VERSION SUFFIX
+# Detects and preserves "(Original Mix)", "(Club Edit)" etc. in track names.
+# ──────────────────────────────────────────────────────────────────────────────
+mix_info:
+  enabled: true
+  detect_keywords:
+    - remix
+    - edit
+    - mix
+    - version
+    - rework
+    - bootleg
+    - dub
+    - original mix
+    - extended mix
+    - extended version
+    - club mix
+    - radio edit
+    - instrumental
+    - acapella
+    - vip
+    - flip
+    - re-edit
+    - re-rub
+    - reprise
+  style: parenthetical   # parenthetical → (Original Mix) | dash → - Original Mix
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TITLE CLEANUP
+# Applied to track title tags before constructing the filename.
+# ──────────────────────────────────────────────────────────────────────────────
+title_cleanup:
+  enabled: true
+
+  # Strip domain names appended to titles ("Track Name - freedownload.com")
+  strip_trailing_domains: true
+
+  # Strip social handles ("Track Name - @producer")
+  strip_trailing_handles: true
+
+  # Trailing phrases (trailing-match, case-insensitive).
+  # These are stripped whether they appear in parentheses or after a dash.
+  strip_trailing_phrases:
+    - official video
+    - official music video
+    - official audio
+    - lyrics
+    - lyric video
+    - visualizer
+    - audio
+    - hq
+    - hd
+    - 4k
+    - free download
+    - download
+    - uploaded by
+    - ripped by
+    - encoded by
+    - rip
+    - webrip
+    - dvdrip
+    - cdrip
+    - 320kbps
+    - 320 kbps
+    - v0
+    - vbr
+    - cbr
+    - 16bit
+    - 24bit
+    - lossless
+    - hi-res
+    - soundcloud
+    - youtube
+    - bandcamp
+    - spotify
+    - prod. by
+    - prod by
+    - produced by
+    - production by
+    - clip
+    - teaser
+    - preview
+    - snippet
+    - exclusive
+    - free dl
+    - direct download
+
+  # Parenthetical content containing these words is KEPT even if the phrase
+  # appears in strip_trailing_phrases above. Protects mix/version labels.
+  keep_parenthetical_if_contains:
+    - live
+    - remaster
+    - edit
+    - mix
+    - version
+    - instrumental
+    - acapella
+    - demo
+    - mono
+    - stereo
+    - original
+    - extended
+    - club
+    - radio
+    - vip
+    - dub
+    - feat
+    - ft.
+    - bonus
+
+  normalize:
+    replace_underscores: true
+    collapse_whitespace: true
+    trim_dots_spaces: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# All paths are relative to the directory where you run raagdosa.
+# ──────────────────────────────────────────────────────────────────────────────
+logging:
+  root_dir:            logs
+  session_dir:         logs/sessions
+  history_log:         logs/history.jsonl
+  skipped_log:         logs/skipped.jsonl
+  track_history_log:   logs/track-history.jsonl
+  track_skipped_log:   logs/track-skipped.jsonl
+
+  # Write human-readable report.txt, report.csv, report.html after each scan.
+  write_human_report: true
+  report_filename:    report.txt
+
+  # Archive the history log when it exceeds this size.
+  rotate_log_max_mb: 10.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UNDO
+# ──────────────────────────────────────────────────────────────────────────────
+undo:
+  allow_undo_by_id:            true
+  allow_undo_by_original_path: true
+  allow_undo_by_session:       true
