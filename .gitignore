@@ -1,0 +1,46 @@
+# ─────────────────────────────
+# RaagDosa runtime artifacts
+# ─────────────────────────────
+
+# Logs and reports
+logs/
+logs/sessions/
+*.log
+
+# Tag cache
+logs/tag_cache.json
+
+# Local databases (future)
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Local data directories
+data/
+state/
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# MacOS noise
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

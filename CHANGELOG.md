@@ -5,6 +5,142 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+---
+
+## [3.5.1] — 2026-03-06
+
+### Release summary
+
+Performance patch. Three independent wins that compound: same-filesystem moves are now
+atomic renames (~1ms vs 1s/album), scan and apply now overlap via a streaming pipeline,
+and a persistent tag cache eliminates mutagen reads for unchanged files on subsequent runs.
+
+---
+
+### Performance
+
+- **Same-filesystem fast path in `safe_move_folder`** — detects when source and destination
+  are on the same device (`st_dev` comparison, walking up ancestry for non-existent paths).
+  Uses `os.rename()` instead of `copytree → verify → rmtree`. Atomic, ~1ms per folder
+  regardless of size. Falls back to copy+verify for cross-device moves. Typical DJ setup
+  (everything on one drive): 500 albums moves from ~8 minutes to ~0.5 seconds.
+
+- **Streaming scan→apply pipeline** — scan and apply now overlap. Candidates are split
+  into configurable batches (`scan.streaming_batch_size`, default 50). A background scanner
+  thread fills a queue; the main thread drains it, routes proposals, applies moves, and
+  renames tracks per batch immediately. First folder moves within seconds of starting even
+  on large libraries. Within-run duplicate tracking is maintained correctly across batches
+  via a shared accumulator.
+
+- **Persistent tag cache** — `TagCache` persisted to `logs/tag_cache.json`, keyed by
+  `(absolute_path, mtime)`. On warm runs (files unchanged), mutagen is skipped entirely.
+  Parallel-safe with `threading.Lock`. Atomic disk write via temp-file replace. Managed
+  via `raagdosa cache` (status / clear / evict).
+
+- **Parallel scan workers** — `ThreadPoolExecutor` within each batch for concurrent tag
+  reading. I/O-bound so threads give ~7× speedup vs sequential. Configurable via
+  `scan.workers` (default: min(8, cpu_count)).
+
+- **Thread-safe progress bar** — `Progress` now uses `Lock` for concurrent tick() calls,
+  shows real-time rate (folders/s) and ETA alongside the bar.
+
+- **move_method logged** — history entries now include `move_method: rename|copy` and
+  elapsed ms. `--dry-run` previews which method would be used per folder.
+
+### Config
+
+- `scan.workers: 8` — parallel scan workers
+- `scan.tag_cache_enabled: true` — persistent tag cache on/off
+- `scan.streaming_batch_size: 50` — folders per batch in streaming pipeline
+
+### Commands
+
+- `raagdosa cache` — show cache status (entries, size, last saved)
+- `raagdosa cache clear` — force full re-read on next scan
+- `raagdosa cache evict` — remove stale entries for missing files
+
+
+## [3.5.0] — 2026-03-06
+
+### Release summary
+
+v3.5 delivers the intelligence layer on top of the v3.0 foundation: deeper naming logic,
+a richer multi-factor confidence system, mix/EP classification, seven new commands, and a suite
+of quality-of-life improvements from the 3.1 planning backlog. No database — stays
+fully CLI-only and file-system-based.
+
+---
+
+### New — Logic / Naming Intelligence
+
+- **EP detection** — folders with 3–6 tracks classified as EPs, labelled `[EP]` in
+  proposed folder name (configurable via `ep_detection`).
+- **Garbage naming** — three-stage pipeline: bracket stack stripper (noise/promo/format
+  bracket groups removed from album names), token flood guard (5+ parenthetical groups
+  flagged), promo watermark detection (`www.`, `.com`, `free download` etc.).
+- **Mojibake detection** — garbled double-encoded Unicode flagged; folder routed to Review.
+- **Title resolution priority chain** — tag-first; numeric filename prefix fallback; heuristic last.
+- **Vinyl track notation** — A1/B2/C3/D4 side-track format recognised and converted to
+  absolute track numbers (A1=1, B1=9, C1=17, D1=25).
+- **Capitalisation pathologies** — ALL CAPS and all-lowercase album/title names converted
+  to intelligent title case. Configurable via `title_case.never_cap` and
+  `title_case.always_cap` (e.g. always-cap `DJ`, `MC`, `UK`, `EP`).
+- **Bracket content classifier** — each bracket group tagged as
+  year | format | edition | remix_credit | promo | noise | unknown.
+- **Per-folder `.raagdosa` override file** — place YAML inside any folder to force
+  `album`, `artist`, `year`, `skip`, or `confidence_boost`.
+- **Disc indicator stripping** — `Album - Disc 1`, `Album (CD2)` normalised to `Album`
+  for voting and deduplication.
+- **Display name noise stripping** — `(Official Audio)`, `[HD]`, `(Lyrics)` stripped
+  from album names and titles before voting.
+
+### New — Completeness + Confidence
+
+- **Named confidence factor breakdown** — `confidence_factors` dict in `decision`:
+  - `dominance` (0.40 weight) — vote quality
+  - `tag_coverage` (0.15) — fraction of tracks with tags
+  - `title_quality` (0.12) — meaningful title ratio
+  - `completeness` (0.12) — track gap and duplicate penalties
+  - `filename_consistency` (0.10) — filename vs tag agreement
+  - `aa_consistency` (0.06) — albumartist uniformity
+  - `folder_alignment` (0.05) — source folder name match bonus
+- **Track gap detection** — missing track numbers penalise `completeness` factor.
+- **Duplicate track numbers** — same track number on two files penalises score.
+- **Meaningful title ratio** — garbage/watermark titles reduce `title_quality`.
+- **Filename-vs-tag consistency** — `Artist - Title` filename pattern scored against tags.
+- **`raagdosa show` confidence bar chart** — each factor shown as colour-coded bar.
+
+### New — Large Folder / Mix Handling
+
+- **Mix / chart classifier** — keyword matching plus unique-artist ratio heuristic.
+- **Mix routing** — mix folders go to `Clean/_Mixes/` (configurable via `library.mixes_folder`).
+- **`raagdosa extract --by-artist FOLDER`** — splits a VA/mix folder into per-artist groups.
+- **`raagdosa compare --folder A B`** — diffs two folders: track overlap, tag comparison.
+
+### New — Commands
+
+- **`raagdosa orphans`** — find loose audio files in Clean/Review outside album subfolders.
+- **`raagdosa artists --list`** — list artist directories with album and track counts.
+- **`raagdosa artists --find <query>`** — fuzzy-find an artist in Clean.
+- **`raagdosa review-list`** — tabular view of Review folders with age, confidence, reason.
+- **`raagdosa review-list --older-than <days>`** — filter to long-stale folders.
+- **`raagdosa clean-report`** — Clean library audit: counts, formats, quality issues.
+- **`raagdosa show --tracks`** — per-track rename preview alongside folder analysis.
+- **`raagdosa diff <session_a> <session_b>`** — compare two sessions side-by-side.
+  Accepts `last` and `prev` as shorthand.
+
+### Improved — From 3.1 planning backlog
+
+- **Extension case normalisation** — `.MP3` → `.mp3` during track rename pass.
+- **Windows reserved filename sanitisation** — `CON`, `NUL`, `PRN`, `COMn`, `LPTn`
+  get a trailing underscore before use as folder names.
+- **Empty parent cleanup** — empty parent dirs left after folder moves are removed.
+- **`ignore_folder_names` glob support** — patterns like `_*`, `tmp*` now work.
+- **Collision detail in route reasons** — `duplicate_in_run` now includes colliding name.
+- **`.raagdosa` override shown in `raagdosa show`** — override applied and displayed.
+
+---
+
 ## [3.0.0] — 2026-03-05
 
 ### Release summary

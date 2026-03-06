@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RaagDosa v3.5
+RaagDosa
 Deterministic library cleanup for DJ music folders — CLI-first, safe-by-default, undoable.
 
 Commands:
@@ -19,6 +19,7 @@ from collections import Counter
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
+from importlib.metadata import version, PackageNotFoundError
 
 try:
     import yaml
@@ -30,8 +31,12 @@ try:
 except Exception:
     MutagenFile = None
 
-APP_VERSION = "3.5.2"
-
+# Version management
+def get_version():
+    try:
+        return version("raagdosa")
+    except PackageNotFoundError:
+        return "dev"
 # ─────────────────────────────────────────────
 # Output / colour / verbosity
 # ─────────────────────────────────────────────
@@ -2907,6 +2912,7 @@ def profile_use(cfg_path:Path,cfg:Dict[str,Any],name:str)->None:
 # CLI
 # ─────────────────────────────────────────────
 def build_parser()->argparse.ArgumentParser:
+    app_version = get_version()
     p=argparse.ArgumentParser(prog="raagdosa",description=f"RaagDosa v{APP_VERSION} — deterministic music library cleanup.",
         formatter_class=argparse.RawDescriptionHelpFormatter,epilog="""
 Examples:

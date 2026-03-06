@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# RaagDosa v3.0 — Configuration
+# RaagDosa — Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 # Run `raagdosa init` to generate this file interactively.
 # Run `raagdosa doctor` to validate it.
@@ -7,7 +7,6 @@
 
 app:
   name: RaagDosa
-  version: "3.5.2"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROFILES
