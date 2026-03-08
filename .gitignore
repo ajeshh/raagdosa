@@ -10,17 +10,30 @@ sessions/
 # Tag cache
 logs/tag_cache.json
 
-# Local databases (future)
-*.db
-*.sqlite
-*.sqlite3
-*.db-shm
-*.db-wal
+# Runtime outputs (future-proof)
+reports/
+output/
+exports/
 
 # Local data directories
 data/
 state/
 cache/
+
+# Temporary working folders
+tmp/
+temp/
+scratch/
+
+# ─────────────────────────────
+# Local databases
+# ─────────────────────────────
+
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
 
 # ─────────────────────────────
 # Python
@@ -30,16 +43,33 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Distribution / packaging
+# Bytecode
+*.pyo
+*.pyd
+
+# ─────────────────────────────
+# Python packaging / build
+# ─────────────────────────────
+
 build/
 dist/
 *.egg-info/
 .eggs/
+pip-wheel-metadata/
 
+# setuptools temporary
+*.manifest
+*.spec
+
+# ─────────────────────────────
 # Testing / coverage
+# ─────────────────────────────
+
+testenv/
+tests/.cache/
+.pytest_cache/
 .coverage
 .coverage.*
-.pytest_cache/
 htmlcov/
 
 # ─────────────────────────────
@@ -49,6 +79,7 @@ htmlcov/
 .venv/
 venv/
 env/
+ENV/
 
 # ─────────────────────────────
 # macOS
@@ -57,17 +88,31 @@ env/
 .DS_Store
 .AppleDouble
 .LSOverride
+._*
 
 # ─────────────────────────────
-# Editors
+# Editors / IDE
 # ─────────────────────────────
 
 .vscode/
 .idea/
 
+# JetBrains
+*.iml
+
 # ─────────────────────────────
-# Misc
+# CLI / shell artifacts
 # ─────────────────────────────
 
 *.swp
 *.swo
+*.tmp
+*.bak
+
+# ─────────────────────────────
+# Local config overrides
+# ─────────────────────────────
+
+config.local.yaml
+.env
+.env.*
