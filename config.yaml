@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# RaagDosa — Configuration
+# RaagDosa v3.0 — Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 # Run `raagdosa init` to generate this file interactively.
 # Run `raagdosa doctor` to validate it.
@@ -7,6 +7,7 @@
 
 app:
   name: RaagDosa
+  version: "3.5"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROFILES
@@ -659,3 +660,67 @@ garbage_naming:
   # is moved as soon as it is scanned). Use 0 or omit to disable streaming
   # (scan-all-then-apply, legacy behaviour).
   streaming_batch_size: 50
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERFORMANCE TIERS
+# Controls workers, lookahead buffer, and courtesy sleep between copy-path moves.
+# Tier sets all values; individual overrides take precedence.
+#
+#   slow   — 2017 Intel MBP, old MacBook Air, 8 GB RAM: workers=1, no parallel
+#   medium — 2019–2021 Intel MBP, 16 GB RAM:            workers=2
+#   fast   — 2021+ M1/M2, 16 GB RAM:                    workers=4
+#   ultra  — 2023+ M3/M4, 32 GB+ RAM, NVMe:             workers=8
+#
+# Override per-run: raagdosa go --performance fast
+# ──────────────────────────────────────────────────────────────────────────────
+performance:
+  tier: medium              # slow | medium | fast | ultra
+  # Optional per-key overrides (comment out to use tier defaults):
+  # workers: 2
+  # streaming_lookahead: 4
+  # sleep_between_moves_ms: 10
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DUPLICATE RESOLUTION
+# When a proposed folder name matches an existing Clean folder, compare contents
+# before routing blindly to Duplicates.
+# ──────────────────────────────────────────────────────────────────────────────
+duplicates:
+  compare_before_routing: true    # enable intelligent comparison
+  merge_missing_tracks: true      # auto-copy missing tracks into existing folder
+                                  # and re-run track rename on the merged folder
+  flac_mp3_coexistence: keep_both # keep_both | prefer_flac | prefer_mp3
+                                  # keep_both + flac_segregation=true → FLAC goes
+                                  # to Artist/FLAC/Album/ automatically
+  size_match_tolerance: 0.01      # 1% — tracks "same size" within this ratio
+  title_match_threshold: 0.90     # fuzzy title similarity required to count as match
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ARTIFACT HANDLING
+# Non-audio files found in album source folders.
+# ──────────────────────────────────────────────────────────────────────────────
+artifacts:
+  enabled: true
+
+  # These extensions travel with the album into Clean/
+  keep_extensions:
+    - .jpg
+    - .jpeg
+    - .pdf
+    - .cue              # cue sheets are kept only if paired with .flac/.ape/.wav
+
+  # These are moved to Review/Artifacts/<folder_name>/ before the album moves
+  quarantine_extensions:
+    - .png              # always quarantine (policy: let go of all PNGs)
+    - .nfo
+    - .sfv
+    - .txt
+    - .url
+    - .log
+    - .m3u
+    - .m3u8
+
+  quarantine_folder: Review/Artifacts
+
+  # Files with unrecognised extensions → quarantine (conservative default)
+  quarantine_unknown: true

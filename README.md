@@ -20,9 +20,8 @@
 </div>
 
 ---
-RaagDosa is a CLI tool that transforms chaotic music folders into a structured DJ-ready library.
 
-It is a local-first, CLI-driven tool that transforms a chaotic music folder into a clean, coherent library structure you can trust. It reads your tags, votes across tracks to find consensus metadata, assigns a confidence score, and routes each album to `Clean/` or `Review/` accordingly.
+RaagDosa is **Calibre for DJs** — a local-first, CLI-driven tool that transforms a chaotic music folder into a clean, coherent library structure you can trust. It reads your tags, votes across tracks to find consensus metadata, assigns a confidence score, and routes each album to `Clean/` or `Review/` accordingly.
 
 It never touches your source. Every action is sessioned, logged, and fully undoable.
 
@@ -182,9 +181,13 @@ Track renames (--tracks)
 | Detected as DJ mix / chart folder | `Clean/_Mixes/` |
 | Confidence < threshold | `Review/Albums/` |
 | Same proposed name appears twice in this run | `Review/Duplicates/` |
-| Already exists in Clean (manifest or disk) | `Review/Duplicates/` |
+| Exists in Clean AND incoming has missing tracks | Tracks merged into existing folder |
+| Exists in Clean as MP3, incoming is FLAC | `Clean/Albums/Artist/FLAC/Album/` (if `flac_segregation: true`) |
+| Exists in Clean as FLAC, incoming is MP3 | `Review/Duplicates/` tagged `lower_quality_mp3` |
+| Already exists in Clean (exact or partial) | `Review/Duplicates/` |
 | Tags absent, folder name used as fallback | `Review/Albums/` |
 | Too many unreadable files | `Review/Albums/` |
+| Non-audio junk (`.nfo`, `.log`, `.png`, etc.) | `Review/Artifacts/<album>/` |
 
 Review is a **holding area**, not a bin. Nothing is ever deleted.
 
@@ -194,7 +197,7 @@ Review is a **holding area**, not a bin. Nothing is ever deleted.
 
 RaagDosa is fast even on large libraries:
 
-| Library | Old (sequential) | v3.5 (same drive) | v3.5 (first scan) | v3.5 (warm cache) |
+| Library | Old (sequential) | v3.81 (same drive) | v3.81 (first scan) | v3.81 (warm cache) |
 |---------|-----------------|-------------------|-------------------|-------------------|
 | 600 tracks | ~50s | **<1s** | ~2s | **<1s** |
 | 6k tracks | ~8m | **<2s** | ~8s | **<1s** |
@@ -251,13 +254,32 @@ year: 1998
 confidence_boost: 0.15
 ```
 
-### Performance
+### Performance tier
 
 ```yaml
-scan:
-  workers: 8                  # parallel tag-reading workers
-  tag_cache_enabled: true     # persist tag cache between runs
-  streaming_batch_size: 50    # folders per batch (smaller = sooner first move)
+performance:
+  tier: medium    # slow | medium | fast | ultra
+  # Individual overrides (optional):
+  # workers: 4
+  # sleep_between_moves_ms: 0
+```
+
+### Artifact handling
+
+```yaml
+artifacts:
+  enabled: true
+  keep_extensions: [.jpg, .jpeg, .pdf, .cue]
+  quarantine_extensions: [.png, .nfo, .sfv, .txt, .url, .log, .m3u, .m3u8]
+  quarantine_folder: Review/Artifacts
+
+### Duplicate resolution
+
+```yaml
+duplicates:
+  compare_before_routing: true   # compare contents before routing to Duplicates
+  merge_missing_tracks: true     # auto-copy missing tracks into existing folder
+  flac_mp3_coexistence: keep_both
 ```
 
 ---

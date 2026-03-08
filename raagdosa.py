@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RaagDosa
+RaagDosa v3.5
 Deterministic library cleanup for DJ music folders — CLI-first, safe-by-default, undoable.
 
 Commands:
@@ -19,7 +19,6 @@ from collections import Counter
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
-from importlib.metadata import version, PackageNotFoundError
 
 try:
     import yaml
@@ -31,12 +30,56 @@ try:
 except Exception:
     MutagenFile = None
 
-# Version management
-def get_version():
+APP_VERSION = "3.81"
+
+# ─────────────────────────────────────────────────────────────────
+# Hardware performance tiers
+# ─────────────────────────────────────────────────────────────────
+_PERF_TIERS: Dict[str, Dict[str, int]] = {
+    "slow":   {"workers": 1, "lookahead": 1,  "sleep_copy_ms": 50},
+    "medium": {"workers": 2, "lookahead": 4,  "sleep_copy_ms": 10},
+    "fast":   {"workers": 4, "lookahead": 8,  "sleep_copy_ms": 0},
+    "ultra":  {"workers": 8, "lookahead": 16, "sleep_copy_ms": 0},
+}
+
+def resolve_perf_settings(cfg: Dict[str, Any], cli_tier: Optional[str] = None) -> Dict[str, Any]:
+    """Return resolved performance settings, merging tier defaults with per-key overrides."""
+    pc = cfg.get("performance", {})
+    tier_name = (cli_tier or pc.get("tier", "medium")).lower()
+    if tier_name not in _PERF_TIERS:
+        tier_name = "medium"
+    base = dict(_PERF_TIERS[tier_name])
+    # Per-key overrides win
+    if "workers"               in pc: base["workers"]        = int(pc["workers"])
+    if "streaming_lookahead"   in pc: base["lookahead"]      = int(pc["streaming_lookahead"])
+    if "sleep_between_moves_ms" in pc: base["sleep_copy_ms"] = int(pc["sleep_between_moves_ms"])
+    # Legacy: scan.workers still honoured if no performance section
+    if "workers" not in (cfg.get("performance") or {}) and "workers" in cfg.get("scan", {}):
+        base["workers"] = int(cfg["scan"]["workers"])
+    return base
+
+def detect_recommended_tier() -> str:
+    """Lightweight hardware heuristic — no psutil required."""
+    cores = os.cpu_count() or 1
+    ram_gb = 0
     try:
-        return version("raagdosa")
-    except PackageNotFoundError:
-        return "dev"
+        import platform
+        if platform.system() == "Darwin":
+            import subprocess as _sp
+            r = _sp.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2)
+            ram_gb = int(r.stdout.strip()) // 1024 // 1024 // 1024
+        elif platform.system() == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal"):
+                        ram_gb = int(line.split()[1]) // 1024 // 1024; break
+    except Exception:
+        pass
+    if cores <= 2 or (0 < ram_gb <= 8):  return "slow"
+    if cores <= 4 or (0 < ram_gb <= 16): return "medium"
+    if cores <= 8 or (0 < ram_gb <= 32): return "fast"
+    return "ultra"
+
 # ─────────────────────────────────────────────
 # Output / colour / verbosity
 # ─────────────────────────────────────────────
@@ -1152,6 +1195,108 @@ def fp_from_dict(d:Dict[str,Any])->FolderProposal:
                           destination=d["destination"],confidence=d["confidence"],
                           decision=d["decision"],stats=stats)
 
+
+# ─────────────────────────────────────────────────────────────────
+# Artifact classification
+# ─────────────────────────────────────────────────────────────────
+def _png_is_large(path:Path, min_dim:int=800)->bool:
+    """Return True if PNG dimensions are >= min_dim x min_dim. Requires Pillow."""
+    if not _HAS_PIL: return False   # no Pillow → caller decides policy
+    try:
+        with _PILImage.open(str(path)) as img:
+            w,h=img.size
+            return w>=min_dim and h>=min_dim
+    except Exception:
+        return False
+
+def _cue_has_paired_audio(path:Path)->bool:
+    """Return True if a .cue sheet has a matching .flac or .ape file alongside."""
+    stem=path.stem
+    for ext in (".flac",".ape",".wav"):
+        if (path.parent/(stem+ext)).exists():
+            return True
+    return False
+
+def classify_artifacts(folder:Path, cfg:Dict[str,Any])->Dict[str,List[Path]]:
+    """
+    Classify all non-audio, non-hidden files in folder into:
+        keep       — moves with the album (jpg/jpeg/pdf/qualifying cue)
+        quarantine — sent to Review/Artifacts/<folder_name>/
+        ignore     — hidden/system files (already filtered)
+        unknown    — unrecognised extensions → quarantine by default
+
+    Returns dict with those four keys.
+    """
+    ac=cfg.get("artifacts",{})
+    if not ac.get("enabled",True):
+        return {"keep":[],"quarantine":[],"ignore":[],"unknown":[]}
+
+    keep_exts   ={e.lower() for e in ac.get("keep_extensions",[".jpg",".jpeg",".pdf"])}
+    smart_exts  ={e.lower() for e in ac.get("smart_extensions",[])}
+    quar_exts   ={e.lower() for e in ac.get("quarantine_extensions",
+                    [".nfo",".sfv",".txt",".url",".log",".m3u",".m3u8"])}
+    min_dim     =int(ac.get("smart_png_min_dimension",800))
+    quar_unknown=bool(ac.get("quarantine_unknown",True))
+    audio_exts  ={".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma"}
+
+    result:Dict[str,List[Path]]={"keep":[],"quarantine":[],"ignore":[],"unknown":[]}
+    try:
+        for p in folder.iterdir():
+            if not p.is_file(): continue
+            if is_hidden_file(p): result["ignore"].append(p); continue
+            sfx=p.suffix.lower()
+            if sfx in audio_exts: continue          # audio files handled elsewhere
+            if sfx in keep_exts:
+                # Special case: .cue — keep only if paired audio exists
+                if sfx==".cue":
+                    if _cue_has_paired_audio(p): result["keep"].append(p)
+                    else: result["quarantine"].append(p)
+                else:
+                    result["keep"].append(p)
+            elif sfx in smart_exts:
+                # .png — always quarantine (policy: let go of all PNGs)
+                result["quarantine"].append(p)
+            elif sfx in quar_exts:
+                result["quarantine"].append(p)
+            else:
+                if quar_unknown: result["quarantine"].append(p)
+                else: result["unknown"].append(p)
+    except PermissionError:
+        pass
+    return result
+
+def move_artifacts_to_quarantine(
+    artifacts:Dict[str,List[Path]],
+    folder_name:str,
+    cfg:Dict[str,Any],
+    profile_obj:Dict[str,Any],
+    source_root:Path,
+    dry_run:bool=False,
+    session_id:str=""
+)->int:
+    """Move quarantine files to Review/Artifacts/<folder_name>/. Returns count moved."""
+    files=artifacts.get("quarantine",[])
+    if not files: return 0
+    ac=cfg.get("artifacts",{})
+    qfolder_rel=ac.get("quarantine_folder","Review/Artifacts")
+    roots=ensure_roots(profile_obj,source_root)
+    qfolder=roots["review_root"]/Path(qfolder_rel).parts[-1]/folder_name
+    moved=0
+    for f in files:
+        if not f.exists(): continue
+        if dry_run:
+            out(f"    {C.DIM}[artifact dry-run]{C.RESET} quarantine: {f.name}")
+            continue
+        try:
+            ensure_dir(qfolder)
+            dst=qfolder/f.name
+            if dst.exists(): dst=qfolder/(f.stem+"_"+uuid.uuid4().hex[:6]+f.suffix)
+            shutil.move(str(f),str(dst))
+            moved+=1
+        except Exception as e:
+            err(f"    artifact move failed ({f.name}): {e}")
+    return moved
+
 def list_audio_files(folder:Path,exts:List[str],follow_symlinks:bool=False)->List[Path]:
     out_f:List[Path]=[]
     try:
@@ -1550,6 +1695,134 @@ def collision_resolve(dst:Path,policy:str,suffix_fmt:str)->Optional[Path]:
         cand=Path(str(dst)+suffix_fmt.format(n=n))
         if not cand.exists(): return cand
         n+=1
+
+
+# ─────────────────────────────────────────────────────────────────
+# Intelligent duplicate resolution
+# ─────────────────────────────────────────────────────────────────
+def _norm_title(s:str)->str:
+    """Normalise a title for fuzzy comparison: lowercase, strip numbers/punctuation."""
+    s=(s or "").lower().strip()
+    s=re.sub(r'^\d+[.\-_\s]+','',s)   # strip leading track number
+    s=re.sub(r'[^\w\s]','',s)
+    return re.sub(r'\s+',' ',s).strip()
+
+def _title_similarity(a:str,b:str)->float:
+    """Simple Jaccard word-set similarity for title matching."""
+    wa=set(_norm_title(a).split()); wb=set(_norm_title(b).split())
+    if not wa or not wb: return 0.0
+    return len(wa&wb)/len(wa|wb)
+
+def compare_with_existing(
+    incoming_path:Path,
+    existing_path:Path,
+    incoming_tags:List[Dict],
+    existing_tags:List[Dict],
+    cfg:Dict[str,Any],
+)->Dict[str,Any]:
+    """
+    Compare incoming folder against existing Clean folder.
+
+    Returns a result dict:
+        outcome:  exact_duplicate | missing_tracks | format_upgrade |
+                  lower_quality_mp3 | partial_overlap | unknown
+        missing_in_existing:  List[Path]  (files in incoming not in existing)
+        matched:  int
+        unmatched_existing: int
+        incoming_formats: set
+        existing_formats: set
+    """
+    dc=cfg.get("duplicates",{})
+    title_thresh=float(dc.get("title_match_threshold",0.90))
+    size_tol    =float(dc.get("size_match_tolerance",0.01))
+
+    inc_audio=[p for p in incoming_path.iterdir()
+               if p.is_file() and p.suffix.lower() in {".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus"}]
+    ex_audio =[p for p in existing_path.iterdir()
+               if p.is_file() and p.suffix.lower() in {".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus"}]
+
+    inc_formats={p.suffix.lower() for p in inc_audio}
+    ex_formats ={p.suffix.lower() for p in ex_audio}
+
+    # Build title→path maps from tags
+    def tag_map(files,tags_list):
+        m={}
+        for f,t in zip(files,tags_list or [{}]*len(files)):
+            title=(t or {}).get("title") or _norm_title(f.stem)
+            m[_norm_title(title)]=f
+        return m
+
+    inc_map=tag_map(inc_audio,incoming_tags)
+    ex_map =tag_map(ex_audio, existing_tags)
+
+    # Find tracks in incoming not matched in existing
+    missing_in_existing:List[Path]=[]
+    for inc_title,inc_file in inc_map.items():
+        best=max(((_title_similarity(inc_title,ex_t),ex_t) for ex_t in ex_map), default=(0,""))
+        if best[0]<title_thresh:
+            missing_in_existing.append(inc_file)
+
+    matched=len(inc_map)-len(missing_in_existing)
+
+    # Determine outcome
+    # Format upgrade: incoming is FLAC, existing is MP3 only
+    if ".flac" in inc_formats and ".flac" not in ex_formats and matched>=max(1,len(inc_map)-1):
+        outcome="format_upgrade"
+    # Lower quality: incoming is MP3, existing has FLAC
+    elif ".flac" in ex_formats and ".flac" not in inc_formats and matched>=max(1,len(inc_map)-1):
+        outcome="lower_quality_mp3"
+    # Exact duplicate: all tracks match, similar sizes
+    elif not missing_in_existing and inc_formats==ex_formats:
+        # Check size similarity
+        inc_total=sum(f.stat().st_size for f in inc_audio)
+        ex_total =sum(f.stat().st_size for f in ex_audio)
+        size_ok=abs(inc_total-ex_total)/max(ex_total,1)<=size_tol if ex_total else True
+        outcome="exact_duplicate" if size_ok else "partial_overlap"
+    elif missing_in_existing and matched>0:
+        outcome="missing_tracks"
+    else:
+        outcome="partial_overlap"
+
+    return {
+        "outcome":outcome,
+        "missing_in_existing":missing_in_existing,
+        "matched":matched,
+        "unmatched_existing":len(ex_map)-matched,
+        "incoming_formats":inc_formats,
+        "existing_formats":ex_formats,
+        "incoming_count":len(inc_audio),
+        "existing_count":len(ex_audio),
+    }
+
+def merge_missing_tracks(
+    missing_files:List[Path],
+    existing_path:Path,
+    cfg:Dict[str,Any],
+    session_id:str,
+    dry_run:bool=False
+)->List[str]:
+    """
+    Copy missing tracks into existing_path and re-run track rename on the folder.
+    Returns list of copied filenames.
+    """
+    copied=[]
+    hist_path=Path(cfg.get("logging",{}).get("track_history_log","logs/track_history.jsonl"))
+    for f in missing_files:
+        dst=existing_path/f.name
+        if dst.exists():
+            # avoid collision
+            dst=existing_path/(f.stem+"_merged"+f.suffix)
+        if dry_run:
+            out(f"    {C.DIM}[merge dry-run]{C.RESET} would copy: {f.name}")
+            copied.append(f.name); continue
+        try:
+            shutil.copy2(str(f),str(dst))
+            copied.append(f.name)
+            append_jsonl(hist_path,{"action_id":uuid.uuid4().hex[:10],"timestamp":now_iso(),
+                "session_id":session_id,"type":"track_merge","src":str(f),"dst":str(dst)})
+        except Exception as e:
+            err(f"    merge copy failed ({f.name}): {e}")
+    return copied
 
 def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interactive:bool,
                        auto_above:Optional[float],dry_run:bool,session_id:str,
@@ -2507,24 +2780,20 @@ def cmd_apply(cfg:Dict[str,Any],proposals_path:Path,interactive:bool,auto_above:
             if a.get("destination")=="clean":
                 rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),a.get("decision",{}),interactive=interactive,dry_run=dry_run,session_id=session_id)
 
-def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since_str:Optional[str])->None:
+def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,
+               since_str:Optional[str]=None,perf_tier:Optional[str]=None)->None:
     """
-    Streaming pipeline: scan a batch → apply that batch → scan next batch in parallel.
+    True per-album streaming pipeline (v3.81).
 
     Architecture:
-      - Candidate folders are split into batches (default 50 folders each).
-      - A scanner thread fills a queue with completed FolderProposal batches.
-      - The main thread drains the queue, routes proposals, and applies moves.
-      - While the main thread is applying batch N, the scanner is already
-        reading tags for batch N+1.
-      - Within-run duplicate tracking is maintained across batches via a
-        shared seen_names set that grows as each batch is committed.
-
-    Result: first folder moves within seconds of starting even on huge libraries.
-    On same-filesystem setups each move is a ~1ms rename, so apply is nearly
-    instant and the scanner is always ahead.
+      - Walk source → queue of individual candidate folders
+      - Scanner thread pre-reads tags for `lookahead` folders ahead
+      - Main thread: for each folder: route → artifact quarantine → apply move
+        → track rename → duplicate resolution → immediately continue to next
+      - First album moves within seconds of starting on any library size
+      - Performance tier controls workers, lookahead, and copy-path sleep
     """
-    import queue as _queue
+    import queue as _queue, threading as _threading
 
     for lk in ["history_log","track_history_log"]:
         lp=Path(cfg.get("logging",{}).get(lk,""))
@@ -2540,197 +2809,298 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     clean_root_str =str(roots["clean_root"].resolve())+os.sep
     review_root_str=str(roots["review_root"].resolve())+os.sep
 
+    # ── Performance settings ──────────────────────────────────────
+    perf=resolve_perf_settings(cfg, perf_tier)
+    workers     =perf["workers"]
+    lookahead   =perf["lookahead"]
+    sleep_copy  =perf["sleep_copy_ms"]/1000.0
+
     sc=cfg.get("scan",{}); exts=[e.lower() for e in sc.get("audio_extensions",[".mp3",".flac",".m4a"])]
     min_tracks=int(sc.get("min_tracks",3)); follow_sym=bool(sc.get("follow_symlinks",False))
     leaf_only=bool(sc.get("leaf_folders_only",True))
     ignore_patterns:List[str]=list(cfg.get("ignore",{}).get("ignore_folder_names",[]) or [])
-    workers=int(sc.get("workers", min(8,(os.cpu_count() or 4))))
-    batch_size=int(sc.get("streaming_batch_size",50))
     since=_parse_since(since_str,cfg)
+
+    rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
+    max_unread=float(sc.get("max_unreadable_track_ratio",0.25))
+    lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
+    mixes_root=clean_albums.parent/mixes_folder
+    dc=cfg.get("duplicates",{}); do_dup_compare=bool(dc.get("compare_before_routing",True))
+    do_merge    =bool(dc.get("merge_missing_tracks",True))
+    flac_coex   =dc.get("flac_mp3_coexistence","keep_both")
+    do_artifacts=bool(cfg.get("artifacts",{}).get("enabled",True))
+    trc=cfg.get("track_rename",{})
+    do_tracks=(trc.get("enabled",True) and trc.get("scope","clean_only") in ("clean_only","both"))
 
     # Session setup
     session_id=make_session_id()
     session_dir=Path(cfg["logging"]["session_dir"])/session_id; ensure_dir(session_dir)
     out(f"\n{C.BOLD}Session:{C.RESET}   {session_id}")
-    out(f"{C.DIM}Pipeline: streaming batches of {batch_size}, {workers} scan workers{C.RESET}",level=VERBOSE)
+    tier_name=perf_tier or cfg.get("performance",{}).get("tier","medium")
+    out(f"{C.DIM}Performance: {tier_name}  workers={workers}  lookahead={lookahead}  sleep={perf['sleep_copy_ms']}ms{C.RESET}",level=VERBOSE)
 
-    # Routing state — built incrementally across batches
-    rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
-    max_unread=float(sc.get("max_unreadable_track_ratio",0.25))
-    seen_names:Counter=Counter()   # accumulates proposed_folder_name counts across batches
+    # Pre-load existing Clean names for cross-run dedup
+    seen_names:Counter=Counter()
     existing_clean:Set[str]=set()
+    existing_clean_paths:Dict[str,Path]={}    # name → actual path (for comparison)
     if clean_albums.exists():
         try:
             for item in clean_albums.rglob("*"):
-                if item.is_dir(): existing_clean.add(normalize_unicode(item.name))
+                if item.is_dir():
+                    n=normalize_unicode(item.name)
+                    existing_clean.add(n)
+                    existing_clean_paths[n]=item
         except Exception: pass
     manifest_entries:Set[str]=set(read_manifest(cfg).get("entries",{}).keys())
-    lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
-    mixes_root=clean_albums.parent/mixes_folder
 
-    # ── Phase 1: collect candidates (fast — just os.walk, no tag reads) ─
+    # ── Phase 1: collect candidate paths ──────────────────────────
     candidates:List[Path]=[]
     for root,dirs,files in os.walk(source_root,followlinks=follow_sym):
         rp=Path(root); rp_str=str(rp.resolve())+os.sep
-        if rp_str.startswith(clean_root_str) or rp_str.startswith(review_root_str): dirs[:]=[] ; continue
+        if rp_str.startswith(clean_root_str) or rp_str.startswith(review_root_str): dirs[:]=[];continue
         if leaf_only and dirs: continue
         if sum(1 for f in files if Path(f).suffix.lower() in exts)>=min_tracks: candidates.append(rp)
     if since:
         candidates=[f for f in candidates if dt.datetime.fromtimestamp(folder_mtime(f))>=since]
         out(f"  --since: {len(candidates)} folders modified after {since.strftime('%Y-%m-%d %H:%M')}",level=VERBOSE)
     candidates=[rp for rp in candidates if not folder_matches_ignore(rp.name,ignore_patterns)]
+    total_n=len(candidates)
+    out(f"{C.DIM}Candidates: {total_n} folder(s){C.RESET}",level=VERBOSE)
 
-    out(f"{C.DIM}Candidates: {len(candidates)} folder(s){C.RESET}",level=VERBOSE)
-
-    # Initialise tag cache
     _get_tag_cache(cfg)
 
-    # ── Streaming pipeline ───────────────────────────────────────────────
-    # scanner_queue carries completed batches: List[FolderProposal] | None (sentinel)
-    scanner_queue:_queue.Queue=_queue.Queue(maxsize=3)  # backpressure: don't scan too far ahead
+    # ── Streaming pipeline ─────────────────────────────────────────
+    # Queue carries individual FolderProposal|None (sentinel)
+    # lookahead controls queue maxsize — scanner runs this many folders ahead
+    scanner_queue:_queue.Queue=_queue.Queue(maxsize=max(1,lookahead))
     all_proposals:List[FolderProposal]=[]
-    total_applied=0; total_clean=0; total_review=0; total_dup=0
-    prog=Progress(len(candidates),"Scanning")
+    total_clean=0; total_review=0; total_dup=0; total_merged=0; total_artifacts=0
+    prog=Progress(total_n,"Processing")
+
+    def _scan_one(rp:Path)->Optional[FolderProposal]:
+        if should_stop(): return None
+        audio_files=list_audio_files(rp,exts,follow_sym)
+        if len(audio_files)<min_tracks: prog.tick(rp.name); return None
+        return build_folder_proposal(rp,audio_files,source_root,profile_obj,cfg)
 
     def _scanner_worker():
-        """Background thread: scan candidates in batches, push to queue."""
-        batches=[candidates[i:i+batch_size] for i in range(0,len(candidates),batch_size)]
-        if not batches:
-            scanner_queue.put(None); return
-
-        for batch in batches:
-            if should_stop(): break
-            batch_proposals:List[FolderProposal]=[]
-            # Use thread pool within each batch for parallel tag reading
-            if workers>1 and len(batch)>1:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures={pool.submit(_scan_one_folder,rp,exts,follow_sym,min_tracks,source_root,profile_obj,cfg,prog):rp
-                             for rp in batch}
-                    for fut in as_completed(futures):
-                        if should_stop(): break
-                        try:
-                            prop=fut.result()
-                            if prop: batch_proposals.append(prop)
-                        except Exception as e:
-                            err(f"  scan error: {e}")
-            else:
-                for rp in batch:
+        # Pre-read tags for each folder; push individual proposals to queue
+        if workers>1 and total_n>1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures={pool.submit(_scan_one,rp):rp for rp in candidates}
+                # Submit in order; yield in completion order
+                for fut in as_completed(futures):
                     if should_stop(): break
-                    prop=_scan_one_folder(rp,exts,follow_sym,min_tracks,source_root,profile_obj,cfg,prog)
-                    if prop: batch_proposals.append(prop)
-
-            # Sort for determinism before pushing
-            batch_proposals.sort(key=lambda p:p.folder_path)
-            scanner_queue.put(batch_proposals)
-
-        scanner_queue.put(None)  # sentinel: scanner done
-        # Save cache after all scanning complete
+                    try:
+                        prop=fut.result()
+                        scanner_queue.put(prop)   # None = skip, main thread handles
+                    except Exception as e:
+                        err(f"  scan error: {e}"); scanner_queue.put(None)
+        else:
+            for rp in candidates:
+                if should_stop(): scanner_queue.put(None); break
+                scanner_queue.put(_scan_one(rp))
+        scanner_queue.put("DONE")
         if _tag_cache is not None:
             _tag_cache.save()
             out(f"  Tag cache: {_tag_cache.size} entries saved",level=VERBOSE)
 
-    def _scan_one_folder(rp,exts,follow_sym,min_tracks,source_root,profile_obj,cfg,prog):
-        if should_stop(): return None
-        audio_files=list_audio_files(rp,exts,follow_sym)
-        if len(audio_files)<min_tracks:
-            prog.tick(rp.name); return None
-        prog.tick(rp.name)
-        return build_folder_proposal(rp,audio_files,source_root,profile_obj,cfg)
+    def _route_one(p:FolderProposal)->FolderProposal:
+        """Route a single proposal. Updates seen_names."""
+        reasons:List[str]=[]; dest="clean"
+        if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
+            dest="review"; reasons.append("low_confidence")
+        seen_names[p.proposed_folder_name]+=1
+        if rr.get("route_duplicates",True) and seen_names[p.proposed_folder_name]>1:
+            dest="duplicate"; reasons.append("duplicate_in_run")
+        norm_prop=normalize_unicode(p.proposed_folder_name)
+        is_existing_clean=(norm_prop in existing_clean or norm_prop in manifest_entries)
+        if rr.get("route_cross_run_duplicates",True) and is_existing_clean:
+            dest="duplicate"; reasons.append("already_in_clean")
+        if p.decision.get("unreadable_ratio",0.0)>max_unread:
+            dest="review"; reasons.append("unreadable_ratio_high")
+        if p.decision.get("used_heuristic",False):
+            if dest=="clean": dest="review"
+            reasons.append("heuristic_fallback")
+        if p.stats.format_duplicates: reasons.append(f"format_dupes({len(p.stats.format_duplicates)})")
+        if p.decision.get("is_ep"): reasons.append("ep")
+        if p.decision.get("is_mix") and dest=="clean":
+            reasons.append("mix_folder"); ensure_dir(mixes_root)
+            p.target_path=str(mixes_root/p.proposed_folder_name)
+        p.destination=dest; p.decision["route_reasons"]=reasons
+        if dest=="review":      p.target_path=str(review_albums/p.proposed_folder_name)
+        elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
+        return p
 
-    def _route_batch(batch:List[FolderProposal])->List[FolderProposal]:
-        """Route a batch of proposals. Updates shared seen_names in-place."""
-        # Count within this batch first, then add to seen_names
-        batch_names=Counter(p.proposed_folder_name for p in batch)
-        for p in batch:
-            reasons:List[str]=[]; dest="clean"
-            if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
-                dest="review"; reasons.append("low_confidence")
-            # within-run duplicate: count across all batches seen so far + this batch
-            total_count=seen_names[p.proposed_folder_name]+batch_names[p.proposed_folder_name]
-            if rr.get("route_duplicates",True) and total_count>1:
-                dest="duplicate"
-                reasons.append(f"duplicate_in_run")
-            norm_prop=normalize_unicode(p.proposed_folder_name)
-            if rr.get("route_cross_run_duplicates",True) and (norm_prop in existing_clean or norm_prop in manifest_entries):
-                dest="duplicate"; reasons.append("already_in_clean")
-            if p.decision.get("unreadable_ratio",0.0)>max_unread:
-                dest="review"; reasons.append("unreadable_ratio_high")
-            if p.decision.get("used_heuristic",False):
-                if dest=="clean": dest="review"
-                reasons.append("heuristic_fallback")
-            if p.stats.format_duplicates: reasons.append(f"format_dupes({len(p.stats.format_duplicates)})")
-            if p.decision.get("is_ep"): reasons.append("ep")
-            if p.decision.get("is_mix") and dest=="clean":
-                reasons.append("mix_folder"); ensure_dir(mixes_root)
-                p.target_path=str(mixes_root/p.proposed_folder_name)
-            p.destination=dest; p.decision["route_reasons"]=reasons
-            if dest=="review":     p.target_path=str(review_albums/p.proposed_folder_name)
-            elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
-        # Update global seen_names after routing this batch
-        seen_names.update(p.proposed_folder_name for p in batch)
-        return batch
+    def _handle_duplicate(p:FolderProposal)->str:
+        """
+        Intelligent duplicate handling. Returns final outcome label.
+        Mutates p.destination and p.decision in place.
+        """
+        if not do_dup_compare: return "duplicate"
+        norm_prop=normalize_unicode(p.proposed_folder_name)
+        ex_path=existing_clean_paths.get(norm_prop)
+        if ex_path is None or not ex_path.exists(): return "duplicate"
 
-    # Start scanner in background thread
-    import threading as _threading
+        inc_path=Path(p.folder_path)
+        # Read tags for both sides (use cache)
+        inc_audio=list_audio_files(inc_path,exts,follow_sym)
+        ex_audio =list_audio_files(ex_path, exts,follow_sym)
+        inc_tags=[read_audio_tags(f,cfg) for f in inc_audio]
+        ex_tags =[read_audio_tags(f,cfg) for f in ex_audio]
+
+        result=compare_with_existing(inc_path,ex_path,inc_tags,ex_tags,cfg)
+        outcome=result["outcome"]
+        p.decision["dup_compare"]=result
+        p.decision["dup_compare"]["missing_in_existing"]=[str(f) for f in result.get("missing_in_existing",[])]
+
+        if outcome=="missing_tracks" and do_merge:
+            missing=result.get("missing_in_existing",[])
+            copied=merge_missing_tracks(missing,ex_path,cfg,session_id,dry_run=dry_run)
+            p.decision["merged_tracks"]=copied
+            p.destination="merged"; p.decision["route_reasons"].append(f"merged_{len(copied)}_tracks")
+            # Re-run track rename on the now-augmented existing folder
+            if do_tracks and not dry_run:
+                rename_tracks_in_clean_folder(cfg,ex_path,p.decision,interactive=False,
+                                               dry_run=False,session_id=session_id)
+            return "merged"
+
+        if outcome=="format_upgrade":
+            if flac_coex=="keep_both" or flac_coex=="prefer_flac":
+                if lib.get("flac_segregation",False):
+                    # Route to FLAC sub-folder
+                    artist_dir=ex_path.parent
+                    flac_dest=artist_dir/"FLAC"/p.proposed_folder_name
+                    p.target_path=str(flac_dest)
+                    p.destination="clean"; p.decision["route_reasons"].append("flac_segregation")
+                    return "flac_upgrade"
+            p.decision["route_reasons"].append("format_upgrade")
+            return "format_upgrade_review"
+
+        if outcome=="lower_quality_mp3":
+            p.decision["route_reasons"].append("lower_quality_mp3")
+            return "lower_quality_mp3"
+
+        p.decision["route_reasons"].append(outcome)
+        return outcome
+
+    # Scanner starts immediately
     scanner_thread=_threading.Thread(target=_scanner_worker,daemon=True)
     scanner_thread.start()
 
-    trc=cfg.get("track_rename",{})
-    do_tracks=(trc.get("enabled",True) and trc.get("scope","clean_only") in ("clean_only","both"))
+    folder_idx=0
+    hist_path=Path(cfg.get("logging",{}).get("history_log","logs/history.jsonl"))
 
-    # Main thread: drain queue → route → apply → track rename
     while True:
-        batch=scanner_queue.get()
-        if batch is None: break   # sentinel
-        if not batch: continue
+        item=scanner_queue.get()
+        if item=="DONE": break
+        if item is None:
+            # Either below min_tracks or scan error — just tick
+            prog.tick(""); continue
         if should_stop():
-            out(f"\n{C.YELLOW}Stop requested — flushing remaining queue…{C.RESET}")
-            # Drain remaining batches without applying
-            while True:
-                b=scanner_queue.get()
-                if b is None: break
-            break
+            out(f"\n{C.YELLOW}Stop requested.{C.RESET}"); break
 
-        routed=_route_batch(batch)
-        all_proposals.extend(routed)
+        p:FolderProposal=item
+        folder_idx+=1
+        prog.tick(p.folder_name)
+        p=_route_one(p)
+        src_path=Path(p.folder_path)
 
-        # Apply this batch immediately
-        applied=apply_folder_moves(cfg,routed,interactive=interactive,auto_above=None,
-                                    dry_run=dry_run,session_id=session_id,source_root=source_root)
-        total_applied+=len(applied)
-        total_clean +=sum(1 for a in applied if a.get("destination")=="clean")
-        total_review +=sum(1 for a in applied if a.get("destination")=="review")
-        total_dup    +=sum(1 for a in applied if a.get("destination")=="duplicate")
+        # ── Artifact quarantine (before move) ──────────────────
+        artifact_count=0
+        if do_artifacts and src_path.exists():
+            artifacts=classify_artifacts(src_path,cfg)
+            artifact_count=move_artifacts_to_quarantine(
+                artifacts,p.folder_name,cfg,profile_obj,source_root,dry_run,session_id)
+            if artifact_count:
+                p.decision["artifacts_quarantined"]=artifact_count
+                total_artifacts+=artifact_count
 
-        # Track rename immediately for clean folders in this batch
-        if do_tracks:
-            for a in applied:
-                if a.get("destination")=="clean":
-                    rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),
-                                                   a.get("decision",{}),
-                                                   interactive=interactive,dry_run=dry_run,
-                                                   session_id=session_id)
+        # ── Duplicate resolution ────────────────────────────────
+        dup_outcome=None
+        if p.destination=="duplicate":
+            dup_outcome=_handle_duplicate(p)
+            if dup_outcome=="merged":
+                total_merged+=1
+                out(f"  [{folder_idx}/{total_n}]  {C.CYAN}MERGED{C.RESET} ⟳  {p.folder_name}  "
+                    f"({len(p.decision.get('merged_tracks',[]))} tracks added)")
+                all_proposals.append(p); continue   # no folder move needed
+            if dup_outcome=="flac_upgrade":
+                p.destination="clean"   # will move to FLAC subfolder
+
+        # ── Apply folder move ───────────────────────────────────
+        if p.destination in ("clean","review","duplicate"):
+            target=Path(p.target_path); ensure_dir(target.parent)
+            if dry_run:
+                same=_same_device(src_path,target)
+                out(f"  [{folder_idx}/{total_n}]  {C.DIM}[dry-run][{'rename' if same else 'copy'}]{C.RESET}"
+                    f"  {status_tag(p.destination)}  {p.folder_name}  →  {target.name}"
+                    f"  conf={conf_color(p.confidence)}")
+            elif src_path.exists():
+                try:
+                    move_method,move_elapsed=safe_move_folder(src_path,target)
+                    if sleep_copy>0 and move_method=="copy":
+                        import time as _time; _time.sleep(sleep_copy)
+                    # Log action
+                    action_id=uuid.uuid4().hex[:10]
+                    entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,
+                           "type":"folder","original_path":str(src_path),
+                           "original_parent":str(src_path.parent),"original_folder_name":p.folder_name,
+                           "target_path":str(target),"target_parent":str(target.parent),
+                           "target_folder_name":target.name,"destination":p.destination,
+                           "confidence":p.confidence,"decision":p.decision,
+                           "move_method":move_method}
+                    append_jsonl(hist_path,entry)
+                    if p.destination=="clean":
+                        manifest_add(cfg,target.name,{"original_path":str(src_path),
+                                                       "confidence":p.confidence,"session_id":session_id})
+                        existing_clean.add(normalize_unicode(target.name))
+                        existing_clean_paths[normalize_unicode(target.name)]=target
+                    method_tag=f"  {C.DIM}[{move_method} {move_elapsed*1000:.0f}ms]{C.RESET}" if _verbosity>=VERBOSE else ""
+                    art_tag=f"  {C.DIM}[{artifact_count} artifacts quarantined]{C.RESET}" if artifact_count else ""
+                    out(f"  [{folder_idx}/{total_n}]  MOVED {status_tag(p.destination)}"
+                        f"  {C.DIM}{p.folder_name}{C.RESET}  →  {target.name}"
+                        f"  conf={conf_color(p.confidence)}{method_tag}{art_tag}")
+                    try: cleanup_empty_parents(src_path,source_root)
+                    except Exception: pass
+                    # Track rename immediately after move
+                    if do_tracks and p.destination=="clean":
+                        rename_tracks_in_clean_folder(cfg,target,p.decision,
+                                                       interactive=interactive,dry_run=dry_run,
+                                                       session_id=session_id)
+                except RuntimeError as e:
+                    err(f"  [{folder_idx}/{total_n}]  ⛔ FAILED  {p.folder_name}: {e}")
+
+        # Tally
+        if   p.destination=="clean":     total_clean+=1
+        elif p.destination=="review":    total_review+=1
+        elif p.destination in ("duplicate","merged"): total_dup+=1
+        all_proposals.append(p)
 
     prog.done()
     scanner_thread.join(timeout=5)
+    if _tag_cache is not None: _tag_cache.save()
 
-    # Write consolidated session report
-    payload={"app":cfg.get("app",{}),"session_id":session_id,"timestamp":now_iso(),"profile":profile,
-             "source_root":str(source_root),"since":since.isoformat() if since else None,
+    # Session report
+    payload={"app":cfg.get("app",{}),"session_id":session_id,"timestamp":now_iso(),
+             "profile":profile,"source_root":str(source_root),
+             "since":since.isoformat() if since else None,
              "folder_proposals":[dataclasses.asdict(p) for p in all_proposals]}
     write_json(session_dir/"proposals.json",payload)
     _write_session_reports(session_id,profile,source_root,all_proposals,session_dir,cfg)
 
-    clean_n=sum(1 for p in all_proposals if p.destination=="clean")
-    rev_n  =sum(1 for p in all_proposals if p.destination=="review")
-    dup_n  =sum(1 for p in all_proposals if p.destination=="duplicate")
-    out(f"\n{C.BOLD}Results:{C.RESET}   {len(all_proposals)} proposals | {C.GREEN}Clean: {clean_n}{C.RESET} | {C.YELLOW}Review: {rev_n}{C.RESET} | {C.RED}Dupes: {dup_n}{C.RESET}")
+    merged_tag=f"  {C.CYAN}Merged: {total_merged}{C.RESET}" if total_merged else ""
+    art_tag=f"  {C.DIM}Artifacts quarantined: {total_artifacts}{C.RESET}" if total_artifacts else ""
+    out(f"\n{C.BOLD}Results:{C.RESET}   {len(all_proposals)} processed | "
+        f"{C.GREEN}Clean: {total_clean}{C.RESET} | {C.YELLOW}Review: {total_review}{C.RESET} | "
+        f"{C.RED}Dupes: {total_dup}{C.RESET}{merged_tag}")
+    if art_tag: out(art_tag)
     out(f"{C.DIM}Reports:   {session_dir}/report.{{txt,csv,html}}{C.RESET}")
-
     manifest_set_last_run(cfg)
 
-def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str])->None:
-    _run_core(cfg_path,cfg,profile,interactive,dry_run,since)
+
+def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None)->None:
+    _run_core(cfg_path,cfg,profile,interactive,dry_run,since,perf_tier=perf_tier)
 
 def cmd_folders_only(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str])->None:
     register_stop_handler(); sid,_,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg))
@@ -2865,6 +3235,17 @@ def cmd_doctor(cfg_path:Path,cfg:Dict[str,Any])->None:
     try:
         ensure_dir(log_root); t=log_root/".write_test"; t.write_text("ok",encoding="utf-8"); t.unlink(); ok_msg(f"Logs writable: {log_root}")
     except Exception as e: err(f"Logs not writable: {log_root} — {e}"); is_ok=False
+    # Performance tier
+    recommended=detect_recommended_tier()
+    configured=cfg.get("performance",{}).get("tier","medium")
+    perf=resolve_perf_settings(cfg)
+    out(f"\n{C.BOLD}Performance{C.RESET}")
+    out(f"  CPU cores:       {os.cpu_count() or '?'}")
+    out(f"  Configured tier: {C.CYAN}{configured}{C.RESET}")
+    out(f"  Recommended:     {C.GREEN}{recommended}{C.RESET}")
+    if recommended!=configured:
+        out(f"  {C.DIM}Tip: set performance.tier: {recommended} in config.yaml, or use --performance {recommended}{C.RESET}")
+    out(f"  Active:          workers={perf['workers']}  lookahead={perf['lookahead']}  sleep_copy={perf['sleep_copy_ms']}ms (copy-path only)")
     out(f"\n{'✓ Doctor complete.' if is_ok else C.YELLOW+'⚠ Doctor complete — see warnings.'+C.RESET}")
 
 # ─────────────────────────────────────────────
@@ -2912,7 +3293,6 @@ def profile_use(cfg_path:Path,cfg:Dict[str,Any],name:str)->None:
 # CLI
 # ─────────────────────────────────────────────
 def build_parser()->argparse.ArgumentParser:
-    app_version = get_version()
     p=argparse.ArgumentParser(prog="raagdosa",description=f"RaagDosa v{APP_VERSION} — deterministic music library cleanup.",
         formatter_class=argparse.RawDescriptionHelpFormatter,epilog="""
 Examples:
@@ -2953,7 +3333,7 @@ Examples:
     sc=sub.add_parser("scan",help="Scan → proposals.json"); sc.add_argument("--profile"); sc.add_argument("--out"); sc.add_argument("--since")
     ap=sub.add_parser("apply",help="Apply proposals.json"); ap.add_argument("proposals",nargs="?"); ap.add_argument("--last-session",action="store_true"); ap.add_argument("--interactive",action="store_true"); ap.add_argument("--auto-above",type=float); ap.add_argument("--dry-run",action="store_true")
     for nc in ("run","go"):
-        c=sub.add_parser(nc,help="Scan + apply (folders + tracks)"); c.add_argument("--profile"); c.add_argument("--interactive",action="store_true"); c.add_argument("--dry-run",action="store_true"); c.add_argument("--since")
+        c=sub.add_parser(nc,help="Scan + apply (folders + tracks)"); c.add_argument("--profile"); c.add_argument("--interactive",action="store_true"); c.add_argument("--dry-run",action="store_true"); c.add_argument("--since"); c.add_argument("--performance",choices=["slow","medium","fast","ultra"],default=None,metavar="TIER",help="Hardware tier: slow|medium|fast|ultra")
     fo=sub.add_parser("folders",help="Folder pass only"); fo.add_argument("--profile"); fo.add_argument("--interactive",action="store_true"); fo.add_argument("--dry-run",action="store_true"); fo.add_argument("--since")
     tr=sub.add_parser("tracks",help="Track rename pass"); tr.add_argument("--profile"); tr.add_argument("--interactive",action="store_true"); tr.add_argument("--dry-run",action="store_true")
     sub.add_parser("status",help="Library overview").add_argument("--profile")
@@ -3006,7 +3386,7 @@ def main()->None:
         pp=load_last_session(cfg) if args.last_session else (Path(args.proposals) if args.proposals else None)
         if not pp: err("Provide proposals.json or --last-session"); sys.exit(1)
         cmd_apply(cfg,pp,interactive=bool(args.interactive),auto_above=args.auto_above,dry_run=bool(args.dry_run))
-    elif cmd in("run","go"): cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None))
+    elif cmd in("run","go"): cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None))
     elif cmd=="folders":  cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None))
     elif cmd=="tracks":   cmd_tracks_only(cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run))
     elif cmd=="status":   cmd_status(cfg,gp())

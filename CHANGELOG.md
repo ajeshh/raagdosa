@@ -7,6 +7,103 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [3.81.0] — 2026-03-08
+
+### Release summary
+
+v3.81 rewires how RaagDosa processes music: true per-album streaming (scan one → move it → next), intelligent duplicate resolution with track merging, hardware speed tiers so it plays nicely on any machine, and a proper artifact policy that keeps cover art and liner notes while quarantining junk files.
+
+---
+
+### True per-album streaming pipeline
+
+The previous pipeline batched folders in groups of 50 before applying. v3.81 processes one album at a time — scan, route, quarantine artifacts, move, rename tracks — before starting the next. First album moves within seconds of starting on any library size.
+
+- Background scanner thread pre-reads tags `lookahead` folders ahead (controlled by performance tier)
+- Main thread processes each proposal completely: route → artifact quarantine → move → track rename → duplicate resolution → next
+- Per-album progress counter: `[42/833]  MOVED ✦ clean  Portishead - Dummy (1994)  conf=0.95  0.4ms`
+- Within-run duplicate tracking maintained correctly across individual proposals
+- `scan.streaming_batch_size` repurposed as `performance.streaming_lookahead` (tier-controlled)
+
+### Intelligent duplicate resolution
+
+When a proposed folder name matches an existing Clean folder, RaagDosa now compares contents before routing.
+
+Four outcomes:
+
+- **`missing_tracks`** — incoming has tracks not present in existing. Missing files are copied into the existing Clean folder and track rename re-runs on the merged result. Source goes to `Review/Duplicates/` as `[merged_N_tracks]`.
+- **`format_upgrade`** — incoming is FLAC, existing is MP3. With `flac_segregation: true`, FLAC goes to `Artist/FLAC/Album/` automatically. Otherwise routed to Review with reason `format_upgrade`.
+- **`lower_quality_mp3`** — incoming is MP3, existing has FLAC. Routed to Review, never downgrades existing quality.
+- **`exact_duplicate`** / **`partial_overlap`** — full match or partial, routed to Duplicates with detailed reason.
+
+Track matching uses fuzzy title similarity (configurable threshold, default 0.90) with leading track-number stripping.
+
+```yaml
+duplicates:
+  compare_before_routing: true
+  merge_missing_tracks: true
+  flac_mp3_coexistence: keep_both   # keep_both | prefer_flac | prefer_mp3
+  title_match_threshold: 0.90
+  size_match_tolerance: 0.01
+```
+
+### Hardware performance tiers
+
+Four tiers replace the raw `scan.workers` knob. Pick the one that matches your machine; RaagDosa sets workers, lookahead buffer, and copy-path sleep automatically.
+
+| Tier | Who | Workers | Lookahead | Copy sleep |
+|------|-----|---------|-----------|------------|
+| `slow` | 2017 Intel MBP, 8 GB RAM, old MacBook Air | 1 | 1 | 50ms |
+| `medium` | 2019–2021 Intel MBP, 16 GB RAM | 2 | 4 | 10ms |
+| `fast` | 2021+ M1/M2, 16 GB | 4 | 8 | 0ms |
+| `ultra` | 2023+ M3/M4, 32 GB+ NVMe | 8 | 16 | 0ms |
+
+- `sleep_between_moves_ms` applied **only on copy-path moves** (cross-device). Same-filesystem renames are ~1ms and never throttled.
+- Per-run override: `raagdosa go --performance slow`
+- `raagdosa doctor` shows detected hardware and recommended tier
+- Individual overrides (`workers`, `streaming_lookahead`, `sleep_between_moves_ms`) take precedence over tier
+
+```yaml
+performance:
+  tier: medium   # slow | medium | fast | ultra
+```
+
+### Artifact handling
+
+Non-audio files in album source folders now have an explicit policy.
+
+| Extension | Action |
+|-----------|--------|
+| `.jpg`, `.jpeg` | Keep — moves with album into Clean |
+| `.pdf` | Keep — liner notes, booklets |
+| `.cue` | Keep **only if** a matching `.flac`/`.ape`/`.wav` exists alongside |
+| `.png` | Quarantine — always (policy: let go of all PNGs) |
+| `.nfo`, `.sfv`, `.txt`, `.url`, `.log`, `.m3u`, `.m3u8` | Quarantine |
+| Unknown extensions | Quarantine (conservative default) |
+
+Quarantined files move to `Review/Artifacts/<original_folder_name>/` before the album folder is processed. The album move and track rename proceed without them.
+
+`raagdosa show` displays artifact classification alongside the tag analysis. Move output shows `[N artifacts quarantined]` when applicable.
+
+```yaml
+artifacts:
+  enabled: true
+  keep_extensions: [.jpg, .jpeg, .pdf, .cue]
+  quarantine_extensions: [.png, .nfo, .sfv, .txt, .url, .log, .m3u, .m3u8]
+  quarantine_folder: Review/Artifacts
+  quarantine_unknown: true
+```
+
+### Other
+
+- `APP_VERSION` now reads from `importlib.metadata` when installed via pip; falls back to hardcoded string
+- Optional `Pillow` import available for future smart PNG sizing (not used in this release per policy decision)
+- `existing_clean_paths` dict built at startup for O(1) path lookup during duplicate comparison
+- History entries include `move_method: rename|copy` (carried forward from v3.5.1)
+
+---
+
+
 ## [3.5.1] — 2026-03-06
 
 ### Release summary
