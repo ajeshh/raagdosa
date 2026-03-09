@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RaagDosa v3.5
+RaagDosa v5.5
 Deterministic library cleanup for DJ music folders — CLI-first, safe-by-default, undoable.
 
 Commands:
@@ -9,6 +9,7 @@ Commands:
   profile / history / undo / doctor
   orphans / artists / review-list / clean-report
   extract / compare / diff
+  tree / catchall / genre / cache
 """
 from __future__ import annotations
 
@@ -30,7 +31,14 @@ try:
 except Exception:
     MutagenFile = None
 
-APP_VERSION = "3.81"
+try:
+    from PIL import Image as _PILImage
+    _HAS_PIL = True
+except Exception:
+    _PILImage = None
+    _HAS_PIL = False
+
+APP_VERSION = "5.5.0"
 
 # ─────────────────────────────────────────────────────────────────
 # Hardware performance tiers
@@ -183,8 +191,26 @@ def should_stop()->bool:
 # ─────────────────────────────────────────────
 def now_iso()->str: return dt.datetime.now().isoformat(timespec="seconds")
 
-def make_session_id()->str:
-    return f"{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S_%f')}_{uuid.uuid4().hex[:6]}"
+def slugify(s: str, max_len: int = 24) -> str:
+    """Convert a string to a lowercase, hyphen-separated filesystem-safe slug."""
+    s = normalize_unicode(s.strip().lower())
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s[:max_len] if len(s) > max_len else s
+
+def make_session_id(profile: str = "", source_folder: str = "") -> str:
+    """
+    Human-readable session ID: YYYY-MM-DD_HH-MM_<profile>_<source-folder-slug>
+    Format makes it easy to recall which profile and folder the session covers.
+    Example: 2026-03-08_14-30_incoming_slsk-complete-march
+    Duplicate-minute collision → appends _2, _3, …  (detected by caller if needed).
+    """
+    ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    parts = [ts]
+    if profile:       parts.append(slugify(profile, 20))
+    if source_folder: parts.append(slugify(Path(source_folder).name, 32))
+    return "_".join(p for p in parts if p)
 
 def read_yaml(path:Path)->Dict[str,Any]:
     if yaml is None: raise RuntimeError("Missing: pyyaml — pip install pyyaml")
@@ -220,6 +246,32 @@ def lower(s:Optional[str])->str: return (s or "").strip().lower()
 def is_hidden_file(p:Path)->bool:
     n=p.name.lower()
     return n in {".ds_store","thumbs.db","desktop.ini",".localized"} or n.startswith("._") or n.startswith("__macosx")
+
+# v4.1 — extensions silently skipped during audio scan (default set; override via scan.skip_sidecar_extensions in config)
+_SKIP_AUDIO_EXTENSIONS_DEFAULT: Set[str] = {".sfk", ".asd", ".reapeaks", ".pkf", ".db", ".lrc"}
+_SKIP_AUDIO_EXTENSIONS: Set[str] = set(_SKIP_AUDIO_EXTENSIONS_DEFAULT)  # merged at runtime by _init_skip_sets
+
+# v4.1 — folder names always skipped during walk (default set; override via scan.skip_system_folders in config)
+_SKIP_FOLDER_NAMES_DEFAULT: Set[str] = {"__MACOSX", "__macosx"}
+_SKIP_FOLDER_NAMES: Set[str] = set(_SKIP_FOLDER_NAMES_DEFAULT)  # merged at runtime by _init_skip_sets
+
+def _init_skip_sets(cfg: Dict[str, Any]) -> None:
+    """Merge config-defined skip lists with hardcoded defaults. Call once after cfg is loaded."""
+    global _SKIP_AUDIO_EXTENSIONS, _SKIP_FOLDER_NAMES
+    sc = cfg.get("scan", {})
+    _SKIP_AUDIO_EXTENSIONS = set(_SKIP_AUDIO_EXTENSIONS_DEFAULT) | {
+        e.lower() for e in (sc.get("skip_sidecar_extensions") or [])
+    }
+    _SKIP_FOLDER_NAMES = set(_SKIP_FOLDER_NAMES_DEFAULT) | set(sc.get("skip_system_folders") or [])
+
+# ── v4.2 filename regexes ────────────────────────────────────────────
+# Disc-track compound: "1-01 Title" or "2-07 Title"
+_TRACK_DISC_COMPOUND = re.compile(r"^(\d{1})-(\d{2})\s+")
+# Vinyl side lettering in filename stem: "A1 - Title" / "b2 - Title"
+_TRACK_VINYL_STEM = re.compile(r"^([A-Da-d]\d{1,2})\s*[-–—]?\s+")
+# Beatport multi-artist pattern in stem: "Title - Artist1, Artist2 (Mix)"
+_BEATPORT_MULTI_ARTIST = re.compile(r"^(.+?)\s+-\s+(.+?,\s*.+?)(?:\s+\(([^)]+)\))?\s*$")
+# ── v4.2 filename regexes (see above block) ──
 
 def parse_int_prefix(s:str)->Optional[int]:
     m=re.match(r"^\s*(\d+)",s or "")
@@ -607,7 +659,7 @@ def detect_ep(audio_files:List[Path],cfg:Dict[str,Any])->bool:
     """True if file count falls in the EP range (default 3–6 tracks)."""
     ep=cfg.get("ep_detection",{})
     if not ep.get("enabled",True): return False
-    mn=int(ep.get("min_tracks",3)); mx=int(ep.get("max_tracks",6))
+    mn=int(ep.get("min_tracks",2)); mx=int(ep.get("max_tracks",6))
     return mn<=len(audio_files)<=mx
 
 # ─────────────────────────────────────────────
@@ -703,13 +755,43 @@ def compute_filename_tag_consistency(
             scores.append(0.5)
     return sum(scores)/len(scores) if scores else 0.5
 
-def _parse_fn_artitle(stem:str)->Tuple[Optional[str],Optional[str]]:
-    """Quick filename stem → (artist, title) without full cleanup overhead."""
-    s=re.sub(r'_-_',' - ',stem).replace('_',' ')
-    s=re.sub(r'^\d{1,3}\s*[-–—\.]\s*','',s)
-    parts=[p.strip() for p in re.split(r'\s*[-–—]\s*',s,maxsplit=1) if p.strip()]
-    if len(parts)>=2: return parts[0],parts[1]
-    return None,parts[0] if parts else None
+def _parse_fn_artitle(stem: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Quick filename stem → (artist, title) for consistency scoring.
+    Handles common DJ filename formats:
+      "Artist - Title"                          → (artist, title)
+      "NN - Artist - Title"                     → (artist, title)
+      "NN. Artist - Title"                      → (artist, title)
+      "NN. - Artist - Title"                    → (artist, title)   v4.3: dot+dash
+      "Artist - Album - NN - Title"             → (artist, title)   4-part
+      "Artist - Album - Title"                  → (artist, title)   3-part
+    v4.3 additions:
+      Hash/checksum tail stripped: "07-track-cd4051c3" → "07-track"
+      NNN/NN tag-style track num: "001/12 - Title" → (None, title)
+    """
+    s = re.sub(r'_-_', ' - ', stem).replace('_', ' ')
+
+    # v4.3: strip trailing hash/checksum (-7c10a753 / _cd4051c3)
+    s = _HASH_CHECKSUM_TAIL.sub('', s).strip()
+
+    # v4.3: NNN/NN tag-style track number prefix: "001/12 - Title"
+    s = re.sub(r'^\d{1,3}/\d{1,3}\s*[-–—.]\s*', '', s)
+
+    # Strip leading track number prefix: 01 / 01. / 01 - / 01. -
+    s = re.sub(r'^\d{1,3}\s*\.?\s*[-–—]?\s*', '', s)
+
+    parts = [p.strip() for p in re.split(r'\s*[-–—]\s*', s) if p.strip()]
+
+    if len(parts) == 1:
+        return None, parts[0]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) >= 3:
+        # "Artist - Album - NN - Title" → (Artist, Title)
+        if re.match(r'^\d{1,3}$', parts[2]) and len(parts) >= 4:
+            return parts[0], parts[3]
+        return parts[0], parts[-1]
+    return None, parts[0] if parts else None
 
 def compute_albumartist_consistency(all_tags:List[Dict[str,Optional[str]]])->float:
     """Fraction of tagged tracks sharing the dominant albumartist."""
@@ -1011,11 +1093,12 @@ def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->Tuple[str,float
 # ─────────────────────────────────────────────
 # DJ database detection
 # ─────────────────────────────────────────────
-_DJ_PATTERNS=["export.pdb","database2","rekordbox.xml","_Serato_","Serato Scratch","Serato DJ","PIONEER"]
+_DJ_PATTERNS_DEFAULT = ["export.pdb","database2","rekordbox.xml","_Serato_","Serato Scratch","Serato DJ","PIONEER"]
 
-def find_dj_databases(source_root:Path)->List[str]:
+def find_dj_databases(source_root:Path, cfg:Dict[str,Any]=None)->List[str]:
+    patterns = list((cfg or {}).get("dj_safety", {}).get("database_patterns") or _DJ_PATTERNS_DEFAULT)
     found:List[str]=[]
-    for pat in _DJ_PATTERNS:
+    for pat in patterns:
         try: matches=list(source_root.rglob(f"*{pat}*"))
         except Exception: matches=[]
         if matches: found.append(f"'{pat}' ({len(matches)})")
@@ -1036,13 +1119,21 @@ def rotate_log_if_needed(log_path:Path,max_mb:float=10.0)->None:
 # ─────────────────────────────────────────────
 def _rname(profile:Dict,key:str,default:str)->str: return profile.get(key,default)
 
-def derive_clean_root(profile:Dict,source_root:Path)->Path:
+def derive_wrapper_root(profile:Dict,source_root:Path)->Path:
+    """
+    The raagdosa wrapper folder — parent of Clean/, Review/, logs/.
+    All output lives here so logs and organised music are co-located with the source,
+    making it obvious which drive/folder they belong to.
+    Config key: profiles.<name>.wrapper_folder_name  (default: 'raagdosa')
+    """
     base=source_root.parent if profile.get("clean_mode")=="inside_parent" else source_root
-    return base/_rname(profile,"clean_folder_name","Clean")
+    return base/_rname(profile,"wrapper_folder_name","raagdosa")
+
+def derive_clean_root(profile:Dict,source_root:Path)->Path:
+    return derive_wrapper_root(profile,source_root)/_rname(profile,"clean_folder_name","Clean")
 
 def derive_review_root(profile:Dict,source_root:Path)->Path:
-    base=source_root.parent if profile.get("clean_mode")=="inside_parent" else source_root
-    return base/_rname(profile,"review_folder_name","Review")
+    return derive_wrapper_root(profile,source_root)/_rname(profile,"review_folder_name","Review")
 
 def derive_clean_albums_root(profile:Dict,source_root:Path)->Path:
     return derive_clean_root(profile,source_root)/_rname(profile,"clean_albums_folder_name","Albums")
@@ -1065,6 +1156,44 @@ def ensure_roots(profile:Dict,source_root:Path)->Dict[str,Path]:
     }
     for p in roots.values(): ensure_dir(p)
     return roots
+
+def setup_logging_paths(cfg:Dict[str,Any],profile:Dict[str,Any],source_root:Path)->None:
+    """
+    Resolve all logging paths relative to the raagdosa wrapper folder and mutate
+    cfg["logging"] in-place with absolute paths.  Call once per command after
+    profile and source_root are known.
+
+    Result structure on disk:
+      <source_root>/raagdosa/
+        Clean/
+        Review/
+        logs/
+          history.jsonl          ← folder-move history (used by undo)
+          skipped.jsonl          ← folders that were skipped
+          track-history.jsonl   ← track-rename history (used by undo --tracks)
+          track-skipped.jsonl   ← tracks that were skipped
+          sessions/
+            2026-03-08_14-30_incoming_test/
+              proposals.json
+              report.txt / .csv / .html
+          tag_cache.json
+          trees/
+
+    Logs live next to the music they describe, so the drive label / path is
+    implicit from the filesystem location — no ambiguity across multiple sources.
+    """
+    wrapper=derive_wrapper_root(profile,source_root)
+    lcfg=cfg.setdefault("logging",{})
+    log_root=wrapper/lcfg.get("root_dir","logs")
+    ensure_dir(log_root)
+    # Patch all keys with absolute resolved paths so every downstream caller
+    # just does Path(cfg["logging"]["<key>"]) and gets the right location.
+    lcfg["root_dir"]          = str(log_root)
+    lcfg["session_dir"]       = str(log_root/"sessions")
+    lcfg["history_log"]       = str(log_root/"history.jsonl")
+    lcfg["skipped_log"]       = str(log_root/"skipped.jsonl")
+    lcfg["track_history_log"] = str(log_root/"track-history.jsonl")
+    lcfg["track_skipped_log"] = str(log_root/"track-skipped.jsonl")
 
 # ─────────────────────────────────────────────
 # Normalise for voting (not for display names)
@@ -1141,28 +1270,571 @@ def detect_bpm_dj_encoding(stem:str)->bool:
 # ─────────────────────────────────────────────
 # Folder name heuristic parser
 # ─────────────────────────────────────────────
-def smart_title_case(s:str)->str:
-    if not s: return s
-    words=s.split()
-    if [w for w in words if len(w)>2] and all(w.isupper() for w in words if len(w)>2):
-        small={"a","an","the","and","but","or","for","nor","on","at","to","by","in","of","vs"}
-        return " ".join(w.capitalize() if i==0 or w.lower() not in small else w.lower() for i,w in enumerate(words))
+# ─────────────────────────────────────────────
+# v4.1 — Folder name pre-processor
+# ─────────────────────────────────────────────
+
+# Cyrillic → Latin lookalike normalisation table
+_CYRILLIC_MAP: Dict[str,str] = {
+    "А":"A","В":"B","С":"C","Е":"E","Н":"H","І":"I","К":"K","М":"M",
+    "О":"O","Р":"P","Т":"T","Х":"X","а":"a","е":"e","і":"i","о":"o",
+    "р":"p","с":"c","х":"x","у":"y",
+}
+
+# Country codes to protect from being stripped as catalog IDs
+_COUNTRY_CODES: Set[str] = {
+    "AU","UK","US","CA","DE","FR","JP","NL","SE","NO","DK","FI","IT",
+    "ES","PT","PL","RU","BR","MX","NZ","ZA","BE","CH","AT","IE",
+}
+
+# Known iTunes genre bucket names to strip in itunes_hierarchy mode
+_ITUNES_GENRE_BUCKETS: Set[str] = {
+    "Alternative","Blues","Children's Music","Classical","Comedy","Country",
+    "Dance","Electronic","Folk","Hip-Hop/Rap","Holiday","Indie Pop",
+    "Jazz","Latin","New Age","Opera","Pop","R&B/Soul","Reggae","Religious",
+    "Rock","Singer/Songwriter","Soundtracks","Spoken Word","Vocal","World",
+    "Ambient","Bass","Breaks","Deep House","Disco","Drum & Bass","Dub",
+    "Dubstep","Electro","Funk","Garage","Grime","Hard Techno","House",
+    "Industrial","Jungle","Minimal Techno","Progressive House","Psychedelic",
+    "Reggaeton","Rave","Soul","Techno","Trance","Trip Hop","UK Garage",
+    "Afrobeats","Afro House","Melodic House & Techno","Organic Electronic",
+    "Organic House","Downtempo","Glitch Hop","IDM","Lo-fi","Experimental",
+    "Noise","Post-Rock","Shoegaze","Dream Pop","Art Rock","Avant-garde",
+    "Contemporary Classical","Electroacoustic","Sound Art","New Wave",
+    "Punk","Hardcore","Metal","Grunge","Emo","Post-Punk","Gothic Rock",
+    "Psychedelic Rock","Stoner Rock","Doom Metal","Death Metal","Black Metal",
+    "Rap","Trap","Cloud Rap","Drill","Grime","UK Drill","Afrorap",
+    "Dancehall","Dub Reggae","Rocksteady","Ska","Cumbia","Merengue","Salsa",
+    "Bossa Nova","Samba","Forro","Baile Funk","Afropop","Highlife","Afrojuju",
+    "Afrobeats","Afrohouse","Amapiano","Gqom",
+}
+
+def _normalise_cyrillic_lookalikes(s: str) -> str:
+    """Replace Cyrillic characters that look identical to Latin ones."""
+    return "".join(_CYRILLIC_MAP.get(c, c) for c in s)
+
+def _strip_catalog_prefix(name: str) -> str:
+    """
+    Strip catalog-ID-style prefix like 'ANJDEE786D Artist - Album'.
+    Heuristic: all-caps run of letters+digits before a recognisable artist/album separator.
+    Does NOT strip country codes (AU, UK, US, etc.).
+    """
+    m = re.match(r"^([A-Z]{2,8}[0-9]{2,8}[A-Z0-9]*)\s+(.+)$", name)
+    if m:
+        code = m.group(1)
+        # Protect country codes (pure alpha, 2 chars)
+        if code in _COUNTRY_CODES:
+            return name
+        return m.group(2).strip()
+    return name
+
+def _strip_leading_bracket_catalog(name: str) -> str:
+    """
+    Strip a leading [CATALOG-CODE] that looks like a label code, not a word.
+    Examples stripped:  [HYPE004], [atg030], [bbp012], [basshead001], [sol selectas - sol045]
+    NOT stripped: [Deep House], [Human], [FLAC]  — word-only content without digits
+    Rule: strip if bracket content contains digits OR is all-caps abbreviation with digits.
+    """
+    m = re.match(r"^\[([^\]]+)\]\s*(.*)$", name)
+    if not m:
+        return name
+    code, rest = m.group(1).strip(), m.group(2).strip()
+    if not rest:   # bracket is the whole name — don't strip
+        return name
+    # Strip if: contains digits (most label codes do), or looks like pure alphanum code
+    has_digits = bool(re.search(r"\d", code))
+    is_word_only = bool(re.match(r"^[A-Za-z\s]+$", code)) and len(code.split()) <= 2
+    if has_digits and not is_word_only:
+        return rest
+    # Also strip multi-word catalog codes like "sol selectas - sol045"
+    if re.search(r"[A-Za-z]+\d+", code):   # alphanum run like "sol045"
+        return rest
+    return name
+
+def _strip_bang_delimiters(name: str) -> str:
+    """Strip !!! … !!! from start and end, preserving internal !"""
+    name = re.sub(r"^!{2,}\s*", "", name)
+    name = re.sub(r"\s*!{2,}$", "", name)
+    return name.strip()
+
+def _strip_self_released(name: str) -> str:
+    """Strip (Selfreleased CD) / (Self Released) / (Self-Released) noise."""
+    return re.sub(r"\s*\(self[- ]?released(?:\s+cd)?\)\s*", " ", name, flags=re.IGNORECASE).strip()
+
+def _strip_mashup_keyword(name: str) -> Tuple[str, bool]:
+    """Strip MASHUP ALBUM keyword; return (cleaned_name, is_mashup)."""
+    if re.search(r'\bmashup\s+album\b', name, re.IGNORECASE):
+        cleaned = re.sub(r'\bmashup\s+album\b', '', name, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned, True
+    return name, False
+
+def _strip_beatport_compilation_noise(name: str) -> str:
+    """
+    Clean Beatport/Traxsource compilation folder names.
+    Handles: dot-separators, trailing underscore dates, 'Best New Hype' prefix,
+    dots as word separators, double spaces (Traxsource).
+    Examples:
+      "Beatport Best New Afro House_ November 2024" → "Beatport Afro House (November 2024)"
+      "Beatport.Top.100.Deep.House.2017.07"         → "Beatport Deep House Top 100 (July 2017)"
+      "Best new Organic House  Beatport ..."         → "Beatport & Traxsource Organic House Top 100"
+    """
+    n = name
+    # Convert dot-separated names ("Beatport.Top.100.Deep.House.2017.07")
+    if re.search(r"^Beatport\.[A-Za-z]", n):
+        n = n.replace(".", " ")
+    # Strip noise prefixes
+    n = re.sub(r"^Best\s+New\s+(?:Hype\s+)?", "", n, flags=re.IGNORECASE)
+    # Handle trailing underscore date
+    n = _strip_beatport_trailing_date(n)
+    # Collapse double+ spaces (Traxsource export artefact)
+    n = re.sub(r"  +", " ", n).strip()
+    # Strip trailing punctuation/underscore artifacts
+    n = n.strip(". _").strip()
+    return n
+
+def _is_discography_folder(name: str) -> bool:
+    """Detect folders that are artist discography containers."""
+    return bool(re.search(r'\b(discography|complete\s+collection|complete\s+works|all\s+albums)\b', name, re.IGNORECASE))
+
+def _strip_bitrate_noise(name: str) -> str:
+    """Strip bitrate/format noise from discography folder names."""
+    return re.sub(r'\s*[\(\[]\s*(?:\d+\s*kbps|mp3|flac|320|256|192|128|lossless)\s*[\)\]]\s*', ' ', name, flags=re.IGNORECASE).strip()
+
+# ── v4.2 Beatport helpers ──────────────────────────────────────────────────────
+
+def _is_beatport_format(stem: str, folder_name: str = "") -> bool:
+    """
+    Detect Beatport-exported filenames.  Leading space is the strongest signal
+    (194/194 files in real libraries).  Folder name starting with Beatport/
+    Traxsource is secondary.  Multi-artist comma pattern is tertiary.
+    NEVER invert without one of these signals — false positives are catastrophic.
+    """
+    if stem != stem.lstrip():          return True   # leading space
+    fn_lower = folder_name.lower()
+    if fn_lower.startswith(("beatport", "traxsource")): return True
+    # Title - Artist1, Artist2 (Mix) where title has no commas and artists section does
+    m = _BEATPORT_MULTI_ARTIST.match(stem)
+    if m:
+        title_part, artists_part = m.group(1), m.group(2)
+        if "," in artists_part and "," not in title_part:
+            # Extra guard: title part should not look like a track-number prefix
+            if not re.match(r"^\d{1,3}[\s\-]", title_part):
+                return True
+    return False
+
+def _invert_beatport_filename(stem: str, keep_all_artists: bool = False) -> Tuple[str, str, str]:
+    """
+    Invert Beatport "Title - Artist1, Artist2 (Mix)" → (primary_artist, title, mix_suffix).
+    Strips leading space before processing.
+    Returns (artist, title, mix_suffix) where mix_suffix includes parentheses e.g. "(Extended Mix)".
+    """
+    stem = stem.strip()
+    # Extract trailing (Mix) if present
+    mix_suffix = ""
+    m_mix = re.search(r"\s+(\([^)]+(?:mix|remix|edit|version|dub|instrumental|reprise|rework)[^)]*\))\s*$", stem, re.I)
+    if m_mix:
+        mix_suffix = " " + m_mix.group(1)
+        stem = stem[:m_mix.start()].strip()
+    # Split on first " - "
+    parts = re.split(r"\s+-\s+", stem, maxsplit=1)
+    if len(parts) == 2:
+        raw_title, raw_artists = parts[0].strip(), parts[1].strip()
+    else:
+        return stem, "", mix_suffix   # can't parse — return as-is
+    # Identify primary artist (first before comma)
+    artist_list = [a.strip() for a in raw_artists.split(",")]
+    if keep_all_artists:
+        primary = ", ".join(artist_list)
+    else:
+        primary = artist_list[0]
+    return primary, raw_title, mix_suffix
+
+def _strip_beatport_trailing_date(name: str) -> str:
+    """
+    Replace Beatport trailing "_ Month YYYY" or "_ YYYY-MM" date separator.
+    Examples:
+      "Afro House_ November 2024" → "Afro House (November 2024)"
+      "Afro House_ 2024-11"       → "Afro House (November 2024)"
+    """
+    _MONTHS = ["january","february","march","april","may","june",
+               "july","august","september","october","november","december"]
+    # "_  Month YYYY"
+    m = re.search(r"_\s+(" + "|".join(_MONTHS) + r")\s+(\d{4})\s*$", name, re.IGNORECASE)
+    if m:
+        return name[:m.start()].strip() + f" ({m.group(1).capitalize()} {m.group(2)})"
+    # "_ YYYY-MM"
+    m2 = re.search(r"_\s+(\d{4})[.\-](\d{2})\s*$", name)
+    if m2:
+        yr, mo = int(m2.group(1)), int(m2.group(2))
+        if 1 <= mo <= 12:
+            mname = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"][mo-1]
+            return name[:m2.start()].strip() + f" ({mname} {yr})"
+    return name
+
+# ── v4.3 folder-name pre-processor regexes ───────────────────────────────────
+# Scene release group suffix: Artist-Album-WEB-2023-GROUP
+_SCENE_RELEASE_SUFFIX = re.compile(
+    r'[\s_-]+(WEB|FLAC|MP3|CD|VINYL|DIGITAL|WEB-FLAC|WEB-MP3)'
+    r'[-_]+(\d{4})[-_]+[A-Z0-9]{2,12}\s*$', re.IGNORECASE)
+
+# Format in trailing brackets/parens: [FLAC] ( 320 Kbps ) [16Bit-44.1kHz]
+_FORMAT_BRACKET_TRAIL = re.compile(
+    r'\s*\[\s*(FLAC|MP3|320|256|192|128|VBR|CBR|WEB|16Bit[^\]]*|24Bit[^\]]*'
+    r'|lossless|hi.?res|vinyl.?rip)\s*\]\s*$', re.IGNORECASE)
+_FORMAT_PAREN_TRAIL = re.compile(
+    r'\s*\(\s*(FLAC|MP3|320|256|192|128|VBR|CBR|\d{2,3}\s*[Kk]bps)\s*\)\s*$',
+    re.IGNORECASE)
+
+# Catalog code in parens/brackets at end: (CA046) [KOSA043] {MFM031}
+_CATALOG_TAIL = re.compile(
+    r'\s*[\(\[\{]\s*[A-Z]{1,6}\d{2,6}[A-Z]?\s*[\)\]\}]\s*$')
+
+# Curly brace noise: {Digital Media} {MFM031}
+_CURLY_NOISE = re.compile(r'\s*\{[^}]{1,40}\}\s*')
+
+# Duplicate year: "2010 - Río Arriba (2010)" → keep prefix year only
+_DUPLICATE_YEAR = re.compile(
+    r'^((19|20)\d{2})(.*?)\(\s*\2\d{2}\s*\)\s*$')
+
+# 4-dash label-year-artist-album: "Label - 2024 - Artist - Album"
+_LABEL_4DASH = re.compile(
+    r'^(?P<label>.+?)\s+-\s+(?P<year>(?:19|20)\d{2})\s+-\s+(?P<artist>.+?)\s+-\s+(?P<album>.+)$')
+
+# Double-dash slug separator: Artist--Album_Name
+_DOUBLE_DASH = re.compile(r'--+')
+
+# Mid-name paren year: "Artist - (2017) Album"
+_MID_PAREN_YEAR = re.compile(r'\s+-\s+\(((19|20)\d{2})\)\s+')
+
+# Mid-name bracket year (aukai. pattern): "Artist  [2016] Album"
+_MID_BRACKET_YEAR = re.compile(
+    r'^(?P<pre>.+?)\s{1,2}\[(?P<year>(19|20)\d{2})\]\s*(?:[-\u2013]\s*)?(?P<post>.+)$')
+
+# Hash/checksum tail on track stems: -7c10a753 (7-12 hex chars)
+_HASH_CHECKSUM_TAIL = re.compile(r'[-_][0-9a-f]{7,12}$', re.IGNORECASE)
+
+# Trailing CD+bitrate slug noise: "2012 cd 320 tmgk"
+_CD_BITRATE_SLUG = re.compile(
+    r'\s+(?:cd|cdl?)\s+\d{2,3}(?:\s*kbps?)?\s+[a-z0-9]{2,8}\s*$', re.IGNORECASE)
+
+# Known-label names in trailing brackets: [warp 2008] [strike 45]
+_LABEL_BRACKET_TRAIL = re.compile(
+    r'\s*\[(?:warp|ninja|brainfeeder|hyperdub|kranky|ghostly|erased\s*tapes|'
+    r'zencd|strike|sol\s*selectas|!k7|anticon|mush|def\s*jux|big\s*dada)'
+    r'[^\]]{0,30}\]\s*', re.IGNORECASE)
+
+# Tilde separator → normalise to " - "
+_TILDE_SEP = re.compile(r'\s*~\s*')
+
+# Trailing type bracket: [Anthology] [album]
+_TYPE_BRACKET_TRAIL = re.compile(
+    r'\s*\[\s*(anthology|collection|box\s*set|compilation|bootleg|unreleased)\s*\]\s*$',
+    re.IGNORECASE)
+
+def _strip_scene_release_suffix(name: str) -> Tuple[str, bool]:
+    """Strip scene release group suffix. Returns (cleaned, was_stripped)."""
+    # Full slug (all underscores/dashes, no spaces): normalise first
+    if '_' in name and ' ' not in name:
+        expanded = name.replace('_', ' ')
+        m = _SCENE_RELEASE_SUFFIX.search(expanded)
+        if m:
+            return expanded[:m.start()].strip().rstrip('- '), True
+    m = _SCENE_RELEASE_SUFFIX.search(name)
+    if m:
+        return name[:m.start()].strip().rstrip('-_ '), True
+    return name, False
+
+def _normalise_double_dash_slug(name: str) -> str:
+    """Convert Artist--Album_Name → Artist - Album Name."""
+    if '--' not in name:
+        return name
+    name = _DOUBLE_DASH.sub(' - ', name)
+    name = name.replace('_', ' ')
+    return re.sub(r'\s+', ' ', name).strip()
+
+def _extract_mid_paren_year(name: str) -> Tuple[str, Optional[str]]:
+    """'Artist - (2017) Album' → ('Artist - Album', '2017')"""
+    m = _MID_PAREN_YEAR.search(name)
+    if m:
+        year = m.group(1)
+        cleaned = name[:m.start()] + ' - ' + name[m.end():]
+        return re.sub(r'\s+', ' ', cleaned).strip(), year
+    return name, None
+
+def _extract_mid_bracket_year(name: str) -> Tuple[str, Optional[str]]:
+    """'aukai.  [2016] aukai' → ('aukai. - aukai', '2016')"""
+    m = _MID_BRACKET_YEAR.match(name)
+    if m:
+        pre  = m.group('pre').strip()
+        year = m.group('year')
+        post = m.group('post').strip()
+        return f"{pre} - {post}", year
+    return name, None
+
+def _smart_title_case_v43(s: str, cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    v4.3 Smart Title Case — fires only on all-lowercase input.
+    Confirmed rule from 147 all-lowercase folders across two library sessions.
+    Config toggle: title_case.auto_titlecase_lowercase_folders (default: true).
+    """
+    if not s:
+        return s
+    alpha_words = [w for w in s.split() if any(c.isalpha() for c in w)]
+    if not alpha_words or not all(w.islower() for w in alpha_words):
+        return s  # not all-lowercase — leave as-is
+
+    tc = (cfg or {}).get("title_case", {})
+    if not tc.get("auto_titlecase_lowercase_folders", True):
+        return s  # user disabled
+
+    _SMALL = {
+        "a","an","the","and","but","or","for","nor","of","in","on","at",
+        "to","by","up","as","vs","via","feat","feat.","ft.","b/w","vs.",
+    }
+    never  = _SMALL | {w.lower() for w in (tc.get("never_cap", []) or [])}
+    # Always-uppercase short tokens
+    _ALWAYS_UPPER = {"dj","mc","ep","lp","va","uk","us","la","nyc","ny","ii","iii","iv","vi"}
+    always = _ALWAYS_UPPER | {w.lower() for w in (tc.get("always_cap", []) or [])}
+
+    words  = s.split()
+    result = []
+    for i, word in enumerate(words):
+        m = re.match(r'^([^\w]*)(.+?)([^\w]*)$', word)
+        if not m:
+            result.append(word); continue
+        lead, core, trail = m.group(1), m.group(2), m.group(3)
+        core_lower = core.lower()
+        is_first = (i == 0)
+        is_last  = (i == len(words) - 1)
+        if core_lower in always:
+            result.append(lead + core.upper() + trail)
+        elif is_first or is_last or core_lower not in never:
+            result.append(lead + core[0].upper() + core[1:] + trail)
+        else:
+            result.append(lead + core_lower + trail)
+    return " ".join(result)
+
+def _detect_label_as_albumartist(albumartist: str) -> bool:
+    """
+    True if the albumartist tag looks like a record label, not an artist name.
+    Pattern confirmed in 37 folders (3.7%) from session 2 (Tropical Twista Records cluster).
+    """
+    if not albumartist:
+        return False
+    return bool(re.search(
+        r'\b(Records?|Discos?|Recordings?|Label|Music\s+Group|Inc\.?|Ltd\.?|Disques?)\b',
+        albumartist, re.IGNORECASE))
+
+
+def apply_v41_folder_pre_processor(name: str, cfg: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    v4.3 folder name pre-processor (supersedes v4.1, backwards-compatible).
+    Returns (cleaned_name, metadata_dict) where metadata may contain:
+      year, folder_type, extracted_label, noise_stripped flags.
+    Steps 1-13 are the v4.1 pipeline; steps 14-27 are new v4.3 patterns
+    confirmed across 2,000+ real folders in two library sessions.
+    """
+    meta: Dict[str, Any] = {}
+    nc = cfg.get("title_cleanup", {})
+
+    # ── v4.1 pipeline ──────────────────────────────────────────────────────
+
+    # 1. Cyrillic lookalike normalisation
+    name = _normalise_cyrillic_lookalikes(name)
+
+    # 2. Double-space collapse (Traxsource artefact)
+    name = re.sub(r"  +", " ", name).strip()
+
+    # 3. URL-decode
+    if nc.get("url_decode", True):
+        import urllib.parse
+        name = urllib.parse.unquote(name)
+
+    # 4. Strip leading macOS resource-fork prefix (._)
+    if name.startswith("._"):
+        name = name[2:]
+
+    # 5. Strip !!! … !!! bang delimiters
+    if nc.get("strip_bang_delimiters", True):
+        name = _strip_bang_delimiters(name)
+
+    # 6. Strip catalog ID prefix (ANJDEE786D Artist - Album)
+    name = _strip_catalog_prefix(name)
+
+    # 7. Strip leading [bracket] catalog code
+    name = _strip_leading_bracket_catalog(name)
+
+    # 8. Strip (Self Released) / (Selfreleased CD) edition noise
+    name = _strip_self_released(name)
+
+    # 9. MASHUP ALBUM keyword
+    name, is_mashup = _strip_mashup_keyword(name)
+    if is_mashup:
+        meta["folder_type"] = "mashup"
+
+    # 10. Beatport compilation noise
+    name = _strip_beatport_compilation_noise(name)
+
+    # 11. Discography container detection + bitrate noise
+    if _is_discography_folder(name):
+        meta["folder_type"] = "discography"
+        name = _strip_bitrate_noise(name)
+
+    # 12. Year-dot separator: "Artist - 2011. Album" → year=2011, album=Album
+    m = re.match(r"^(.+?)\s*-\s*((?:19|20)\d{2})\.\s*(.+)$", name)
+    if m:
+        meta["year"] = m.group(2)
+        name = f"{m.group(1).strip()} - {m.group(3).strip()}"
+
+    # 13. Normalise spaces after v4.1 stripping
+    name = re.sub(r"\s+", " ", name).strip()
+
+    # ── v4.3 pipeline ──────────────────────────────────────────────────────
+
+    # 14. Scene release group suffix: Artist-Album-WEB-2023-GROUP
+    name, was_scene = _strip_scene_release_suffix(name)
+    if was_scene:
+        meta["noise_scene_stripped"] = True
+
+    # 15. Double-dash slug: Artist--Album_Name → Artist - Album Name
+    if '--' in name:
+        name = _normalise_double_dash_slug(name)
+
+    # 16. Tilde separator ~ → " - "
+    name = _TILDE_SEP.sub(' - ', name)
+
+    # 17. Curly brace noise blocks: {Digital Media} {MFM031}
+    name = _CURLY_NOISE.sub(' ', name).strip()
+
+    # 18. Known-label bracket at end: [warp 2008] [strike 45]
+    name = _LABEL_BRACKET_TRAIL.sub('', name).strip()
+
+    # 19. Trailing type annotation: [Anthology] [album]
+    name = _TYPE_BRACKET_TRAIL.sub('', name).strip()
+
+    # 20. Format bracket/paren noise: [FLAC] ( 320 Kbps ) [16Bit-44.1kHz]
+    for _ in range(4):  # may stack: "(EP) ( FLAC ) [320]"
+        prev = name
+        name = _FORMAT_BRACKET_TRAIL.sub('', name).strip()
+        name = _FORMAT_PAREN_TRAIL.sub('', name).strip()
+        if name == prev:
+            break
+
+    # 21. Trailing CD+bitrate slug noise: "2012 cd 320 tmgk"
+    name = _CD_BITRATE_SLUG.sub('', name).strip()
+
+    # 22. Trailing catalog code in parens/brackets/curly: (CA046) [KOSA043]
+    name = _CATALOG_TAIL.sub('', name).strip()
+
+    # 23. Duplicate year: "2010 - Río Arriba (2010)" → keep prefix year
+    dm = _DUPLICATE_YEAR.match(name)
+    if dm:
+        year_prefix = dm.group(1)
+        rest = dm.group(3).strip().rstrip('-–').strip()
+        if not meta.get("year"):
+            meta["year"] = year_prefix
+        name = f"{year_prefix} - {rest}" if '-' not in rest[:3] else f"{year_prefix}{rest}"
+        name = re.sub(r"\s+", " ", name).strip()
+
+    # 24. Mid-name paren year: "Artist - (2017) Album" → year extracted, moved
+    name, paren_year = _extract_mid_paren_year(name)
+    if paren_year and not meta.get("year"):
+        meta["year"] = paren_year
+
+    # 25. Mid-name bracket year (aukai. pattern): "Artist  [2016] Album"
+    name, bracket_year = _extract_mid_bracket_year(name)
+    if bracket_year and not meta.get("year"):
+        meta["year"] = bracket_year
+
+    # 26. 4-dash label-year-artist-album pattern:
+    #     "Cosmovision Records - 2024 - VA - Electropical"
+    # Guard: only fires when the first segment looks like a label (contains a label keyword
+    # OR is present in brain.known_labels). Prevents false positives on Artist-Year-Artist-Album.
+    lm = _LABEL_4DASH.match(name)
+    if lm:
+        label   = lm.group("label").strip()
+        year    = lm.group("year")
+        artist  = lm.group("artist").strip()
+        album   = lm.group("album").strip()
+        known_labels = {lb.lower() for lb in (
+            (cfg or {}).get("brain", {}).get("known_labels", []) or [])}
+        label_is_label = (
+            _detect_label_as_albumartist(label)
+            or label.lower() in known_labels
+        )
+        if label_is_label:
+            meta["extracted_label"] = label
+            if not meta.get("year"):
+                meta["year"] = year
+            # Reassemble as standard artist - year - album
+            name = f"{artist} - {year} - {album}"
+
+    # 27. Final space normalisation and cleanup
+    name = re.sub(r"\s+", " ", name).strip()
+    # Strip orphaned trailing separators left by aggressive stripping
+    name = name.rstrip("-– ").strip()
+    # Strip orphaned trailing year digits (e.g. "Album remixed2012" → "Album remixed")
+    # Only when immediately abutted to the previous word (no space before the year)
+    name = re.sub(r'([a-z])(?:19|20)\d{2}\s*$', r'\1', name, flags=re.IGNORECASE).strip()
+    # Final trailing separator cleanup after year strip
+    name = name.rstrip("-– ").strip()
+    name = re.sub(r"\s+", " ", name).strip()
+
+    return name, meta
+
+# ─────────────────────────────────────────────
+# Folder name heuristic parser
+# ─────────────────────────────────────────────
+def smart_title_case(s: str, cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Intelligent title case — handles both ALL CAPS and all-lowercase inputs.
+    v4.3: all-lowercase support confirmed across 147 real library folders.
+    Delegates to _smart_title_case_v43 for lowercase; handles ALL CAPS inline.
+    """
+    if not s:
+        return s
+    words = s.split()
+    alpha_words = [w for w in words if any(c.isalpha() for c in w)]
+    if not alpha_words:
+        return s
+    # ALL CAPS path (pre-existing behaviour)
+    if all(w.isupper() for w in alpha_words if len(w) > 1):
+        small = {"a","an","the","and","but","or","for","nor","on","at","to","by","in","of","vs"}
+        return " ".join(w.capitalize() if i==0 or w.lower() not in small else w.lower()
+                        for i, w in enumerate(words))
+    # All-lowercase path (v4.3 new)
+    if all(w.islower() for w in alpha_words):
+        return _smart_title_case_v43(s, cfg)
     return s
 
-def parse_folder_name_heuristic(folder_name:str)->Dict[str,Optional[str]]:
+def parse_folder_name_heuristic(folder_name:str, cfg:Optional[Dict[str,Any]]=None)->Dict[str,Optional[str]]:
     result:Dict[str,Optional[str]]={"artist":None,"album":None,"year":None}
-    name=normalize_unicode(folder_name.strip())
+    if cfg is None: cfg = {}
+
+    # v4.1 pre-processor: apply naming pattern fixes before parsing
+    cleaned, meta = apply_v41_folder_pre_processor(folder_name, cfg)
+    # Propagate year extracted by pre-processor
+    if meta.get("year"):
+        result["year"] = meta["year"]
+
+    # v4.3: apply Smart Title Case to all-lowercase folder names before parsing
+    cleaned = smart_title_case(cleaned, cfg)
+
+    name=normalize_unicode(cleaned.strip())
     name=re.sub(r"\s*\[[A-Z0-9\.\s]+\]\s*$","",name,flags=re.IGNORECASE).strip()
     name=re.sub(r"_-_"," - ",name).replace("_"," ")
     name=re.sub(r"\s+"," ",name).strip()
     ym=re.search(r"\b(19\d{2}|20\d{2})\b",name)
-    if ym: result["year"]=ym.group(1)
+    if ym and not result["year"]: result["year"]=ym.group(1)
     name_ny=re.sub(r"[\(\[]\s*(19\d{2}|20\d{2})\s*[\)\]]","",name).strip()
     name_ny=re.sub(r"\b(19\d{2}|20\d{2})\b","",name_ny).strip()
     name_ny=re.sub(r"\s+"," ",name_ny).strip().rstrip("-–").strip()
     m=re.match(r"^[\[\(]?(19\d{2}|20\d{2})[\]\)]?\s*[-–]\s*(.+?)\s*[-–]\s*(.+)$",name)
     if m:
-        result["year"]=m.group(1); result["artist"]=smart_title_case(m.group(2).strip())
+        if not result["year"]: result["year"]=m.group(1)
+        result["artist"]=smart_title_case(m.group(2).strip())
         result["album"]=smart_title_case(re.sub(r"\s*[\(\[](19\d{2}|20\d{2})[\)\]]\s*$","",m.group(3)).strip()); return result
     m2=re.match(r"^(.+?)\s*[-–]\s*(.+)$",name_ny)
     if m2:
@@ -1321,12 +1993,45 @@ def recover_display(norm_key:Optional[str],raw_by_norm:Dict[str,Counter])->Optio
     rc=raw_by_norm.get(norm_key)
     return rc.most_common(1)[0][0] if rc else norm_key
 
-def detect_va(aa_norm:str,track_artists:List[str],cfg:Dict[str,Any])->bool:
-    vc=cfg.get("various_artists",{}); matches={m.lower() for m in vc.get("albumartist_matches",[])}
-    if aa_norm and aa_norm in matches: return True
-    if not vc.get("enable_heuristics",True): return False
-    non_empty=[a for a in track_artists if a]
-    return bool(non_empty) and len(set(non_empty))/len(non_empty)>=float(vc.get("unique_artist_ratio_above",0.50))
+def detect_va(aa_norm: str, track_artists: Any, cfg: Dict[str, Any]) -> bool:
+    """
+    Return True if this folder looks like a Various Artists release.
+
+    track_artists may be:
+      - a Counter[norm_str → int]  (preferred — one count per track)
+      - a list[str]                (legacy — interpreted as per-track list)
+
+    THE CLASSIC BUG TO AVOID: if you pass list(Counter.keys()) you get a
+    single-element list for a single-artist album, yielding ratio=1/1=1.0 → VA.
+    Always pass the Counter or the per-track expanded list, never .keys() alone.
+    """
+    vc = cfg.get("various_artists", {})
+    matches = {m.lower() for m in vc.get("albumartist_matches", [])}
+
+    # Explicit albumartist tag says Various Artists
+    if aa_norm and aa_norm in matches:
+        return True
+
+    if not vc.get("enable_heuristics", True):
+        return False
+
+    # Resolve to (unique_artists, total_tracks)
+    if isinstance(track_artists, Counter):
+        non_empty = {k: v for k, v in track_artists.items() if k}
+        if not non_empty:
+            return False
+        total = sum(non_empty.values())
+        unique = len(non_empty)
+    else:
+        # list of per-track artist names (may be repeated)
+        non_empty = [a for a in track_artists if a]
+        if not non_empty:
+            return False
+        total = len(non_empty)
+        unique = len(set(non_empty))
+
+    threshold = float(vc.get("unique_artist_ratio_above", 0.50))
+    return (unique / total) >= threshold
 
 def pick_year(year_counts:Counter,tracks_with_year:int,total:int,cfg:Dict[str,Any])->Tuple[Optional[int],Dict[str,Any]]:
     yc=cfg.get("year",{})
@@ -1398,7 +2103,60 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
             except Exception: pass
 
     va_label=cfg.get("various_artists",{}).get("label","VA")
-    is_va=detect_va(dom_aa_n or "",list(track_artists_norm.keys()),cfg)
+    # ── VA detection ──────────────────────────────────────────────────────
+    # CRITICAL: pass the Counter (not .keys()) so ratio = unique/total tracks.
+    # Passing list(Counter.keys()) gives a 1-element list for any single-artist
+    # album, yielding ratio=1/1=1.0 ≥ 0.5 → false VA for every real album.
+    is_va = detect_va(dom_aa_n or "", track_artists_norm, cfg)
+
+    # Pre-compute the set of known VA keywords for safeguard checks
+    _va_kws = {m.lower() for m in cfg.get("various_artists",{}).get("albumartist_matches",[])}
+
+    # Safeguard A: Strong single-artist signal overrides VA heuristic.
+    # If albumartist AND artist tags BOTH point to the same name at ≥75%
+    # dominance, this is definitively a single-artist album — not VA.
+    # Guard: only fires when the albumartist is NOT itself a VA keyword.
+    if is_va and dom_aa_n and dom_aa_n not in _va_kws and dom_art_n:
+        if dom_aa_n == dom_art_n and aa_share >= 0.75 and art_share >= 0.75:
+            is_va = False
+
+    # Safeguard A2: albumartist alone at very high confidence with no
+    # counter-evidence — but ONLY for non-VA albumartist tags.
+    if is_va and dom_aa_n and dom_aa_n not in _va_kws and aa_share >= 0.90:
+        if dom_art_n and art_share >= 0.75 and dom_art_n == dom_aa_n:
+            is_va = False
+        elif not dom_art_n:
+            # albumartist present & non-VA, artist tag absent → trust albumartist
+            is_va = False
+
+    # Safeguard B: Folder name starts with the dominant albumartist name.
+    # "Artist - Album" folder + single AA tag = single artist album.
+    # Guard: albumartist must not be a VA keyword.
+    if is_va and dom_aa_n and dom_aa_n not in _va_kws and aa_share >= 0.80:
+        fn_norm = normalize_unicode(folder.name.strip().lower())
+        aa_norm_str = normalize_unicode((dom_aa or dom_aa_n or "").strip().lower())
+        if aa_norm_str and fn_norm.startswith(aa_norm_str):
+            is_va = False
+
+    # Safeguard C: No albumartist tag, but artist tag is dominant and
+    # folder name starts with that artist.
+    if is_va and not dom_aa_n and dom_art_n and art_share >= 0.90:
+        fn_norm = normalize_unicode(folder.name.strip().lower())
+        art_norm_str = normalize_unicode(dom_art_n.strip().lower())
+        if art_norm_str and fn_norm.startswith(art_norm_str):
+            is_va = False
+
+    # Safeguard D (v4.3): albumartist tag is a label name, not an artist.
+    # Pattern confirmed in 37 folders (3.7%) in session 2.
+    # Re-parse using dominant track artist instead.
+    if dom_aa_n and _detect_label_as_albumartist(dom_aa or dom_aa_n or ""):
+        # Folder has pattern "Label - Artist - Album" or "Label - Album"
+        # Check if track artist gives us a cleaner single-artist signal
+        if dom_art_n and art_share >= 0.70:
+            dom_aa   = recover_display(dom_art_n, {}) or dom_art_n
+            dom_aa_n = dom_art_n
+            aa_share = art_share
+            is_va    = detect_va(dom_aa_n, track_artists_norm, cfg)
 
     # ── folder content type ─────────────────────────────────────────────
     folder_type=classify_folder_content(audio_files,folder.name,all_tags,cfg)
@@ -1471,23 +2229,43 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     return FolderProposal(folder_path=str(folder),folder_name=folder.name,proposed_folder_name=proposed,
                           target_path=str(target_dir),destination="clean",confidence=float(confidence),decision=decision,stats=stats)
 
-def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=None)->Tuple[str,Path,List[FolderProposal]]:
+def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->Tuple[str,Path,List[FolderProposal]]:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     if not source_root.exists(): raise FileNotFoundError(f"source_root missing: {source_root}")
 
+    # v5.5 — resolve log paths and skip-sets from config
+    setup_logging_paths(cfg, profile, source_root)
+    _init_skip_sets(cfg)
+
+    # v4.1 — resolve effective genre roots (CLI flag + config)
+    effective_genre_roots = _resolve_genre_roots(cfg, genre_roots)
+
     roots=ensure_roots(profile,source_root)
     clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
+    # Also skip the wrapper folder itself during walk (it contains Clean/, Review/, logs/)
+    wrapper_root_str=str(derive_wrapper_root(profile,source_root).resolve())+os.sep
     clean_root_str =str(derive_clean_root(profile,source_root).resolve())+os.sep
     review_root_str=str(derive_review_root(profile,source_root).resolve())+os.sep
 
-    session_id=make_session_id(); session_dir=Path(cfg["logging"]["session_dir"])/session_id; ensure_dir(session_dir)
+    session_id=make_session_id(profile_name, str(source_root))
+    # Deduplicate if same-minute session already exists
+    session_base=Path(cfg["logging"]["session_dir"])/session_id
+    if session_base.exists():
+        for i in range(2,20):
+            candidate=Path(cfg["logging"]["session_dir"])/f"{session_id}_{i}"
+            if not candidate.exists():
+                session_id=f"{session_id}_{i}"; session_base=candidate; break
+    session_dir=session_base; ensure_dir(session_dir)
 
     sc=cfg.get("scan",{}); exts=[e.lower() for e in sc.get("audio_extensions",[".mp3",".flac",".m4a"])]
     min_tracks=int(sc.get("min_tracks",3)); follow_sym=bool(sc.get("follow_symlinks",False))
     leaf_only=bool(sc.get("leaf_folders_only",True))
     ignore_patterns:List[str]=list(cfg.get("ignore",{}).get("ignore_folder_names",[]) or [])
+    # v5.5: skip sets now fully populated by _init_skip_sets (also covers config overrides)
+    skip_folder_names = set(_SKIP_FOLDER_NAMES)
+    skip_exts = set(_SKIP_AUDIO_EXTENSIONS)
 
     # Initialise tag cache for this scan run
     _get_tag_cache(cfg)
@@ -1496,9 +2274,20 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     candidates:List[Path]=[]
     for root,dirs,files in os.walk(source_root,followlinks=follow_sym):
         rp=Path(root); rp_str=str(rp.resolve())+os.sep
+        # Skip the entire wrapper folder (contains Clean/, Review/, logs/)
+        if rp_str.startswith(wrapper_root_str): dirs[:]=[] ; continue
         if rp_str.startswith(clean_root_str) or rp_str.startswith(review_root_str): dirs[:]=[] ; continue
+        # v4.1: skip __MACOSX and other noise folders
+        dirs[:] = [d for d in dirs if d not in skip_folder_names]
+        # v4.1: genre root protection — skip renaming them but recurse inside
+        if effective_genre_roots and rp.name in effective_genre_roots and rp != source_root:
+            continue  # don't process genre root itself as a candidate
         if leaf_only and dirs: continue
-        if sum(1 for f in files if Path(f).suffix.lower() in exts)>=min_tracks: candidates.append(rp)
+        audio_count = sum(1 for f in files
+                          if Path(f).suffix.lower() in exts
+                          and Path(f).suffix.lower() not in skip_exts
+                          and not f.startswith("._"))
+        if audio_count >= min_tracks: candidates.append(rp)
 
     if since:
         candidates=[f for f in candidates if dt.datetime.fromtimestamp(folder_mtime(f))>=since]
@@ -1946,15 +2735,49 @@ def cleanup_title(title:str,cfg:Dict[str,Any])->str:
     if n.get("trim_dots_spaces",True): o=o.rstrip(". ").strip()
     return o
 
-def parse_artist_title_from_fn(stem:str)->Tuple[Optional[str],Optional[str]]:
-    s=normalize_unicode(re.sub(r"\s+"," ",stem.strip()))
-    if detect_bpm_dj_encoding(s): return None,None
-    s=re.sub(r"_-_"," - ",s).replace("_"," "); s=re.sub(r"\s+"," ",s).strip()
-    s=re.sub(r"^[\[\(][^\]\)]+[\]\)]\s*","",s)
-    s2=re.sub(r"^\(?\d{1,3}\)?\s*[-–—\.]\s*","",s); s2=re.sub(r"^\d{1,3}\s+","",s2)
-    parts=[p.strip() for p in re.split(r"\s*[-–—]\s*",s2) if p.strip()]
-    if len(parts)>=2: return parts[0]," - ".join(parts[1:])
-    return None,None
+def parse_artist_title_from_fn(stem: str, folder_name: str = "", cfg: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse artist and title from a filename stem.
+    v4.2: Handles Beatport inverted format (Title - Artist1, Artist2) and
+    leading-space Beatport artefact.  Also handles disc-track compound prefix
+    (1-01 Title) and vinyl side lettering (A1 - Title).
+    """
+    if cfg is None: cfg = {}
+    beatport_aware = cfg.get("beatport_aware", True)
+    keep_all = cfg.get("beatport_keep_all_artists", False)
+
+    # Strip leading space first (always safe — Beatport artefact)
+    raw_stem = stem
+    stem = stem.lstrip()
+
+    # Strip disc-track compound prefix from stem if present: "1-01 Title"
+    m_disc = _TRACK_DISC_COMPOUND.match(stem)
+    if m_disc:
+        stem = stem[m_disc.end():]
+
+    # Strip vinyl side prefix from stem: "A1 - Title" or "b2 Title"
+    m_vinyl = _TRACK_VINYL_STEM.match(stem)
+    if m_vinyl:
+        stem = stem[m_vinyl.end():]
+
+    # Beatport inversion
+    if beatport_aware and _is_beatport_format(raw_stem, folder_name):
+        artist, title, _ = _invert_beatport_filename(raw_stem, keep_all_artists=keep_all)
+        if artist and title:
+            return artist.strip(), title.strip()
+
+    # Standard parse
+    s = normalize_unicode(re.sub(r"\s+", " ", stem.strip()))
+    if detect_bpm_dj_encoding(s): return None, None
+    s = re.sub(r"_-_", " - ", s).replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"^[\[\(][^\]\)]+[\]\)]\s*", "", s)
+    s2 = re.sub(r"^\(?\d{1,3}\)?\s*[-–—\.]\s*", "", s)
+    s2 = re.sub(r"^\d{1,3}\s+", "", s2)
+    parts = [p.strip() for p in re.split(r"\s*[-–—]\s*", s2) if p.strip()]
+    if len(parts) >= 2:
+        return parts[0], " - ".join(parts[1:])
+    return None, None
 
 def extract_mix_suffix(title:str,cfg:Dict[str,Any])->Tuple[str,str]:
     mc=cfg.get("mix_info",{}); kw=[k.lower() for k in (mc.get("detect_keywords",[]) or [])]
@@ -1975,7 +2798,8 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
     trc=cfg.get("track_rename",{}); pat=trc.get("patterns",{}); ext=src.suffix.lower()
     title=(tags.get("title") or "").strip(); artist=(tags.get("artist") or "").strip()
     track_raw=(tags.get("tracknumber") or "").strip(); disc_raw=(tags.get("discnumber") or "").strip()
-    fn_artist,fn_title=parse_artist_title_from_fn(src.stem)
+    folder_name = src.parent.name
+    fn_artist, fn_title = parse_artist_title_from_fn(src.stem, folder_name=folder_name, cfg=cfg)
     if not title and fn_title: title=fn_title
     if title: title=cleanup_title(title,cfg)
     if not title: return None,0.0,"missing_title",{}
@@ -2169,6 +2993,7 @@ def cmd_verify(cfg:Dict[str,Any],profile_name:str)->None:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
     roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     manifest=read_manifest(cfg); mf_entries=manifest.get("entries",{})
@@ -2212,6 +3037,7 @@ def cmd_verify(cfg:Dict[str,Any],profile_name:str)->None:
 # learn — config suggestion from Review patterns
 # ─────────────────────────────────────────────
 def cmd_learn(cfg_path:Path,cfg:Dict[str,Any],session_id:Optional[str])->None:
+    _resolve_log_paths_from_active_profile(cfg)
     sdir=Path(cfg["logging"]["session_dir"]); sessions:List[Path]=[]
     if session_id:
         sp=sdir/session_id/"proposals.json"
@@ -2275,6 +3101,106 @@ def cmd_learn(cfg_path:Path,cfg:Dict[str,Any],session_id:Optional[str])->None:
         out(f"\n{C.DIM}Saved: {cfg_path}{C.RESET}")
     else: out("No changes applied.")
 
+
+# ─────────────────────────────────────────────
+# dump-tree — export raw folder/file tree for training/debug
+# ─────────────────────────────────────────────
+def cmd_dump_tree(
+    cfg: Dict[str, Any],
+    profile_name: str,
+    out_path: str,
+    include_clean: bool = False,
+    include_review: bool = False,
+    include_logs: bool = False,
+    folders_only: bool = False,
+    files_only: bool = False,
+) -> None:
+    profiles = cfg.get("profiles", {})
+    if profile_name not in profiles:
+        raise ValueError(f"Unknown profile: {profile_name}")
+
+    profile = profiles[profile_name]
+    source_root = Path(profile["source_root"]).expanduser().resolve()
+    roots = ensure_roots(profile, source_root)
+
+    if not source_root.exists():
+        raise FileNotFoundError(f"source_root missing: {source_root}")
+
+    clean_root = roots["clean_root"].resolve()
+    review_root = roots["review_root"].resolve()
+    logs_cfg = Path(cfg.get("logging", {}).get("root_dir", "logs"))
+    logs_root = (source_root / logs_cfg).resolve() if not logs_cfg.is_absolute() else logs_cfg.resolve()
+
+    out_file = Path(out_path).expanduser().resolve()
+    ensure_dir(out_file.parent)
+
+    def _is_under(path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except Exception:
+            return False
+
+    lines: List[str] = []
+
+    for root, dirs, files in os.walk(source_root):
+        root_path = Path(root).resolve()
+
+        # Prune excluded top-level generated areas
+        pruned_dirs = []
+        for d in dirs:
+            child = (root_path / d).resolve()
+
+            if not include_clean and _is_under(child, clean_root):
+                continue
+            if not include_review and _is_under(child, review_root):
+                continue
+            if not include_logs and _is_under(child, logs_root):
+                continue
+
+            pruned_dirs.append(d)
+
+        dirs[:] = sorted(pruned_dirs)
+        files = sorted(files)
+
+        # Skip hidden macOS noise files in output
+        rel_root = root_path.relative_to(source_root)
+        depth = 0 if str(rel_root) == "." else len(rel_root.parts)
+
+        if not files_only:
+            rel_str = "." if str(rel_root) == "." else rel_root.as_posix()
+            lines.append(f"DIR|depth={depth}|path={rel_str}")
+
+        if folders_only:
+            continue
+
+        for fname in files:
+            fpath = root_path / fname
+
+            if is_hidden_file(fpath):
+                continue
+
+            if not include_clean and _is_under(fpath, clean_root):
+                continue
+            if not include_review and _is_under(fpath, review_root):
+                continue
+            if not include_logs and _is_under(fpath, logs_root):
+                continue
+
+            rel_file = fpath.relative_to(source_root).as_posix()
+            file_depth = len(Path(rel_file).parts) - 1
+            ext = fpath.suffix.lower() or ""
+            lines.append(f"FILE|depth={file_depth}|ext={ext}|path={rel_file}")
+
+    out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    out(f"\n{C.BOLD}raagdosa dump-tree — {profile_name}{C.RESET}")
+    out(f"Source: {source_root}")
+    out(f"Wrote:  {out_file}")
+    out(f"Lines:  {len(lines)}")
+
+
+
 # ─────────────────────────────────────────────
 # orphans — find loose audio files
 # ─────────────────────────────────────────────
@@ -2282,6 +3208,7 @@ def cmd_orphans(cfg:Dict[str,Any],profile_name:str)->None:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
     roots=ensure_roots(profile,source_root)
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     orphans:List[Path]=[]
@@ -2313,6 +3240,7 @@ def cmd_artists(cfg:Dict[str,Any],profile_name:str,list_mode:bool,find_query:Opt
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
     roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
@@ -2353,6 +3281,7 @@ def cmd_review_list(cfg:Dict[str,Any],profile_name:str,older_than_days:Optional[
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
     roots=ensure_roots(profile,source_root); review_albums=roots["review_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
@@ -2440,6 +3369,7 @@ def cmd_clean_report(cfg:Dict[str,Any],profile_name:str)->None:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
     roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
@@ -2641,6 +3571,7 @@ def cmd_status(cfg:Dict[str,Any],profile_name:str)->None:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
     roots=ensure_roots(profile,source_root)
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     def count_in(path:Path)->Tuple[int,int]:
@@ -2699,14 +3630,18 @@ def cmd_init(cfg_path:Path)->None:
     the_policy=the_map.get(input("  Choose [1]: ").strip(),"keep-front")
     new_cfg={"app":{"name":"RaagDosa","version":APP_VERSION},
              "profiles":{"incoming":{"source_root":source,"clean_mode":"inside_root",
+                "wrapper_folder_name":"raagdosa",
                 "clean_folder_name":"Clean","review_folder_name":"Review",
                 "clean_albums_folder_name":"Albums","clean_tracks_folder_name":"Tracks",
                 "review_albums_folder_name":"Albums","duplicates_folder_name":"Duplicates","orphans_folder_name":"Orphans"}},
              "active_profile":"incoming",
              "library":{"template":template,"flac_segregation":flac_seg,"singles_folder":"_Singles","va_folder":"_Various Artists","unknown_artist_label":"_Unknown"},
              "artist_normalization":{"enabled":True,"the_prefix":the_policy,"normalize_hyphens":True,"fuzzy_dedup_threshold":0.92,"unicode_map":{},"aliases":{}},
-             "scan":{"audio_extensions":[".mp3",".flac",".m4a",".aiff",".wav"],"leaf_folders_only":True,"min_tracks":3,"max_unreadable_track_ratio":0.25,"follow_symlinks":False},
-             "ignore":{"ignore_folder_names":["Singles","One-Offs","Dump","_dump","Clean","Review"]},
+             "scan":{"audio_extensions":[".mp3",".flac",".m4a",".aiff",".wav"],"leaf_folders_only":True,"min_tracks":3,"max_unreadable_track_ratio":0.25,"follow_symlinks":False,
+                     "skip_sidecar_extensions":[".sfk",".asd",".reapeaks",".pkf",".db",".lrc"],
+                     "skip_system_folders":["__MACOSX","__macosx"]},
+             "ep_detection":{"enabled":True,"min_tracks":2,"max_tracks":6},
+             "ignore":{"ignore_folder_names":["Singles","One-Offs","Dump","_dump","Clean","Review","raagdosa"]},
              "tags":{"album_keys":["album"],"albumartist_keys":["albumartist","album_artist","album artist"],
                      "artist_keys":["artist"],"title_keys":["title"],"tracknumber_keys":["tracknumber","track"],
                      "discnumber_keys":["discnumber","disc"],"year_keys_prefer":["originaldate","date","year"],
@@ -2722,7 +3657,8 @@ def cmd_init(cfg_path:Path)->None:
              "format_suffix":{"enabled":True,"only_if_all_same_extension":True,"ignore_extension":".mp3","style":"brackets_upper"},
              "review_rules":{"min_confidence_for_clean":0.85,"route_duplicates":True,"route_cross_run_duplicates":True,"route_questionable_to_review":True,"route_heuristic_to_review":True},
              "move":{"enabled":True,"on_collision":"suffix","suffix_format":" ({n})","use_checksum":False},
-             "dj_safety":{"detect_dj_databases":True,"warn_on_dj_databases":True,"halt_on_dj_databases":False},
+             "dj_safety":{"detect_dj_databases":True,"warn_on_dj_databases":True,"halt_on_dj_databases":False,
+                          "database_patterns":["export.pdb","database2","rekordbox.xml","_Serato_","Serato Scratch","Serato DJ","PIONEER"]},
              "track_rename":{"enabled":True,"scope":"clean_only","allowed_extensions":[".mp3",".flac",".m4a"],"skip_extensions":[".wav",".aiff"],
                              "patterns":{"album":"{disc_prefix}{track:02d} - {title}{mix_suffix}{ext}","various":"{disc_prefix}{track:02d} - {artist} - {title}{mix_suffix}{ext}","mixed":"{artist} - {title}{mix_suffix}{ext}"},
                              "disc":{"enabled":True,"only_if_multi_disc":True,"format":"{disc}-"},
@@ -2736,7 +3672,7 @@ def cmd_init(cfg_path:Path)->None:
              "logging":{"root_dir":"logs","session_dir":"logs/sessions","history_log":"logs/history.jsonl",
                         "skipped_log":"logs/skipped.jsonl","track_history_log":"logs/track-history.jsonl",
                         "track_skipped_log":"logs/track-skipped.jsonl","write_human_report":True,"report_filename":"report.txt","rotate_log_max_mb":10.0},
-             "undo":{"allow_undo_by_id":True,"allow_undo_by_original_path":True,"allow_undo_by_session":True}}
+             "undo":{"allow_undo_by_id":True,"allow_undo_by_original_path":True,"allow_undo_by_session":True,"allow_undo_by_folder":True}}
     write_yaml(cfg_path,new_cfg)
     out(f"\n{C.GREEN}✓ Config written: {cfg_path}{C.RESET}")
     out("\nNext steps:\n  1. Review config.yaml — especially artist_normalization.aliases\n  2. raagdosa doctor\n  3. raagdosa go --dry-run\n  4. raagdosa go")
@@ -2758,8 +3694,8 @@ def _parse_since(val:Optional[str],cfg:Dict[str,Any])->Optional[dt.datetime]:
     try: return dt.datetime.fromisoformat(val)
     except Exception: err(f"Cannot parse --since '{val}'. Use ISO date or 'last_run'."); sys.exit(1)
 
-def cmd_scan(cfg_path:Path,cfg:Dict[str,Any],profile:str,out_path:Optional[str],since:Optional[str])->str:
-    sid,sdir,_=scan_folders(cfg,profile,since=_parse_since(since,cfg))
+def cmd_scan(cfg_path:Path,cfg:Dict[str,Any],profile:str,out_path:Optional[str],since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->str:
+    sid,sdir,_=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
     if out_path: shutil.copyfile(str(sdir/"proposals.json"),out_path)
     return sid
 
@@ -2781,7 +3717,8 @@ def cmd_apply(cfg:Dict[str,Any],proposals_path:Path,interactive:bool,auto_above:
                 rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),a.get("decision",{}),interactive=interactive,dry_run=dry_run,session_id=session_id)
 
 def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,
-               since_str:Optional[str]=None,perf_tier:Optional[str]=None)->None:
+               since_str:Optional[str]=None,perf_tier:Optional[str]=None,
+               genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->None:
     """
     True per-album streaming pipeline (v3.81).
 
@@ -2803,6 +3740,10 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     profiles=cfg.get("profiles",{}); profile_obj=profiles[profile]
     source_root=Path(profile_obj["source_root"]).expanduser()
     if not source_root.exists(): raise FileNotFoundError(f"source_root missing: {source_root}")
+
+    # v5.5 — resolve log paths into wrapper folder and merge skip-sets from config
+    setup_logging_paths(cfg, profile_obj, source_root)
+    _init_skip_sets(cfg)
 
     roots=ensure_roots(profile_obj,source_root)
     clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
@@ -3099,11 +4040,11 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     manifest_set_last_run(cfg)
 
 
-def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None)->None:
-    _run_core(cfg_path,cfg,profile,interactive,dry_run,since,perf_tier=perf_tier)
+def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->None:
+    _run_core(cfg_path,cfg,profile,interactive,dry_run,since,perf_tier=perf_tier,genre_roots=genre_roots,itunes_mode=itunes_mode)
 
-def cmd_folders_only(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str])->None:
-    register_stop_handler(); sid,_,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg))
+def cmd_folders_only(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->None:
+    register_stop_handler(); sid,_,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
     applied=apply_folder_moves(cfg,proposals,interactive=interactive,auto_above=None,dry_run=dry_run,session_id=sid)
     out(f"Folders applied: {len(applied)}"); manifest_set_last_run(cfg)
 
@@ -3111,8 +4052,10 @@ def cmd_tracks_only(cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool)
     profiles=cfg.get("profiles",{})
     if profile not in profiles: raise ValueError(f"Unknown profile: {profile}")
     prof=profiles[profile]; source_root=Path(prof["source_root"]).expanduser()
+    setup_logging_paths(cfg, prof, source_root)
+    _init_skip_sets(cfg)
     roots=ensure_roots(prof,source_root); clean_albums=roots["clean_albums"]
-    sid=make_session_id(); out(f"Session: {sid} (tracks-only)"); register_stop_handler()
+    sid=make_session_id(profile); out(f"Session: {sid} (tracks-only)"); register_stop_handler()
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     for folder in sorted([p for p in clean_albums.rglob("*") if p.is_dir()]):
         if should_stop(): break
@@ -3123,6 +4066,7 @@ def cmd_tracks_only(cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool)
         rename_tracks_in_clean_folder(cfg,folder,decision,interactive=interactive,dry_run=dry_run,session_id=sid)
 
 def cmd_resume(cfg:Dict[str,Any],session_id:str,interactive:bool,dry_run:bool)->None:
+    _resolve_log_paths_from_active_profile(cfg)
     sdir=Path(cfg["logging"]["session_dir"]); pp=sdir/session_id/"proposals.json"
     if not pp.exists(): err(f"No proposals.json for session: {session_id}"); sys.exit(1)
     hist=iter_jsonl(Path(cfg["logging"]["history_log"]))
@@ -3142,7 +4086,24 @@ def cmd_resume(cfg:Dict[str,Any],session_id:str,interactive:bool,dry_run:bool)->
 # ─────────────────────────────────────────────
 # History + undo
 # ─────────────────────────────────────────────
+def _resolve_log_paths_from_active_profile(cfg:Dict[str,Any])->None:
+    """
+    Resolve logging paths for commands that don't take an explicit profile arg
+    (history, undo).  Uses active_profile + source_root to find the wrapper folder.
+    Safe no-op if profile/source_root are not available.
+    """
+    prof_name=cfg.get("active_profile","")
+    prof=cfg.get("profiles",{}).get(prof_name,{})
+    if not prof: return
+    try:
+        source_root=Path(prof.get("source_root","")).expanduser()
+        if source_root.exists():
+            setup_logging_paths(cfg,prof,source_root)
+    except Exception:
+        pass  # fall back to config values as-is
+
 def cmd_history(cfg:Dict[str,Any],last:int,session:Optional[str],match:Optional[str],tracks:bool)->None:
+    _resolve_log_paths_from_active_profile(cfg)
     hist_path=Path(cfg["logging"]["track_history_log"] if tracks else cfg["logging"]["history_log"])
     hist=iter_jsonl(hist_path)
     if session: hist=[h for h in hist if h.get("session_id")==session]
@@ -3157,15 +4118,37 @@ def cmd_history(cfg:Dict[str,Any],last:int,session:Optional[str],match:Optional[
     for sid,cnt in session_counts.most_common(): out(f"  {sid}: {cnt} action(s)")
 
 def cmd_undo(cfg:Dict[str,Any],action_id:Optional[str],session_id:Optional[str],from_path:Optional[str],tracks:bool,folder:Optional[str])->None:
+    """
+    Undo folder moves or track renames.
+
+    --folder <name>  works for BOTH folder-level and track-level undo:
+      • Without --tracks: undoes all folder moves where the original path
+        contains <name> as a path component  (targets a source folder by name).
+      • With --tracks:    undoes all track renames inside clean folder <name>.
+
+    Examples:
+      raagdosa undo --folder "Burial - Untold" --session last
+      raagdosa undo --tracks --folder "Burial - Untold"
+      raagdosa undo --session 2026-03-08_14-30_incoming_test
+    """
+    _resolve_log_paths_from_active_profile(cfg)
     hist_path=Path(cfg["logging"]["track_history_log"] if tracks else cfg["logging"]["history_log"])
     hist=iter_jsonl(hist_path)
     if not hist: err("No history."); return
     selected:List[Dict[str,Any]]=[]
-    if action_id:   selected=[h for h in hist if h.get("action_id")==action_id]
+    if action_id:    selected=[h for h in hist if h.get("action_id")==action_id]
     elif session_id: selected=[h for h in hist if h.get("session_id")==session_id]
     elif from_path:  selected=[h for h in hist if from_path in h.get("original_path","")]
-    elif tracks and folder: selected=[h for h in hist if h.get("folder")==folder]
-    else: err("Specify --id, --session, --from-path"+(" or --folder" if tracks else "")); sys.exit(1)
+    elif folder:
+        if tracks:
+            # Track-level: match by folder field stored in track history
+            selected=[h for h in hist if h.get("folder")==folder]
+        else:
+            # Folder-level: match if folder name appears as a path component
+            selected=[h for h in hist if
+                      folder==Path(h.get("original_path","")).name or
+                      folder in h.get("original_path","")]
+    else: err("Specify --id, --session, --from-path, or --folder"); sys.exit(1)
     if not selected: err("No matches."); return
     selected=sorted(selected,key=lambda x:x.get("timestamp",""),reverse=True); undone=0
     for h in selected:
@@ -3207,7 +4190,12 @@ def cmd_doctor(cfg_path:Path,cfg:Dict[str,Any])->None:
     art_norm=cfg.get("artist_normalization",{})
     out(f"The-prefix: {art_norm.get('the_prefix','keep-front')}  Aliases: {len(art_norm.get('aliases',{}) or {})} defined")
     if source_root.exists():
+        # v5.5 — resolve logging and skip sets before anything that might use them
+        setup_logging_paths(cfg, prof, source_root)
+        _init_skip_sets(cfg)
         roots=ensure_roots(prof,source_root)
+        wrapper=derive_wrapper_root(prof,source_root)
+        out(f"Wrapper: {wrapper}")
         try:
             s=shutil.disk_usage(str(source_root)); fgb=s.free/1024**3
             out(f"Disk:    {fgb:.1f} GB free / {s.total/1024**3:.1f} GB total")
@@ -3215,7 +4203,7 @@ def cmd_doctor(cfg_path:Path,cfg:Dict[str,Any])->None:
         except Exception: pass
         dj=cfg.get("dj_safety",{})
         if dj.get("detect_dj_databases",True):
-            dbs=find_dj_databases(source_root)
+            dbs=find_dj_databases(source_root, cfg)
             if dbs: warn(f"DJ databases: {', '.join(dbs)}"); out(f"  halt_on_dj_databases = {dj.get('halt_on_dj_databases',False)}")
             else: ok_msg("No DJ databases detected.")
         if MutagenFile:
@@ -3232,6 +4220,7 @@ def cmd_doctor(cfg_path:Path,cfg:Dict[str,Any])->None:
                     out(f"Mutagen: {'✓ tags readable' if has else C.YELLOW+'⚠ no tags'+C.RESET} ({test_file.name})")
                 except Exception as e: err(f"Mutagen test failed: {e}")
     log_root=Path(cfg.get("logging",{}).get("root_dir","logs"))
+    out(f"Logs:    {log_root}")
     try:
         ensure_dir(log_root); t=log_root/".write_test"; t.write_text("ok",encoding="utf-8"); t.unlink(); ok_msg(f"Logs writable: {log_root}")
     except Exception as e: err(f"Logs not writable: {log_root} — {e}"); is_ok=False
@@ -3289,6 +4278,475 @@ def profile_use(cfg_path:Path,cfg:Dict[str,Any],name:str)->None:
     if name not in cfg.get("profiles",{}): raise ValueError("No such profile.")
     cfg["active_profile"]=name; write_yaml(cfg_path,cfg); out(f"Active profile: {name}")
 
+
+# ═══════════════════════════════════════════════════════════════════
+# v4.1 — Genre root management
+# ═══════════════════════════════════════════════════════════════════
+
+def _resolve_genre_roots(cfg: Dict[str, Any], cli_roots: Optional[List[str]] = None) -> Set[str]:
+    """Return effective set of genre root folder names (CLI override + config persistent list)."""
+    roots: Set[str] = set()
+    # Config persistent list
+    for item in cfg.get("genre_roots", []) or []:
+        if isinstance(item, str): roots.add(item)
+        elif isinstance(item, dict) and item.get("name"): roots.add(item["name"])
+    # CLI flag overrides (session-only, not written to config)
+    if cli_roots:
+        for r in cli_roots: roots.add(r.strip())
+    return roots
+
+def cmd_genre(cfg_path: Path, cfg: Dict[str, Any], action: str, name: Optional[str] = None) -> None:
+    """Manage persistent genre root declarations."""
+    roots_key = "genre_roots"
+
+    if action == "list":
+        roots = cfg.get(roots_key, []) or []
+        if not roots:
+            out(f"{C.DIM}No genre roots declared. Use: raagdosa genre add <FolderName>{C.RESET}")
+            return
+        out(f"{C.CYAN}Persistent genre roots:{C.RESET}")
+        for r in sorted(str(x) for x in roots):
+            out(f"  • {r}")
+        return
+
+    if action == "clear":
+        cfg[roots_key] = []
+        write_yaml(cfg_path, cfg)
+        ok_msg("Cleared all genre roots.")
+        return
+
+    if action in ("add", "remove", "show"):
+        if not name:
+            err(f"'genre {action}' requires a folder name argument.")
+            sys.exit(1)
+        current: List[str] = [str(x) for x in (cfg.get(roots_key, []) or [])]
+
+        if action == "show":
+            if name in current:
+                out(f"{C.GREEN}'{name}' IS a declared genre root.{C.RESET}")
+            else:
+                out(f"{C.DIM}'{name}' is NOT a declared genre root.{C.RESET}")
+            return
+
+        if action == "add":
+            if name in current:
+                warn(f"'{name}' is already a genre root.")
+            else:
+                current.append(name)
+                cfg[roots_key] = current
+                write_yaml(cfg_path, cfg)
+                ok_msg(f"Added genre root: {name}")
+            return
+
+        if action == "remove":
+            if name not in current:
+                warn(f"'{name}' not found in genre roots.")
+            else:
+                current.remove(name)
+                cfg[roots_key] = current
+                write_yaml(cfg_path, cfg)
+                ok_msg(f"Removed genre root: {name}")
+            return
+
+    err(f"Unknown genre action: {action}")
+    sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v4.1 — iTunes hierarchy flattening
+# ═══════════════════════════════════════════════════════════════════
+
+def _is_itunes_genre_bucket(name: str) -> bool:
+    return name in _ITUNES_GENRE_BUCKETS
+
+def flatten_itunes_hierarchy(source_root: Path, cfg: Dict[str, Any], dry_run: bool = False) -> int:
+    """
+    Flatten iTunes-style Genre/Artist/Album structure.
+    Strips the Genre layer so Artist/Album is at source_root level.
+    Returns count of folders moved.
+    """
+    moved = 0
+    for genre_dir in sorted(source_root.iterdir()):
+        if not genre_dir.is_dir(): continue
+        if not _is_itunes_genre_bucket(genre_dir.name): continue
+        out(f"  [iTunes] Flattening genre bucket: {genre_dir.name}", level=VERBOSE)
+        for artist_dir in sorted(genre_dir.iterdir()):
+            if not artist_dir.is_dir(): continue
+            dst = source_root / artist_dir.name
+            if dry_run:
+                out(f"    [dry-run] {genre_dir.name}/{artist_dir.name} → {artist_dir.name}")
+            else:
+                if dst.exists():
+                    # Merge: move each child of artist_dir into dst
+                    for child in artist_dir.iterdir():
+                        cdst = dst / child.name
+                        if not cdst.exists():
+                            try: child.rename(cdst)
+                            except Exception as e: warn(f"Could not move {child}: {e}")
+                else:
+                    try:
+                        artist_dir.rename(dst)
+                        moved += 1
+                    except Exception as e:
+                        warn(f"Could not move {artist_dir}: {e}")
+        # Remove the now-empty genre bucket
+        if not dry_run:
+            try:
+                if genre_dir.exists() and not any(genre_dir.iterdir()):
+                    genre_dir.rmdir()
+            except Exception: pass
+    return moved
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v4.1 — tree command
+# ═══════════════════════════════════════════════════════════════════
+
+_AUDIO_EXTS_TREE = {".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma",".aac",".alac",".ape"}
+_NON_AUDIO_EXTS_TREE = {".jpg",".jpeg",".png",".gif",".nfo",".txt",".sfk",".m3u",".m3u8",".cue",".pdf",".log",".url"}
+
+def cmd_tree(
+    cfg: Dict[str, Any],
+    path_str: str,
+    audio_only: bool = False,
+    depth: Optional[int] = None,
+    list_mode: bool = False,
+    diff_a: Optional[str] = None,
+    diff_b: Optional[str] = None,
+) -> None:
+    """
+    `raagdosa tree <path>`
+    Each run creates its own subfolder inside logs/trees/:
+      logs/trees/<FolderName>_YYYY-MM-DD_HH-MM/
+        <FolderName>_YYYY-MM-DD_HH-MM.txt
+    This keeps every snapshot self-contained and easy to locate by name + date.
+    """
+    trees_dir = Path(cfg.get("logging", {}).get("root_dir", "logs")) / "trees"
+    ensure_dir(trees_dir)
+
+    if list_mode:
+        # Show subdirectories (one per snapshot run)
+        subdirs = sorted(
+            [d for d in trees_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.stat().st_mtime, reverse=True
+        )
+        # Also pick up legacy flat .txt files
+        flat_txts = [f for f in trees_dir.glob("*.txt")]
+        if not subdirs and not flat_txts:
+            out(f"{C.DIM}No tree snapshots yet. Run: raagdosa tree <path>{C.RESET}")
+            return
+        out(f"{C.CYAN}Saved tree snapshots ({len(subdirs) + len(flat_txts)}):{C.RESET}")
+        for sd in subdirs:
+            try:
+                txt = next(sd.glob("*.txt"))
+                lines = txt.read_text(encoding="utf-8").splitlines()
+                file_count = sum(1 for l in lines if not l.startswith("#") and l.strip() and not l.endswith("/"))
+                created = dt.datetime.fromtimestamp(sd.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                out(f"  {sd.name:<55}  {created}  {file_count:>6} files  → {txt.name}")
+            except StopIteration:
+                out(f"  {sd.name}  (empty)")
+        for f in sorted(flat_txts, reverse=True):
+            created = dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            out(f"  {f.name:<55}  {created}  (legacy flat)")
+        return
+
+    if diff_a and diff_b:
+        _cmd_tree_diff(trees_dir, diff_a, diff_b)
+        return
+
+    if not path_str:
+        err("Provide a path: raagdosa tree <path>")
+        sys.exit(1)
+
+    scan_path = Path(path_str).expanduser().resolve()
+    if not scan_path.exists():
+        err(f"Path not found: {scan_path}")
+        sys.exit(1)
+
+    # Build tree lines
+    lines: List[str] = []
+    _tree_walk(scan_path, scan_path, lines, audio_only=audio_only, max_depth=depth, current_depth=0)
+
+    # Build snapshot folder name: FolderName_YYYY-MM-DD_HH-MM
+    ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    base_name = f"{scan_path.name}_{ts}"
+    snap_dir = trees_dir / base_name
+    # Handle same-minute duplicate
+    if snap_dir.exists():
+        for i in range(2, 100):
+            candidate = trees_dir / f"{base_name}_{i}"
+            if not candidate.exists():
+                snap_dir = candidate
+                base_name = snap_dir.name
+                break
+    ensure_dir(snap_dir)
+
+    out_path = snap_dir / f"{base_name}.txt"
+    header = [
+        f"# RaagDosa tree snapshot",
+        f"# Path:    {scan_path}",
+        f"# Date:    {dt.datetime.now().isoformat(timespec='seconds')}",
+        f"# Options: audio_only={audio_only} depth={depth}",
+        f"# Files:   {sum(1 for l in lines if not l.startswith('#') and l.strip() and not l.endswith('/'))}",
+        "",
+    ]
+    out_path.write_text("\n".join(header + lines), encoding="utf-8")
+    file_count = sum(1 for l in lines if not l.endswith("/") and l.strip())
+    folder_count = sum(1 for l in lines if l.endswith("/"))
+    ok_msg(f"Tree saved → {snap_dir.name}/")
+    out(f"  {file_count:,} files  |  {folder_count:,} folders  |  {out_path}")
+
+def _tree_walk(
+    root: Path,
+    base: Path,
+    lines: List[str],
+    audio_only: bool,
+    max_depth: Optional[int],
+    current_depth: int,
+) -> None:
+    if max_depth is not None and current_depth > max_depth:
+        return
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except PermissionError:
+        return
+    for entry in entries:
+        rel = str(entry.relative_to(base))
+        if entry.is_dir():
+            if entry.name in _SKIP_FOLDER_NAMES: continue
+            lines.append(rel + "/")
+            _tree_walk(entry, base, lines, audio_only, max_depth, current_depth + 1)
+        elif entry.is_file():
+            if entry.name.startswith("._"): continue
+            if entry.suffix.lower() in _SKIP_AUDIO_EXTENSIONS: continue
+            if audio_only and entry.suffix.lower() not in _AUDIO_EXTS_TREE: continue
+            lines.append(rel)
+
+def _cmd_tree_diff(trees_dir: Path, name_a: str, name_b: str) -> None:
+    """Show what appeared and disappeared between two tree snapshots."""
+    def _find_snap(name: str) -> Optional[Path]:
+        # Try as a subdirectory first (v4.2 format)
+        sd = trees_dir / name
+        if sd.is_dir():
+            txts = sorted(sd.glob("*.txt"))
+            if txts: return txts[0]
+        # Try exact .txt (legacy flat)
+        exact = trees_dir / name
+        if exact.exists(): return exact
+        exact_txt = trees_dir / f"{name}.txt"
+        if exact_txt.exists(): return exact_txt
+        # Search subdirs by partial name
+        for d in sorted(trees_dir.iterdir()):
+            if d.is_dir() and name.lower() in d.name.lower():
+                txts = sorted(d.glob("*.txt"))
+                if txts: return txts[0]
+        # Glob flat legacy
+        matches = sorted(trees_dir.glob(f"*{name}*.txt"))
+        return matches[0] if matches else None
+
+    pa = _find_snap(name_a); pb = _find_snap(name_b)
+    if not pa: err(f"Snapshot not found: {name_a}"); sys.exit(1)
+    if not pb: err(f"Snapshot not found: {name_b}"); sys.exit(1)
+
+    lines_a = set(pa.read_text(encoding="utf-8").splitlines()) - set()
+    lines_b = set(pb.read_text(encoding="utf-8").splitlines())
+    # Strip header lines
+    lines_a = {l for l in lines_a if not l.startswith("#") and l.strip()}
+    lines_b = {l for l in lines_b if not l.startswith("#") and l.strip()}
+
+    added = sorted(lines_b - lines_a)
+    removed = sorted(lines_a - lines_b)
+
+    out(f"\n{C.CYAN}Tree diff:{C.RESET} {pa.name} → {pb.name}")
+    out(f"  {C.GREEN}+{len(added)} added{C.RESET}   {C.RED}-{len(removed)} removed{C.RESET}\n")
+    for l in removed: out(f"{C.RED}− {l}{C.RESET}")
+    for l in added:   out(f"{C.GREEN}+ {l}{C.RESET}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v4.1 — catchall command
+# ═══════════════════════════════════════════════════════════════════
+
+_CATCHALL_FOLDER_NAMES = {
+    "_singles","_unsorted","_inbox","_dump","sort","still sort","unzip",
+    "staging","tempo","new music","macbook clean","dupes from tuneup",
+    "chroma download",
+}
+
+def _extract_catchall_artist(path: Path, cfg: Dict[str, Any]) -> str:
+    """
+    Extract artist from a loose audio file for catchall grouping.
+    Priority: albumartist tag → artist tag → filename parse → parent folder name.
+    """
+    if MutagenFile is not None:
+        try:
+            mf = MutagenFile(str(path), easy=True)
+            if mf and mf.tags:
+                t = mf.tags
+                for key in ["albumartist", "artist"]:
+                    v = t.get(key)
+                    if isinstance(v, list): v = v[0] if v else None
+                    if v: return str(v).strip()
+        except Exception:
+            pass
+    # Filename parse: "Artist - Title.mp3"
+    stem = path.stem.strip()
+    m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", stem)
+    if m:
+        candidate = m.group(1).strip()
+        if len(candidate) > 1 and not candidate.isdigit():
+            return smart_title_case(candidate)
+    # Fall back to parent folder
+    return path.parent.name or "_Unknown"
+
+def cmd_catchall(
+    cfg: Dict[str, Any],
+    path_str: str,
+    profile_name: str,
+    dry_run: bool = False,
+    genre_roots: Optional[List[str]] = None,
+) -> None:
+    """
+    Process a flat dump folder: group loose files by artist into subfolders.
+    Artists with ≥ group_threshold tracks get their own folder.
+    Artists with fewer tracks go into _Singles/.
+    Cross-references with Clean/ to propose merges for known artists.
+    """
+    cc = cfg.get("catchall", {})
+    group_threshold = int(cc.get("group_threshold", 3))
+    create_singles = bool(cc.get("create_singles_bucket", True))
+    cross_ref = bool(cc.get("cross_reference_clean", True))
+
+    # Auto-recognise catchall folder names
+    extra_names = [n.lower() for n in cc.get("folder_names", []) or []]
+    catchall_names = _CATCHALL_FOLDER_NAMES | set(extra_names)
+
+    scan_path = Path(path_str).expanduser().resolve()
+    if not scan_path.exists():
+        err(f"Path not found: {scan_path}")
+        sys.exit(1)
+
+    is_known_catchall = scan_path.name.lower() in catchall_names
+    out(f"\n{C.CYAN}Catchall:{C.RESET} {scan_path}" +
+        (f"  {C.DIM}(auto-recognised){C.RESET}" if is_known_catchall else ""))
+
+    exts = {e.lower() for e in cfg.get("scan", {}).get("audio_extensions", [".mp3", ".flac", ".m4a"])}
+
+    # Collect loose audio files (non-recursive — catchall is a flat dump)
+    audio_files: List[Path] = []
+    for f in scan_path.iterdir():
+        if f.is_file() and f.suffix.lower() in exts and not f.name.startswith("._"):
+            audio_files.append(f)
+
+    if not audio_files:
+        warn(f"No audio files found in {scan_path}")
+        return
+
+    out(f"  Found {len(audio_files)} audio files")
+
+    # Group by artist
+    by_artist: Dict[str, List[Path]] = {}
+    for af in audio_files:
+        artist = _extract_catchall_artist(af, cfg)
+        by_artist.setdefault(artist, []).append(af)
+
+    # Classify
+    group_artists = {a: fs for a, fs in by_artist.items() if len(fs) >= group_threshold}
+    singles_files = [f for a, fs in by_artist.items() if len(fs) < group_threshold for f in fs]
+
+    # Cross-reference with Clean/ for merge proposals
+    clean_root: Optional[Path] = None
+    if cross_ref and profile_name in cfg.get("profiles", {}):
+        prof = cfg["profiles"][profile_name]
+        source_root = Path(prof["source_root"]).expanduser()
+        clean_root = derive_clean_root(prof, source_root)
+
+    proposals: List[Dict[str, Any]] = []
+
+    # Build proposals for grouped artists
+    for artist, files in sorted(group_artists.items()):
+        dst = scan_path / sanitize_name(artist)
+        # Check if artist already exists in Clean/
+        merge_target: Optional[Path] = None
+        if clean_root and clean_root.exists():
+            for existing in clean_root.rglob("*"):
+                if existing.is_dir() and artists_are_same(existing.name, artist, cfg):
+                    merge_target = existing
+                    break
+        props = {
+            "type": "catchall_group",
+            "artist": artist,
+            "files": [str(f) for f in files],
+            "count": len(files),
+            "destination": str(dst),
+            "merge_target": str(merge_target) if merge_target else None,
+        }
+        proposals.append(props)
+        if merge_target:
+            out(f"  {C.YELLOW}[MERGE?]{C.RESET}  {artist} ({len(files)} tracks) → {C.DIM}{merge_target}{C.RESET}")
+        else:
+            out(f"  {C.GREEN}[GROUP ]{C.RESET}  {artist} ({len(files)} tracks) → {dst.name}/")
+
+    # Singles bucket
+    if singles_files:
+        singles_dst = scan_path / "_Singles"
+        out(f"  {C.DIM}[SINGLE ]{C.RESET}  {len(singles_files)} tracks → _Singles/")
+        proposals.append({
+            "type": "catchall_singles",
+            "files": [str(f) for f in singles_files],
+            "count": len(singles_files),
+            "destination": str(singles_dst),
+        })
+
+    # Album detection: tracks sharing an album tag → propose album folder
+    album_groups: Dict[str, List[Path]] = {}
+    for af in audio_files:
+        if MutagenFile:
+            try:
+                mf = MutagenFile(str(af), easy=True)
+                if mf and mf.tags:
+                    alb = mf.tags.get("album")
+                    if isinstance(alb, list): alb = alb[0] if alb else None
+                    if alb:
+                        album_groups.setdefault(str(alb).strip(), []).append(af)
+            except Exception:
+                pass
+    for alb_name, alb_files in album_groups.items():
+        if len(alb_files) >= 2:
+            out(f"  {C.BLUE}[ALBUM?]{C.RESET}  '{alb_name}' — {len(alb_files)} tracks share this album tag")
+
+    if dry_run:
+        out(f"\n  {C.DIM}--dry-run: no changes made. {len(proposals)} proposals generated.{C.RESET}")
+        return
+
+    # Apply moves
+    applied = 0
+    for prop in proposals:
+        dst_path = Path(prop["destination"])
+        for f_str in prop["files"]:
+            f = Path(f_str)
+            if not f.exists(): continue
+            try:
+                ensure_dir(dst_path)
+                tgt = dst_path / f.name
+                if tgt.exists():
+                    tgt = dst_path / (f.stem + "_" + uuid.uuid4().hex[:4] + f.suffix)
+                f.rename(tgt)
+                applied += 1
+            except Exception as e:
+                warn(f"Could not move {f.name}: {e}")
+
+    # Save proposals JSON
+    proposals_out = scan_path / "catchall_proposals.json"
+    write_json(proposals_out, {
+        "raagdosa_version": APP_VERSION,
+        "generated_at": now_iso(),
+        "source_folder": str(scan_path),
+        "proposals": proposals,
+    })
+    ok_msg(f"Applied {applied} moves  |  proposals saved: {proposals_out.name}")
+
+
 # ─────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────
@@ -3296,28 +4754,23 @@ def build_parser()->argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="raagdosa",description=f"RaagDosa v{APP_VERSION} — deterministic music library cleanup.",
         formatter_class=argparse.RawDescriptionHelpFormatter,epilog="""
 Examples:
-  raagdosa init                            # guided first-time setup
-  raagdosa doctor                          # verify config, deps, disk
-  raagdosa go --dry-run                    # preview — nothing moves
-  raagdosa go                              # scan + move folders + rename tracks
-  raagdosa go --since last_run             # only new folders since last run
-  raagdosa go --interactive                # confirm each folder
-  raagdosa show "/path/to/folder"          # debug a single folder
-  raagdosa show "/path/to/folder" --tracks # also show per-track renames
-  raagdosa status                          # library overview
-  raagdosa verify                          # audit Clean library health
-  raagdosa learn                           # suggest config improvements
-  raagdosa report --format html            # open last session report
-  raagdosa undo --session <id>             # undo a whole session
-  raagdosa orphans                         # find loose audio files
-  raagdosa artists --list                  # list all artists in Clean
-  raagdosa artists --find "portishead"     # fuzzy-find an artist
-  raagdosa review-list                     # see what's waiting in Review
-  raagdosa review-list --older-than 30     # Review folders >30 days old
-  raagdosa clean-report                    # stats on your Clean library
-  raagdosa extract "/path/to/mix" --by-artist   # split mix by artist
-  raagdosa compare --folder A B            # diff two folders
-  raagdosa diff last prev                  # compare last two sessions
+  raagdosa init                                 # guided first-time setup
+  raagdosa doctor                               # verify config, deps, disk
+  raagdosa go --dry-run                         # preview — nothing moves
+  raagdosa go                                   # scan + move + rename tracks
+  raagdosa go --genre-roots "B,House,Techno"   # protect genre root folders
+  raagdosa go --itunes                          # strip iTunes Genre/ layer first
+  raagdosa tree /Volumes/music/Incoming        # snapshot the directory tree
+  raagdosa tree --list                          # show all saved snapshots
+  raagdosa tree --diff snap_a snap_b            # what changed between snapshots
+  raagdosa catchall /path/to/_Dump             # group loose files by artist
+  raagdosa genre add "Bass"                    # declare a persistent genre root
+  raagdosa genre list                          # show all genre roots
+  raagdosa undo --session last                 # undo a whole session
+  raagdosa orphans                             # find loose audio files
+  raagdosa artists --list                      # list all artists in Clean
+  raagdosa review-list --older-than 30         # Review folders >30 days old
+  raagdosa clean-report                        # stats on your Clean library
 """)
     p.add_argument("--config",default="config.yaml"); p.add_argument("--version",action="version",version=f"raagdosa {APP_VERSION}")
     p.add_argument("--verbose",action="store_true"); p.add_argument("--quiet",action="store_true")
@@ -3331,10 +4784,18 @@ Examples:
     setp=psub.add_parser("set"); setp.add_argument("name"); setp.add_argument("--source"); setp.add_argument("--clean-mode"); setp.add_argument("--clean-folder"); setp.add_argument("--review-folder")
     psub.add_parser("delete").add_argument("name"); psub.add_parser("use").add_argument("name")
     sc=sub.add_parser("scan",help="Scan → proposals.json"); sc.add_argument("--profile"); sc.add_argument("--out"); sc.add_argument("--since")
+    sc.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
+    sc.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
     ap=sub.add_parser("apply",help="Apply proposals.json"); ap.add_argument("proposals",nargs="?"); ap.add_argument("--last-session",action="store_true"); ap.add_argument("--interactive",action="store_true"); ap.add_argument("--auto-above",type=float); ap.add_argument("--dry-run",action="store_true")
     for nc in ("run","go"):
-        c=sub.add_parser(nc,help="Scan + apply (folders + tracks)"); c.add_argument("--profile"); c.add_argument("--interactive",action="store_true"); c.add_argument("--dry-run",action="store_true"); c.add_argument("--since"); c.add_argument("--performance",choices=["slow","medium","fast","ultra"],default=None,metavar="TIER",help="Hardware tier: slow|medium|fast|ultra")
+        c=sub.add_parser(nc,help="Scan + apply (folders + tracks)")
+        c.add_argument("--profile"); c.add_argument("--interactive",action="store_true")
+        c.add_argument("--dry-run",action="store_true"); c.add_argument("--since")
+        c.add_argument("--performance",choices=["slow","medium","fast","ultra"],default=None,metavar="TIER",help="Hardware tier: slow|medium|fast|ultra")
+        c.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
+        c.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
     fo=sub.add_parser("folders",help="Folder pass only"); fo.add_argument("--profile"); fo.add_argument("--interactive",action="store_true"); fo.add_argument("--dry-run",action="store_true"); fo.add_argument("--since")
+    fo.add_argument("--genre-roots",metavar="ROOTS"); fo.add_argument("--itunes",action="store_true")
     tr=sub.add_parser("tracks",help="Track rename pass"); tr.add_argument("--profile"); tr.add_argument("--interactive",action="store_true"); tr.add_argument("--dry-run",action="store_true")
     sub.add_parser("status",help="Library overview").add_argument("--profile")
     rs=sub.add_parser("resume",help="Resume interrupted session"); rs.add_argument("session_id"); rs.add_argument("--interactive",action="store_true"); rs.add_argument("--dry-run",action="store_true")
@@ -3345,8 +4806,45 @@ Examples:
     sub.add_parser("doctor",help="Check config, deps, disk, DJ databases")
     hi=sub.add_parser("history",help="Show history"); hi.add_argument("--last",type=int,default=50); hi.add_argument("--session"); hi.add_argument("--match"); hi.add_argument("--tracks",action="store_true")
     un=sub.add_parser("undo",help="Undo moves or renames"); un.add_argument("--id"); un.add_argument("--session"); un.add_argument("--from-path"); un.add_argument("--tracks",action="store_true"); un.add_argument("--folder")
+    
+    # dump-tree command (legacy)
+    dt_p = sub.add_parser("dump-tree", help="Export raw folder/file tree to a text file")
+    dt_p.add_argument("--profile")
+    dt_p.add_argument("--out", required=True, help="Output text file path")
+    dt_p.add_argument("--include-clean", action="store_true")
+    dt_p.add_argument("--include-review", action="store_true")
+    dt_p.add_argument("--include-logs", action="store_true")
+    dt_p.add_argument("--folders-only", action="store_true")
+    dt_p.add_argument("--files-only", action="store_true")
+
+    # v4.1 — tree command
+    tr_p = sub.add_parser("tree", help="Snapshot a directory tree to logs/trees/")
+    tr_p.add_argument("path", nargs="?", help="Path to scan (omit with --list or --diff)")
+    tr_p.add_argument("--audio-only", action="store_true", help="Strip non-audio files from output")
+    tr_p.add_argument("--depth", type=int, default=None, metavar="N", help="Limit recursion depth")
+    tr_p.add_argument("--list", dest="list_mode", action="store_true", help="Show all saved snapshots")
+    tr_p.add_argument("--diff", nargs=2, metavar=("A", "B"), help="Diff two snapshots")
+
+    # v4.1 — catchall command
+    ca_p = sub.add_parser("catchall", help="Group loose files in a dump folder by artist")
+    ca_p.add_argument("path", help="Path to the flat dump folder")
+    ca_p.add_argument("--profile")
+    ca_p.add_argument("--dry-run", action="store_true")
+    ca_p.add_argument("--genre-roots", metavar="ROOTS")
+
+    # v4.1 — genre command
+    gn_p = sub.add_parser("genre", help="Manage persistent genre root declarations")
+    gn_sub = gn_p.add_subparsers(dest="genre_cmd", required=True)
+    gn_sub.add_parser("list", help="List all declared genre roots")
+    gn_add = gn_sub.add_parser("add", help="Declare a folder as a genre root")
+    gn_add.add_argument("name", help="Folder name to protect")
+    gn_rem = gn_sub.add_parser("remove", help="Remove a genre root declaration")
+    gn_rem.add_argument("name")
+    gn_sub.add_parser("clear", help="Remove all genre root declarations")
+    gn_show = gn_sub.add_parser("show", help="Check if a folder is a declared genre root")
+    gn_show.add_argument("name")
+
     # v3.5 commands
-    sub.add_parser("orphans",help="Find loose audio files in Clean/Review").add_argument("--profile")
     ar=sub.add_parser("artists",help="List or find artists in Clean library"); ar.add_argument("--profile")
     ar.add_argument("--list",dest="list_mode",action="store_true",help="List all artists")
     ar.add_argument("--find",dest="find_query",metavar="QUERY",help="Fuzzy-find an artist")
@@ -3360,7 +4858,13 @@ Examples:
     df=sub.add_parser("diff",help="Diff two session reports"); df.add_argument("session_a",metavar="SESSION_A"); df.add_argument("session_b",metavar="SESSION_B")
     ca=sub.add_parser("cache",help="Manage the tag cache (status/clear/evict)")
     ca.add_argument("action",nargs="?",default="status",choices=["status","clear","evict"])
+    sub.add_parser("orphans",help="Find loose audio files in Clean/Review").add_argument("--profile")
     return p
+
+def _parse_genre_roots_arg(roots_str: Optional[str]) -> Optional[List[str]]:
+    """Parse --genre-roots "A,B,C" into a list of stripped strings."""
+    if not roots_str: return None
+    return [r.strip() for r in roots_str.split(",") if r.strip()]
 
 def main()->None:
     parser=build_parser(); args=parser.parse_args()
@@ -3381,13 +4885,19 @@ def main()->None:
         elif pc=="set":   profile_set(cfg_path,cfg,args.name,args.source,args.clean_mode,args.clean_folder,args.review_folder)
         elif pc=="delete": profile_delete(cfg_path,cfg,args.name)
         elif pc=="use":   profile_use(cfg_path,cfg,args.name)
-    elif cmd=="scan":    cmd_scan(cfg_path,cfg,gp(),args.out,getattr(args,"since",None))
+    elif cmd=="scan":
+        gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
+        cmd_scan(cfg_path,cfg,gp(),args.out,getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
     elif cmd=="apply":
         pp=load_last_session(cfg) if args.last_session else (Path(args.proposals) if args.proposals else None)
         if not pp: err("Provide proposals.json or --last-session"); sys.exit(1)
         cmd_apply(cfg,pp,interactive=bool(args.interactive),auto_above=args.auto_above,dry_run=bool(args.dry_run))
-    elif cmd in("run","go"): cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None))
-    elif cmd=="folders":  cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None))
+    elif cmd in("run","go"):
+        gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
+        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
+    elif cmd=="folders":
+        gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
+        cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
     elif cmd=="tracks":   cmd_tracks_only(cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run))
     elif cmd=="status":   cmd_status(cfg,gp())
     elif cmd=="resume":   cmd_resume(cfg,args.session_id,interactive=bool(args.interactive),dry_run=bool(args.dry_run))
@@ -3398,6 +4908,30 @@ def main()->None:
     elif cmd=="doctor":   cmd_doctor(cfg_path,cfg)
     elif cmd=="history":  cmd_history(cfg,last=args.last,session=args.session,match=args.match,tracks=bool(args.tracks))
     elif cmd=="undo":     cmd_undo(cfg,action_id=args.id,session_id=args.session,from_path=args.from_path,tracks=bool(args.tracks),folder=args.folder)
+    elif cmd=="dump-tree":
+        cmd_dump_tree(
+            cfg,
+            gp(),
+            args.out,
+            include_clean=args.include_clean,
+            include_review=args.include_review,
+            include_logs=args.include_logs,
+            folders_only=args.folders_only,
+            files_only=args.files_only,
+        )
+
+    # v4.1 commands
+    elif cmd=="tree":
+        cmd_tree(cfg,path_str=getattr(args,"path","") or "",audio_only=bool(getattr(args,"audio_only",False)),
+                 depth=getattr(args,"depth",None),list_mode=bool(getattr(args,"list_mode",False)),
+                 diff_a=(getattr(args,"diff",None) or [None,None])[0],
+                 diff_b=(getattr(args,"diff",None) or [None,None])[1])
+    elif cmd=="catchall":
+        gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
+        cmd_catchall(cfg,args.path,getattr(args,"profile",None) or cfg.get("active_profile",""),
+                     dry_run=bool(getattr(args,"dry_run",False)),genre_roots=gr)
+    elif cmd=="genre":
+        cmd_genre(cfg_path,cfg,action=args.genre_cmd,name=getattr(args,"name",None))
     # v3.5 commands
     elif cmd=="orphans":      cmd_orphans(cfg,gp())
     elif cmd=="artists":      cmd_artists(cfg,gp(),list_mode=bool(getattr(args,"list_mode",False)),find_query=getattr(args,"find_query",None))

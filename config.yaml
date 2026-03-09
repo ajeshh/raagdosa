@@ -1,27 +1,48 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# RaagDosa v3.0 — Configuration
+# RaagDosa — Configuration
+# v5.5
 # ══════════════════════════════════════════════════════════════════════════════
-# Run `raagdosa init` to generate this file interactively.
-# Run `raagdosa doctor` to validate it.
+#
+# Run `raagdosa init` to set this file up interactively.
+# Run `raagdosa doctor` to validate it at any time.
+#
+# This file has two zones:
+#   ── SETTINGS ──  Things you configure once (paths, thresholds, toggles).
+#   ── BRAIN ──     Things that accumulate over time (aliases, known labels,
+#                   learned noise patterns). Written by `raagdosa learn`.
+#
+# Ready to split? When BRAIN grows large, move it to raagdosa-brain.yaml and
+# add: brain_file: raagdosa-brain.yaml — the split is clean at that point.
 # ──────────────────────────────────────────────────────────────────────────────
 
 app:
   name: RaagDosa
-  version: "3.5"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SETTINGS ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROFILES
 # Each profile is an independent source + destination configuration.
-# Switch between profiles with: raagdosa profile use <name>
+# Switch with: raagdosa profile use <name>
+# Add more with: raagdosa profile add bandcamp --source ~/Music/Bandcamp
 # ──────────────────────────────────────────────────────────────────────────────
 profiles:
   incoming:
-    # Where your messy music lives. Never modified by RaagDosa.
-    source_root: ~/Music/Incoming
+    # Where your unorganised music lives. RaagDosa never modifies this.
+    # Run `raagdosa init` to set this path interactively.
+    source_root: /Volumes/bass/Test
 
-    # clean_mode: inside_root  → Clean/ and Review/ are inside source_root
-    #             inside_parent → Clean/ and Review/ are siblings of source_root
+    # clean_mode: inside_root   → raagdosa/ sits inside source_root
+    #             inside_parent → raagdosa/ is a sibling of source_root
     clean_mode: inside_root
+
+    # v5.5 — All output lives under this wrapper folder.
+    # Structure: <source_root>/raagdosa/Clean/   …/Review/   …/logs/
+    # This keeps everything — organised music AND logs — co-located with the source,
+    # so on a separate drive the full volume path makes the location unambiguous.
+    wrapper_folder_name:           raagdosa
 
     clean_folder_name:         Clean
     review_folder_name:        Review
@@ -38,14 +59,12 @@ active_profile: incoming
 # How Clean/Albums/ is organised on disk.
 # ──────────────────────────────────────────────────────────────────────────────
 library:
-  # Folder template. Supported tokens: {artist}, {album}, {year}, {album_year}
-  # Presets:
-  #   "{artist}/{album}"              ← recommended (no genre trust required)
-  #   "{album}"                       ← flat — everything under Clean/Albums/
+  # Destination template. Tokens: {artist} {album} {year} {album_year}
+  #   "{artist}/{album}"    ← recommended safe default
+  #   "{album}"             ← flat — everything directly under Clean/Albums/
   template: "{artist}/{album}"
 
-  # FLAC masters get their own subfolder: artist/FLAC/album/
-  # Set true if you want physical separation of lossless masters from MP3 albums.
+  # true → all-FLAC folders go to Artist/FLAC/Album/ (archival masters separate)
   flac_segregation: false
 
   singles_folder:       _Singles
@@ -54,59 +73,13 @@ library:
   unknown_artist_label: _Unknown
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ARTIST NORMALISATION
-# Fuzzy logic for cleaning up artist name variants before using them as
-# folder names. All settings are hot-editable — re-run after changes.
+# CONFIDENCE ROUTING
 # ──────────────────────────────────────────────────────────────────────────────
-artist_normalization:
-  enabled: true
-
-  # "The" prefix policy:
-  #   keep-front   → The Beatles  (default — natural sort order)
-  #   move-to-end  → Beatles, The (library-style filing)
-  #   strip        → Beatles      (minimal — removes "The" entirely)
-  the_prefix: keep-front
-
-  # Normalise typographic hyphen variants (en-dash, em-dash) to ASCII hyphen.
-  # Keeps "Jay-Z" consistent regardless of how it was encoded in the tag.
-  normalize_hyphens: true
-
-  # Jaccard word-set threshold for fuzzy artist deduplication.
-  # 0.92 = "The XX" and "XX" are the same; "Jay-Z" and "Jay Z" are the same.
-  fuzzy_dedup_threshold: 0.92
-
-  # Unicode character map: applied before alias lookup.
-  # Use this for artists whose names contain non-ASCII characters that your
-  # filesystem or DJ software handles poorly.
-  # Example: Ø → O maps "MØ" → "MO" for folder naming.
-  # Leave empty to preserve original Unicode characters.
-  unicode_map: {}
-  #  "Ø": "O"
-  #  "ø": "o"
-  #  "æ": "ae"
-  #  "ß": "ss"
-
-  # Canonical alias map (case-insensitive key lookup).
-  # The key is any variant you've seen in your tags.
-  # The value is the canonical name to use as the folder name.
-  # This is the most powerful normalisation tool — add entries as you
-  # discover inconsistencies in your library.
-  aliases: {}
-  # Examples — uncomment and add your own:
-  #  "jay z":         "Jay-Z"
-  #  "jayz":          "Jay-Z"
-  #  "jay-z":         "Jay-Z"
-  #  "mos def":       "Yasiin Bey"
-  #  "p. diddy":      "Diddy"
-  #  "puff daddy":    "Diddy"
-  #  "biggie":        "The Notorious B.I.G."
-  #  "notorious big": "The Notorious B.I.G."
-  #  "mo":            "MØ"
-  #  "beatles":       "The Beatles"
+review_rules:
+  min_confidence_for_clean: 0.85
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SCAN
-# Controls which folders and files are considered candidates.
 # ──────────────────────────────────────────────────────────────────────────────
 scan:
   audio_extensions:
@@ -119,41 +92,43 @@ scan:
     - .opus
     - .wma
 
-  # Only process leaf folders (folders that contain no sub-folders).
-  # Recommended: true. Prevents double-processing nested structures.
   leaf_folders_only: true
-
-  # Minimum number of audio files to consider a folder a candidate.
-  # Folders below this threshold are skipped entirely.
   min_tracks: 3
-
-  # Skip a folder if more than this ratio of its files are unreadable by mutagen.
   max_unreadable_track_ratio: 0.25
-
-  # Follow symlinks when walking the source tree.
-  # false = safe default; prevents scanning outside the intended source.
   follow_symlinks: false
 
-  # ── Performance ───────────────────────────────────────────────────────
-  # Parallel workers for the scan pass. Tag reading (mutagen) is I/O-bound
-  # so threads give a real speedup. Rule of thumb: set to your drive count
-  # times 4 for SSD, or 2–4 for spinning disk.
-  # Set to 1 to disable parallelism (useful for debugging).
-  workers: 8
+  # Parallel workers for tag reading. 4 for SSD, 2 for spinning disk.
+  workers: 4
 
-  # Persistent tag cache. On warm runs (files unchanged since last scan),
-  # mutagen is skipped entirely — tags served from cache.
-  # Stored at logs/tag_cache.json. Manage with `raagdosa cache`.
   tag_cache_enabled: true
+  streaming_batch_size: 50
+
+  # v5.5 — Sidecar/DAW file extensions silently skipped during audio scan.
+  # These are non-audio files that may sit alongside music but should be ignored.
+  skip_sidecar_extensions:
+    - .sfk
+    - .asd
+    - .reapeaks
+    - .pkf
+    - .db
+    - .lrc
+
+  # v5.5 — System folder names always skipped during directory walk.
+  skip_system_folders:
+    - __MACOSX
+    - __macosx
 
 # ──────────────────────────────────────────────────────────────────────────────
-# INCREMENTAL SCANNING (--since)
-# RaagDosa tracks the timestamp of its last successful run in the manifest.
-# Use `raagdosa go --since last_run` to only process folders that have changed
-# since then. Any folder that has already been committed to Clean (tracked in
-# the manifest) is automatically excluded from all future scans regardless of
-# --since, so re-scanning is safe by design.
+# PERFORMANCE
 # ──────────────────────────────────────────────────────────────────────────────
+performance:
+  # tier: slow | medium | fast | ultra
+  # raagdosa doctor will recommend a tier for your hardware.
+  tier: medium
+  # Uncomment to override individual values:
+  # workers: 8
+  # streaming_lookahead: 8
+  # sleep_between_moves_ms: 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # IGNORE
@@ -161,78 +136,42 @@ scan:
 ignore:
   ignore_single_file_folders: true
   min_audio_files_for_candidate: 4
-  # Folder names (exact match) to skip entirely during scanning.
   ignore_folder_names:
+    - Clean
+    - Review
     - Singles
     - One-Offs
     - Dump
     - _dump
     - Unsorted
-    - Clean
-    - Review
+    - raagdosa    # v5.5 — ignore the wrapper folder during source scanning
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TAG KEYS
-# Mutagen tag key names. The first key in each list that is present wins.
-# Extend these lists if you encounter non-standard tag formats.
+# Mutagen key names tried in order. First match wins.
 # ──────────────────────────────────────────────────────────────────────────────
 tags:
-  album_keys:
-    - album
-  albumartist_keys:
-    - albumartist
-    - album_artist
-    - album artist
-    - TPE2
-  artist_keys:
-    - artist
-    - TPE1
-  title_keys:
-    - title
-    - TIT2
-  tracknumber_keys:
-    - tracknumber
-    - track
-    - TRCK
-  discnumber_keys:
-    - discnumber
-    - disc
-    - TPOS
-  # Year keys tried in preference order. originaldate is preferred to
-  # capture the original release year rather than a remaster date.
-  year_keys_prefer:
-    - originaldate
-    - original_date
-    - date
-    - year
-    - TDRC
-    - TYER
-  bpm_keys:
-    - bpm
-    - tbpm
-    - TBPM
-  key_keys:
-    - initialkey
-    - key
-    - tkey
-    - TKEY
+  album_keys:       [album]
+  albumartist_keys: [albumartist, album_artist, "album artist", TPE2]
+  artist_keys:      [artist, TPE1]
+  title_keys:       [title, TIT2]
+  tracknumber_keys: [tracknumber, track, TRCK]
+  discnumber_keys:  [discnumber, disc, TPOS]
+  # originaldate preferred — captures original release year, not remaster date
+  year_keys_prefer: [originaldate, original_date, date, year, TDRC, TYER]
+  bpm_keys:         [bpm, tbpm, TBPM]
+  key_keys:         [initialkey, key, tkey, TKEY]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NORMALISE (voting pre-processing)
-# Applied to tag values before dominant-value voting. These settings affect
-# which value "wins" — not how the final folder name looks.
+# VOTING NORMALISATION
+# Applied before plurality voting. Affects which value "wins" — not final display.
 # ──────────────────────────────────────────────────────────────────────────────
 normalize:
   lower_case: true
   strip_whitespace: true
   collapse_whitespace: true
-  # Strip (parenthetical) and [bracket] content before voting.
-  # e.g. "Settle [Deluxe]" and "Settle" vote as the same album.
   strip_bracketed_phrases_for_voting: true
-  # Strip punctuation before voting (e.g. colons, slashes).
   strip_punctuation_for_voting: true
-  # Suffixes stripped from the normalised value before voting.
-  # Add any patterns you see repeating in your Review folders.
   strip_common_suffixes_for_voting:
     - deluxe edition
     - deluxe
@@ -243,178 +182,120 @@ normalize:
     - anniversary edition
     - bonus tracks
     - explicit
-    - explicit version
-    - clean version
-    - special edition
-    - collector's edition
-    - limited edition
-    - super deluxe
-    - complete edition
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FUZZY MATCHING
-# ──────────────────────────────────────────────────────────────────────────────
-fuzzy:
-  enabled: true
-  # Similarity threshold for matching folder name vs. album tag during heuristic parsing.
-  similarity_threshold: 0.88
-  # Below this threshold, a filename-derived artist vs. tag artist mismatch
-  # triggers a warning (not a block).
-  prompt_threshold: 0.75
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DECISION ENGINE
-# ──────────────────────────────────────────────────────────────────────────────
-decision:
-  # Minimum share of tracks that must agree on the album value to classify as album.
-  album_dominance_threshold: 0.75
-  albumartist_dominance_threshold: 0.60
-
-  # Fall back to track-level artist tag when albumartist is absent.
-  allow_artist_fallback: true
-
-  # Require interactive confirmation before applying any move.
-  require_confirmation: true
-
-  # Auto-approve moves above this confidence without prompting.
-  auto_approve_above: 0.92
-
-  # Below this confidence, always prompt even if require_confirmation is false.
-  interactive_below: 0.92
-
-# ──────────────────────────────────────────────────────────────────────────────
-# VARIOUS ARTISTS
+# VARIOUS ARTISTS DETECTION
 # ──────────────────────────────────────────────────────────────────────────────
 various_artists:
-  label: VA
+  # VA when: unique_artists / total_tracks >= this value.
+  unique_artist_ratio_above: 0.50
+  enable_heuristics: true
+  label: "VA"
   albumartist_matches:
     - various artists
     - various
     - va
     - v/a
     - v.a.
-  enable_heuristics: true
-  # If unique track artists / total tracks exceeds this, classify as VA.
-  unique_artist_ratio_above: 0.50
+    - varios artistas
+    - varios
+    - artistes variés
+    - aa.vv.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # YEAR
 # ──────────────────────────────────────────────────────────────────────────────
 year:
   enabled: true
+  require_presence_ratio: 0.50
+  agreement_threshold: 0.70
   allowed_range:
     min: 1900
-    max: 2030
-  # Minimum ratio of tracks that must have a year tag for year to be included.
-  require_presence_ratio: 0.50
-  # Minimum agreement ratio for the dominant year value.
-  agreement_threshold: 0.70
+    max: 2099
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FOLDER NAME FORMAT
-# Final folder name templates. {albumartist} is the normalized artist name.
+# ARTIST NORMALISATION
+# ──────────────────────────────────────────────────────────────────────────────
+artist_normalization:
+  enabled: true
+
+  # keep-front → The Beatles  |  move-to-end → Beatles, The  |  strip → Beatles
+  the_prefix: keep-front
+
+  normalize_hyphens: true
+  fuzzy_dedup_threshold: 0.92
+
+  # Unicode char map (e.g. Ø → O). Leave empty to preserve original characters.
+  unicode_map: {}
+
+  # Alias overrides live in the BRAIN section below.
+  aliases: {}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TITLE CASE  (v4.3)
+# Capitalisation fixes for album names, track titles, and folder names.
+# ──────────────────────────────────────────────────────────────────────────────
+title_case:
+  # Apply Smart Title Case to all-lowercase folder names.
+  # Confirmed pattern: ~10% of real-library folders are all-lowercase (slug origin).
+  # Disable if you prefer to leave casing exactly as-is.
+  auto_titlecase_lowercase_folders: true
+
+  # Words never capitalised (unless first word).
+  never_cap:
+    - "feat."
+    - "vs."
+    - "b/w"
+
+  # Words always capitalised in a specific form.
+  always_cap:
+    - "DJ"
+    - "MC"
+    - "UK"
+    - "US"
+    - "NY"
+    - "LA"
+    - "EP"
+    - "LP"
+    - "II"
+    - "III"
+    - "IV"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FORMAT
 # ──────────────────────────────────────────────────────────────────────────────
 format:
-  pattern_no_year:    "{albumartist} - {album}"
-  pattern_with_year:  "{albumartist} - {album} ({year})"
+  label_eps: true
+  pattern_with_year: "{albumartist} - {album} ({year})"
+  pattern_no_year:   "{albumartist} - {album}"
   replace_illegal_chars_with: " - "
-  trim_trailing_dots_spaces: true
 
 format_suffix:
-  # Append [FLAC], [AIFF] etc. to folder name when all files are the same
-  # non-MP3 format. Useful for distinguishing FLAC rips alongside MP3 copies.
   enabled: true
   only_if_all_same_extension: true
-  ignore_extension: .mp3   # MP3 is the default; no suffix added
-  style: brackets_upper    # brackets_upper → [FLAC] | brackets_lower → [flac]
+  ignore_extension: ".mp3"
+  style: brackets_upper
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROUTING
+# EP DETECTION
 # ──────────────────────────────────────────────────────────────────────────────
-review_rules:
-  # Confidence below this → Review/Albums/
-  min_confidence_for_clean: 0.85
-
-  # Duplicate within the same scan run → Review/Duplicates/
-  route_duplicates: true
-
-  # Already exists in Clean (manifest or disk scan) → Review/Duplicates/
-  route_cross_run_duplicates: true
-
-  # Low-confidence → Review/Albums/
-  route_questionable_to_review: true
-
-  # Tag-less folders that relied on folder name heuristic → Review/Albums/
-  route_heuristic_to_review: true
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MOVE
-# ──────────────────────────────────────────────────────────────────────────────
-move:
+ep_detection:
   enabled: true
-
-  # What to do when a folder with the proposed name already exists at the destination.
-  # suffix → append " (1)", " (2)" etc.
-  # skip   → leave source untouched and log as skipped
-  on_collision: suffix
-  suffix_format: " ({n})"
-
-  # MD5 checksum each file after copy before deleting source.
-  # Slower but byte-verified. Recommended for archival libraries.
-  use_checksum: false
+  # Minimum 2 tracks — a 2-track release labelled "EP" is still an EP.
+  min_tracks: 2
+  max_tracks: 6
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DJ SAFETY
+# MIX / CHART DETECTION
 # ──────────────────────────────────────────────────────────────────────────────
-dj_safety:
-  # Scan source folders for Rekordbox / Serato database files.
-  detect_dj_databases: true
-
-  # Print a warning when DJ databases are detected in a folder being processed.
-  # Moving/renaming files will break Rekordbox/Serato analysis data.
-  warn_on_dj_databases: true
-
-  # Skip folders that contain DJ databases entirely.
-  # false = warn and proceed (recommended: rebuild analysis after library overhaul)
-  # true  = stop and skip (safe if you want to protect existing analysis)
-  halt_on_dj_databases: false
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TRACK RENAME
-# Runs on Clean/Albums/ folders after they have been moved.
-# ──────────────────────────────────────────────────────────────────────────────
-track_rename:
+mix_detection:
   enabled: true
-  scope: clean_only   # clean_only | both
-
-  allowed_extensions:
-    - .mp3
-    - .flac
-    - .m4a
-  # Extensions that are present in a folder but should never be renamed.
-  skip_extensions:
-    - .wav
-    - .aiff
-
-  patterns:
-    # Standard album: "01 - Title.mp3"
-    album:   "{disc_prefix}{track:02d} - {title}{mix_suffix}{ext}"
-    # Various Artists: "01 - Artist - Title.mp3"
-    various: "{disc_prefix}{track:02d} - {artist} - {title}{mix_suffix}{ext}"
-    # Mixed/unclear: "Artist - Title.mp3"
-    mixed:   "{artist} - {title}{mix_suffix}{ext}"
-
-  disc:
-    enabled: true
-    only_if_multi_disc: true
-    format: "{disc}-"   # produces "1-01 - Title.mp3"
-
-  track_numbers:
-    required_for_album:    true
-    required_for_various:  true
-    pad_width: 2
-    # Derive track number from filename position when tag is missing.
-    fallback_to_filename_order: false
+  folder_name_keywords:
+    - "compiled by"
+    - "mixed by"
+    - "essentials"
+    - "selections"
+  unique_artist_ratio_mix: 0.65
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ARTIST FEATURE HANDLING
@@ -423,12 +304,10 @@ artists:
   feature_handling:
     enabled: true
     style: keep_in_artist    # keep_in_artist | move_to_title | strip
-    # Normalise "ft." / "featuring" / "feat" → "feat." in artist + title tags.
-    normalize_tokens: true
+    normalize_tokens: true   # ft. / featuring / feat → feat.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MIX / VERSION SUFFIX
-# Detects and preserves "(Original Mix)", "(Club Edit)" etc. in track names.
 # ──────────────────────────────────────────────────────────────────────────────
 mix_info:
   enabled: true
@@ -452,23 +331,15 @@ mix_info:
     - re-edit
     - re-rub
     - reprise
-  style: parenthetical   # parenthetical → (Original Mix) | dash → - Original Mix
+  style: parenthetical   # parenthetical → (Original Mix)  |  dash → - Original Mix
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TITLE CLEANUP
-# Applied to track title tags before constructing the filename.
 # ──────────────────────────────────────────────────────────────────────────────
 title_cleanup:
   enabled: true
-
-  # Strip domain names appended to titles ("Track Name - freedownload.com")
   strip_trailing_domains: true
-
-  # Strip social handles ("Track Name - @producer")
   strip_trailing_handles: true
-
-  # Trailing phrases (trailing-match, case-insensitive).
-  # These are stripped whether they appear in parentheses or after a dash.
   strip_trailing_phrases:
     - official video
     - official music video
@@ -487,8 +358,6 @@ title_cleanup:
     - encoded by
     - rip
     - webrip
-    - dvdrip
-    - cdrip
     - 320kbps
     - 320 kbps
     - v0
@@ -505,17 +374,9 @@ title_cleanup:
     - prod. by
     - prod by
     - produced by
-    - production by
-    - clip
-    - teaser
-    - preview
-    - snippet
-    - exclusive
     - free dl
     - direct download
 
-  # Parenthetical content containing these words is KEPT even if the phrase
-  # appears in strip_trailing_phrases above. Protects mix/version labels.
   keep_parenthetical_if_contains:
     - live
     - remaster
@@ -543,24 +404,44 @@ title_cleanup:
     trim_dots_spaces: true
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# All paths are relative to the directory where you run raagdosa.
+# GARBAGE NAMING
 # ──────────────────────────────────────────────────────────────────────────────
-logging:
-  root_dir:            logs
-  session_dir:         logs/sessions
-  history_log:         logs/history.jsonl
-  skipped_log:         logs/skipped.jsonl
-  track_history_log:   logs/track-history.jsonl
-  track_skipped_log:   logs/track-skipped.jsonl
+garbage_naming:
+  strip_bracket_stack: true
+  token_flood_threshold: 5
+  strip_display_noise: true
+  strip_disc_indicators: true
+  streaming_batch_size: 1
 
-  # Write human-readable report.txt, report.csv, report.html after each scan.
-  write_human_report: true
-  report_filename:    report.txt
+# ──────────────────────────────────────────────────────────────────────────────
+# ARTIFACTS (non-audio files found alongside tracks)
+# ──────────────────────────────────────────────────────────────────────────────
+artifacts:
+  enabled: true
+  keep_extensions:     [.jpg, .jpeg, .pdf]
+  smart_extensions:    [.png]
+  smart_png_min_dimension: 800
+  quarantine_extensions: [.nfo, .sfv, .txt, .url, .log, .m3u, .m3u8]
+  quarantine_unknown:  true
+  quarantine_folder:   Review/Artifacts
 
-  # Archive the history log when it exceeds this size.
-  rotate_log_max_mb: 10.0
-
+# ──────────────────────────────────────────────────────────────────────────────
+# DJ SAFETY
+# ──────────────────────────────────────────────────────────────────────────────
+dj_safety:
+  detect_dj_databases:  true
+  warn_on_dj_databases: true
+  halt_on_dj_databases: false
+  # v5.5 — configurable list of patterns to detect DJ library databases.
+  # RaagDosa warns (or halts) if any of these are found under source_root.
+  database_patterns:
+    - export.pdb
+    - database2
+    - rekordbox.xml
+    - _Serato_
+    - Serato Scratch
+    - Serato DJ
+    - PIONEER
 # ──────────────────────────────────────────────────────────────────────────────
 # UNDO
 # ──────────────────────────────────────────────────────────────────────────────
@@ -568,159 +449,71 @@ undo:
   allow_undo_by_id:            true
   allow_undo_by_original_path: true
   allow_undo_by_session:       true
+  # v5.5 — undo all moves for a specific source folder by name.
+  # Works for both folder-level (raagdosa undo --folder "My Album") and
+  # track-level (raagdosa undo --tracks --folder "My Album").
+  allow_undo_by_folder:        true
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EP DETECTION  (v3.5)
-# Folders with track count in [min_tracks, max_tracks] are classified as EPs.
-# EPs stay in Clean/Albums/ but get a [EP] label in the folder name (if format.label_eps is true).
-# ──────────────────────────────────────────────────────────────────────────────
-ep_detection:
-  enabled:    true
-  min_tracks: 3
-  max_tracks: 6
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MIX / CHART DETECTION  (v3.5)
-# Folders that match mix-related keywords OR have a high unique-artist ratio
-# get routed to Clean/_Mixes/ instead of Clean/Albums/.
-# ──────────────────────────────────────────────────────────────────────────────
-mix_detection:
-  enabled: true
-
-  # Folder name keywords that trigger mix classification (case-insensitive, word-boundary).
-  # These supplement the built-in patterns like "mixtape", "presents", "sessions", etc.
-  folder_name_keywords:
-    - "compiled by"
-    - "mixed by"
-    - "essentials"
-    - "selections"
-
-  # If the ratio of unique artists to total tracks exceeds this, classify as mix.
-  # 0.65 = more than 65% of tracks have distinct artists → likely a mix.
-  unique_artist_ratio_mix: 0.65
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TITLE CASE  (v3.5)
-# Controls intelligent capitalisation fixes applied to album names and titles.
-# Only fires when the input is ALL-CAPS or all-lowercase.
-# ──────────────────────────────────────────────────────────────────────────────
-title_case:
-  # Words that should never be capitalised (unless first word in the string).
-  # These are added to the built-in small-word list (a, an, the, and, but, or…).
-  never_cap:
-    - "feat."
-    - "vs."
-    - "b/w"
-
-  # Words that should always be in a specific case.
-  # Add DJ, MC, UK, etc. — the code will uppercase these when length ≤ 3.
-  always_cap:
-    - "DJ"
-    - "MC"
-    - "UK"
-    - "US"
-    - "NY"
-    - "LA"
-    - "EP"
-    - "LP"
-    - "II"
-    - "III"
-    - "IV"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FORMAT LABELLING  (v3.5 additions)
-# ──────────────────────────────────────────────────────────────────────────────
-format:
-  # Append "[EP]" to the proposed folder name when a folder is detected as an EP.
-  label_eps: true
-
-# ──────────────────────────────────────────────────────────────────────────────
-# GARBAGE NAMING  (v3.5)
-# Controls how aggressively bracket stacks and noise tokens are removed from
-# album/folder names during proposal building.
-# ──────────────────────────────────────────────────────────────────────────────
-garbage_naming:
-  # Strip trailing noise/promo/format bracket groups from album names.
-  strip_bracket_stack: true
-
-  # Token flood threshold: flag names with this many parenthetical groups or more.
-  token_flood_threshold: 5
-
-  # Strip display-upload noise like "(Official Audio)", "[HD]", "(Lyrics)" from
-  # album and track titles.
-  strip_display_noise: true
-
-  # Strip disc/volume indicators from album names before voting.
-  # E.g. "Mezzanine - Disc 1" → "Mezzanine" for normalised comparison.
-  strip_disc_indicators: true
-
-  # Streaming batch size: how many folders to scan before starting to apply.
-  # Smaller = first moves appear sooner. Larger = fewer apply interruptions.
-  # 50 is a good default. Use 1 for maximum responsiveness (every folder
-  # is moved as soon as it is scanned). Use 0 or omit to disable streaming
-  # (scan-all-then-apply, legacy behaviour).
-  streaming_batch_size: 50
-
-# ──────────────────────────────────────────────────────────────────────────────
-# PERFORMANCE TIERS
-# Controls workers, lookahead buffer, and courtesy sleep between copy-path moves.
-# Tier sets all values; individual overrides take precedence.
+# LOGGING
+# v5.5 — All log paths are now resolved RELATIVE TO the raagdosa wrapper folder,
+# not relative to your shell CWD.  So on a separate drive the logs live at:
+#   /Volumes/bass/Test/raagdosa/logs/
+# making it unambiguous which source they belong to.
 #
-#   slow   — 2017 Intel MBP, old MacBook Air, 8 GB RAM: workers=1, no parallel
-#   medium — 2019–2021 Intel MBP, 16 GB RAM:            workers=2
-#   fast   — 2021+ M1/M2, 16 GB RAM:                    workers=4
-#   ultra  — 2023+ M3/M4, 32 GB+ RAM, NVMe:             workers=8
+# The values below are the folder/file names inside the logs/ directory.
+# You rarely need to change these.
+# ──────────────────────────────────────────────────────────────────────────────
+logging:
+  root_dir:           logs
+  session_dir:        logs/sessions
+  history_log:        logs/history.jsonl
+  skipped_log:        logs/skipped.jsonl
+  track_history_log:  logs/track-history.jsonl
+  track_skipped_log:  logs/track-skipped.jsonl
+  write_human_report: true
+  report_filename:    report.txt
+  rotate_log_max_mb:  10.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── BRAIN ─────────────────────────────────────────────────────────────────────
+# This section accumulates intelligence as you use RaagDosa.
+# `raagdosa learn` writes here. You can also edit it by hand.
 #
-# Override per-run: raagdosa go --performance fast
-# ──────────────────────────────────────────────────────────────────────────────
-performance:
-  tier: medium              # slow | medium | fast | ultra
-  # Optional per-key overrides (comment out to use tier defaults):
-  # workers: 2
-  # streaming_lookahead: 4
-  # sleep_between_moves_ms: 10
+# When this section grows large enough to feel unwieldy, move it to a
+# separate file: raagdosa-brain.yaml — the split is clean at this boundary.
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DUPLICATE RESOLUTION
-# When a proposed folder name matches an existing Clean folder, compare contents
-# before routing blindly to Duplicates.
-# ──────────────────────────────────────────────────────────────────────────────
-duplicates:
-  compare_before_routing: true    # enable intelligent comparison
-  merge_missing_tracks: true      # auto-copy missing tracks into existing folder
-                                  # and re-run track rename on the merged folder
-  flac_mp3_coexistence: keep_both # keep_both | prefer_flac | prefer_mp3
-                                  # keep_both + flac_segregation=true → FLAC goes
-                                  # to Artist/FLAC/Album/ automatically
-  size_match_tolerance: 0.01      # 1% — tracks "same size" within this ratio
-  title_match_threshold: 0.90     # fuzzy title similarity required to count as match
+brain:
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ARTIFACT HANDLING
-# Non-audio files found in album source folders.
-# ──────────────────────────────────────────────────────────────────────────────
-artifacts:
-  enabled: true
+  # Artist alias map. Key = any variant seen in tags (case-insensitive).
+  # Value = the canonical folder name to use.
+  artist_aliases: {}
+  # Examples:
+  #   "jay z":             "Jay-Z"
+  #   "jayz":              "Jay-Z"
+  #   "mos def":           "Yasiin Bey"
+  #   "p. diddy":          "Diddy"
+  #   "notorious big":     "The Notorious B.I.G."
+  #   "flying lotus":      "Flying Lotus"
 
-  # These extensions travel with the album into Clean/
-  keep_extensions:
-    - .jpg
-    - .jpeg
-    - .pdf
-    - .cue              # cue sheets are kept only if paired with .flac/.ape/.wav
+  # Record labels that commonly appear in albumartist tags.
+  # When detected, RaagDosa re-derives the artist from track-level tags instead.
+  # Pattern confirmed in 3.7% of folders (e.g. label-organised download folders).
+  known_labels: []
+  # Examples:
+  #   - "Tropical Twista Records"
+  #   - "Fértil Discos"
+  #   - "Dualism Records"
+  #   - "Lump Records"
 
-  # These are moved to Review/Artifacts/<folder_name>/ before the album moves
-  quarantine_extensions:
-    - .png              # always quarantine (policy: let go of all PNGs)
-    - .nfo
-    - .sfv
-    - .txt
-    - .url
-    - .log
-    - .m3u
-    - .m3u8
+  # Folder name prefixes that always signal VA / compilation content.
+  # Checked before tag-based VA detection.
+  va_rescue_prefixes: []
+  # Examples:
+  #   - "Beatport"
+  #   - "Traxsource"
 
-  quarantine_folder: Review/Artifacts
-
-  # Files with unrecognised extensions → quarantine (conservative default)
-  quarantine_unknown: true
+  # Learned noise patterns — added by `raagdosa learn --extract`.
+  # Format: {pattern: "regex string", replace: "", description: "why"}
+  noise_patterns: []

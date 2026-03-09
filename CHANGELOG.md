@@ -5,236 +5,291 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
----
-
-## [3.81.0] — 2026-03-08
+## [5.5.0] — 2026-03-08
 
 ### Release summary
 
-v3.81 rewires how RaagDosa processes music: true per-album streaming (scan one → move it → next), intelligent duplicate resolution with track merging, hardware speed tiers so it plays nicely on any machine, and a proper artifact policy that keeps cover art and liner notes while quarantining junk files.
+v5.5 is the structural housekeeping release. All output now lives under a single
+`raagdosa/` wrapper folder co-located with your source music. Logs are resolved
+relative to that wrapper, not your shell's working directory — so on a separate
+drive the full volume path makes every log file unambiguous. A config-schema
+mismatch causing `track_history_log` / `track_skipped_log` KeyErrors is fixed.
+EP detection minimum is confirmed at 2 tracks. Previously hardcoded values
+(DJ database patterns, sidecar file extensions, system folder skip-list) are
+now first-class config keys so you can override them without touching the script.
 
 ---
 
-### True per-album streaming pipeline
+### New — raagdosa wrapper folder (`wrapper_folder_name`)
 
-The previous pipeline batched folders in groups of 50 before applying. v3.81 processes one album at a time — scan, route, quarantine artifacts, move, rename tracks — before starting the next. First album moves within seconds of starting on any library size.
+All output folders now nest under a single wrapper rather than sitting directly
+inside `source_root`:
 
-- Background scanner thread pre-reads tags `lookahead` folders ahead (controlled by performance tier)
-- Main thread processes each proposal completely: route → artifact quarantine → move → track rename → duplicate resolution → next
-- Per-album progress counter: `[42/833]  MOVED ✦ clean  Portishead - Dummy (1994)  conf=0.95  0.4ms`
-- Within-run duplicate tracking maintained correctly across individual proposals
-- `scan.streaming_batch_size` repurposed as `performance.streaming_lookahead` (tier-controlled)
+```
+Before (v5.0):
+  /Volumes/bass/Test/
+    Clean/Albums/
+    Clean/Tracks/
+    Review/Albums/
+    Review/Duplicates/
 
-### Intelligent duplicate resolution
-
-When a proposed folder name matches an existing Clean folder, RaagDosa now compares contents before routing.
-
-Four outcomes:
-
-- **`missing_tracks`** — incoming has tracks not present in existing. Missing files are copied into the existing Clean folder and track rename re-runs on the merged result. Source goes to `Review/Duplicates/` as `[merged_N_tracks]`.
-- **`format_upgrade`** — incoming is FLAC, existing is MP3. With `flac_segregation: true`, FLAC goes to `Artist/FLAC/Album/` automatically. Otherwise routed to Review with reason `format_upgrade`.
-- **`lower_quality_mp3`** — incoming is MP3, existing has FLAC. Routed to Review, never downgrades existing quality.
-- **`exact_duplicate`** / **`partial_overlap`** — full match or partial, routed to Duplicates with detailed reason.
-
-Track matching uses fuzzy title similarity (configurable threshold, default 0.90) with leading track-number stripping.
-
-```yaml
-duplicates:
-  compare_before_routing: true
-  merge_missing_tracks: true
-  flac_mp3_coexistence: keep_both   # keep_both | prefer_flac | prefer_mp3
-  title_match_threshold: 0.90
-  size_match_tolerance: 0.01
+After (v5.5):
+  /Volumes/bass/Test/
+    raagdosa/
+      Clean/Albums/
+      Clean/Tracks/
+      Review/Albums/
+      Review/Duplicates/
+      logs/
+        history.jsonl
+        skipped.jsonl
+        track-history.jsonl
+        track-skipped.jsonl
+        sessions/
+          2026-03-08_14-30_incoming_test/
+            proposals.json
+            report.txt / .csv / .html
 ```
 
-### Hardware performance tiers
+Config key: `profiles.<n>.wrapper_folder_name` (default: `raagdosa`).
+Rename it to anything you want. The wrapper folder is automatically excluded
+from scanning so its contents are never processed as source music.
 
-Four tiers replace the raw `scan.workers` knob. Pick the one that matches your machine; RaagDosa sets workers, lookahead buffer, and copy-path sleep automatically.
+### New — Logs co-located with source via `setup_logging_paths()`
 
-| Tier | Who | Workers | Lookahead | Copy sleep |
-|------|-----|---------|-----------|------------|
-| `slow` | 2017 Intel MBP, 8 GB RAM, old MacBook Air | 1 | 1 | 50ms |
-| `medium` | 2019–2021 Intel MBP, 16 GB RAM | 2 | 4 | 10ms |
-| `fast` | 2021+ M1/M2, 16 GB | 4 | 8 | 0ms |
-| `ultra` | 2023+ M3/M4, 32 GB+ NVMe | 8 | 16 | 0ms |
+All logging paths are now resolved **relative to the wrapper folder**, not
+relative to the shell's current working directory. A new `setup_logging_paths()`
+function is called at the start of every command that has profile context. It
+mutates `cfg["logging"]` in-place with absolute paths so all downstream code
+works unchanged.
 
-- `sleep_between_moves_ms` applied **only on copy-path moves** (cross-device). Same-filesystem renames are ~1ms and never throttled.
-- Per-run override: `raagdosa go --performance slow`
-- `raagdosa doctor` shows detected hardware and recommended tier
-- Individual overrides (`workers`, `streaming_lookahead`, `sleep_between_moves_ms`) take precedence over tier
+On a drive with a long path (`/Volumes/bass/Test/raagdosa/logs/`), the location
+is unambiguous — you always know which source the logs belong to.
 
-```yaml
-performance:
-  tier: medium   # slow | medium | fast | ultra
+The config `logging.*` keys still control the folder and file **names** inside
+the logs directory. You rarely need to change them.
+
+### Fix — Config schema mismatch: `track_history_log` / `track_skipped_log`
+
+`rename_tracks_in_clean_folder()` accessed `cfg["logging"]["track_history_log"]`
+and `cfg["logging"]["track_skipped_log"]` directly. These keys were missing from
+some `config.yaml` files generated before v4.3, causing a `KeyError` at runtime.
+
+Both keys are now guaranteed present after `setup_logging_paths()` resolves them.
+They are also included in the `init`-generated config template and the
+`config.yaml` reference.
+
+### Fixed — EP minimum tracks: confirmed 2
+
+`ep_detection.min_tracks` is confirmed at `2`. A 2-track release labelled "EP"
+in its folder name or tags is correctly classified as an EP and routed to
+`Clean/` at normal confidence. Previously the config said 2 but the code
+defaulted to 3 in some paths — now consistent everywhere.
+
+### New — Hardcoded values moved to config
+
+Three previously hardcoded Python sets are now first-class `config.yaml` keys:
+
+- `scan.skip_sidecar_extensions` — files silently skipped during audio scan
+  (`.sfk`, `.asd`, `.reapeaks`, `.pkf`, `.db`, `.lrc`). Add your own extensions.
+- `scan.skip_system_folders` — directory names always skipped during walk
+  (`__MACOSX`). Add any folder names you want globally excluded.
+- `dj_safety.database_patterns` — patterns used to detect DJ library databases
+  (`rekordbox.xml`, `_Serato_`, etc.). Add your own if needed.
+
+The Python defaults are preserved as fallbacks so existing configs that don't
+have these keys continue to work without change.
+
+### Improved — Undo by folder (`--folder` flag)
+
+`raagdosa undo --folder <name>` now works for **both** folder-level and
+track-level undo (previously only track-level supported `--folder`):
+
+```
+# Undo all folder moves where source path contains "Burial - Untold"
+raagdosa undo --folder "Burial - Untold"
+
+# Undo all track renames inside that clean folder
+raagdosa undo --tracks --folder "Burial - Untold"
 ```
 
-### Artifact handling
-
-Non-audio files in album source folders now have an explicit policy.
-
-| Extension | Action |
-|-----------|--------|
-| `.jpg`, `.jpeg` | Keep — moves with album into Clean |
-| `.pdf` | Keep — liner notes, booklets |
-| `.cue` | Keep **only if** a matching `.flac`/`.ape`/`.wav` exists alongside |
-| `.png` | Quarantine — always (policy: let go of all PNGs) |
-| `.nfo`, `.sfv`, `.txt`, `.url`, `.log`, `.m3u`, `.m3u8` | Quarantine |
-| Unknown extensions | Quarantine (conservative default) |
-
-Quarantined files move to `Review/Artifacts/<original_folder_name>/` before the album folder is processed. The album move and track rename proceed without them.
-
-`raagdosa show` displays artifact classification alongside the tag analysis. Move output shows `[N artifacts quarantined]` when applicable.
-
-```yaml
-artifacts:
-  enabled: true
-  keep_extensions: [.jpg, .jpeg, .pdf, .cue]
-  quarantine_extensions: [.png, .nfo, .sfv, .txt, .url, .log, .m3u, .m3u8]
-  quarantine_folder: Review/Artifacts
-  quarantine_unknown: true
-```
-
-### Other
-
-- `APP_VERSION` now reads from `importlib.metadata` when installed via pip; falls back to hardcoded string
-- Optional `Pillow` import available for future smart PNG sizing (not used in this release per policy decision)
-- `existing_clean_paths` dict built at startup for O(1) path lookup during duplicate comparison
-- History entries include `move_method: rename|copy` (carried forward from v3.5.1)
+History and undo commands now also call `_resolve_log_paths_from_active_profile()`
+so they find the correct log files inside the wrapper folder automatically.
 
 ---
 
+
+
+### Release summary
+
+v5 is the intelligence consolidation release. It merges all work from v4.3 (folder
+pre-processor, Smart Title Case, label-as-albumartist safeguard, config BRAIN/SETTINGS
+split) with a second layer of signal improvements: domain/URL stripping at every pipeline
+stage, stronger VA/mix detection using compilation and genre tags, EP detection that works
+on 2-track labelled folders, year recovery from comment tags, a broader set of promo
+phrase stripping, diacritic-safe artist matching with alias documentation, and the removal
+of "flip" from default mix suffix keywords.
+
+Validated against real library data: 968 folders, 13,588 audio files.
+
+---
+
+### New — Folder pre-processor (28-step pipeline, was 13)
+
+Steps 1–13 were the v4.1 baseline. Steps 14–28 are new:
+
+- **Scene release group suffix strip** — `Artist-Album-WEB-2023-FTD` → `Artist - Album`. Handles full slugs with underscores. Confirmed in 157 folders (16%) of real library.
+- **Double-dash slug normalisation** — `Artist--Album_Name` → `Artist - Album Name`. Confirmed in 11 folders (1.1%) in session 2.
+- **Tilde separator normalisation** — `Album ~ Remixes` → `Album - Remixes`.
+- **Curly brace noise strip** — `{Digital Media}`, `{MFM031}` removed.
+- **Known-label bracket strip** — `[warp 2008]`, `[zencd178]` removed. Configurable via `brain.known_labels`.
+- **Format bracket/paren strip** (up to 4 stacked) — `( FLAC )`, `[MP3]`, `[16Bit-44.1kHz]`.
+- **CD + bitrate slug strip** — `2012 cd 320 tmgk` tail patterns removed.
+- **Trailing catalog code strip** — `(CA046)`, `[KOSA043]`, `{MFM031}` at end of name.
+- **Duplicate year collapse** — `2010 - Río Arriba (2010)` → `2010 - Río Arriba`.
+- **Mid-name paren year** — `Artist - (2017) Album` → `Artist - Album`, year extracted.
+- **Mid-name bracket year** — `aukai.  [2016] aukai` → `aukai. - aukai`, year extracted. Handles double-space before bracket (Traxsource artefact).
+- **4-dash label-year-artist-album** — `Cosmovision Records - 2024 - Cigarra - Limbica` → `Cigarra - 2024 - Limbica`. Guarded: only fires when first segment contains a label keyword or is in `brain.known_labels`.
+- **Trailing type annotation strip** — `[Anthology]`, `[album]`, `[collection]` removed.
+- **Domain/URL strip** (step 26, v5) — website noise removed at any position (leading, trailing, bracketed, mixed case). `Www.ElectronicFresh.Com - Artist` → `Artist`. `[www.freestep.net] Artist` → `Artist`. Covers 33 TLDs plus bare `www.` patterns.
+- **Final cleanup** — orphaned trailing separators, double spaces, orphaned year digits abutted to words.
+
+### New — Smart Title Case for all-lowercase folders
+
+- ~10% of real-library folders are entirely lowercase (slug/NFO origin). `flying lotus - los angeles` → `Flying Lotus - Los Angeles`.
+- Rules: small prepositions lowercase in mid-title; all-caps acronyms preserved (`DJ`, `EP`, `LP`, `VA`, `UK`, `US`, `LA`, `NYC`, `MC`); trailing artist dots preserved (`aukai.`); accented characters respected.
+- Config: `title_case.auto_titlecase_lowercase_folders: true` (default on).
+
+### New — Track filename parsing extensions
+
+- **Hash/checksum tail strip** — `07-track-cd4051c3` → `07-track` (8–12 hex chars at stem tail).
+- **`NNN/NN` tag-style track number** — `001/12 - Title` prefix handled.
+- **`NN. –` dot-dash format** — `02. - Artist - Title` stripped correctly.
+
+### New — Label-as-albumartist safeguard (Safeguard D)
+
+- Detects record label keywords in albumartist tag: Records, Discos, Recordings, Label, Music Group, Inc., Ltd., Disques. Confirmed in 37 folders (3.7%) in session 2.
+- When detected and track-level artist is dominant at ≥70%, re-derives albumartist from track tags.
+- Config: `brain.known_labels`.
+
+### New — Domain/URL stripping in tag voting (v5)
+
+- Album tags and track titles have domains stripped before voting. `"Album www.electronicfresh.com"` votes as `"Album"`.
+- `_PROMO_WATERMARK` expanded to catch: `free music`, `hot new music`, `ncs release`, `monstercat`, `edm sauce`, `promoted by`, `no copyright music`, `buy on beatport`, `buy on itunes`, `subscribe to our`, `download free`, `listen free`, `get it free`.
+
+### New — Compilation tag → VA detection (v5)
+
+- `compilation` / `TCMP` = `1` on majority of tracks now fires in `classify_folder_content()`.
+- Prevents misclassification when the compilation flag is set but albumartist is absent or non-standard.
+
+### New — Genre tag as release type signal (v5)
+
+- `genre` tag containing "EP" on ≥⅓ of tracks → classifies folder as EP.
+- `genre` tag containing "Single" on ≥⅓ of tracks → classifies folder as Single.
+
+### New — EP detection: 2-track bypass (v5)
+
+- Folders below `scan.min_tracks` are no longer silently dropped if the folder name contains `\b(ep|e\.p\.|single|7\s*inch)\b`. A 2-track folder named "Artist - Debut EP" is now processed and classified correctly.
+
+### New — Year recovery from comment tag (v5)
+
+- When year tag is empty but the `comment` / `description` field contains a plausible 4-digit year (1950–2040), that year is used as a fallback.
+- Only applied when a single unambiguous year is found — prevents false matches on bitrate strings and catalog numbers.
+
+### New — album tag as VA signal (v5)
+
+- If the album tag itself normalises to a VA match string ("various artists", "va", etc.), it counts as an additional VA signal.
+
+### New — Expanded mix/VA folder keywords (v5)
+
+Added to `_MIX_FOLDER_KW`: `best tracks`, `selected tracks`, `sounds of`, `in the style of`, `tribute to`, `playlist`.
+
+### Changed — "flip" removed from default mix suffix keywords
+
+"Flip" is a production technique term, not a mix format variant. Removed from `mix_info.detect_keywords` defaults. Add manually if your library uses it as a format tag.
+
+### New — Expanded strip_trailing_phrases defaults
+
+Added: `ncs release`, `monstercat`, `edm sauce`, `promoted by`, `released by`, `buy on beatport`, `buy on itunes`, `no copyright music`, `music promotion`, `subscribe to`, `follow on`, `follow us`, `free track`, `free music`.
+
+### New — Config SETTINGS/BRAIN split
+
+- `brain:` section added with clear zone separator comments.
+- `brain.artist_aliases` — canonical artist display form map. Fuzzy matching handles `Björk ↔ Bjork`, `MØ ↔ MO`, `Sigur Rós ↔ Sigur Ros` automatically; aliases control only the folder name display form.
+- `brain.known_labels` — label names for albumartist safeguard.
+- `brain.va_rescue_prefixes` — artist prefixes that should never be classified as VA.
+- `brain.noise_patterns` — for future `raagdosa learn --extract` output.
+- `source_root` default changed to `~/Music/Incoming` (no personal paths in shipped config).
+
+### Config keys added
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `title_case.auto_titlecase_lowercase_folders` | `true` | Smart Title Case on all-lowercase folders |
+| `brain.known_labels` | `[]` | Label names for albumartist safeguard |
+| `brain.artist_aliases` | `{}` | Canonical artist display forms |
+| `brain.va_rescue_prefixes` | `[]` | Prefixes that should never be classified as VA |
+| `brain.noise_patterns` | `[]` | Learned noise patterns |
+
+### Golden tests (all passing)
+
+| Input | Output |
+|-------|--------|
+| `13th_Ward_Social_Club-Afrobeat_Vol_1-WEB-2023-FTD` | `13th Ward Social Club - Afrobeat Vol 1` |
+| `Anka Foh - 2021 - Koundary ( FLAC )` | `Anka Foh - 2021 - Koundary` |
+| `2010 - Río Arriba (2010)` | `2010 - Río Arriba` |
+| `aukai.  [2016] aukai` | `aukai. - aukai` (year=2016) |
+| `Tinariwen--Alkhar_Dessouf_Remix-WEB-2022-OMA` | `Tinariwen - Alkhar Dessouf Remix` |
+| `Tropical Twista Records - 2024 - Cigarra - Limbica` | `Cigarra - 2024 - Limbica` |
+| `Www.ElectronicFresh.Com - Artist - Title` | `Artist - Title` |
+| `[www.freestep.net] Artist - Title` | `Artist - Title` |
+| `flying lotus - los angeles` | `Flying Lotus - Los Angeles` |
+| `dj shadow - endtroducing` | `DJ Shadow - Endtroducing` |
+| `07-chris_tiebo-bhedana-cd4051c3` | art=`chris tiebo` title=`bhedana` |
+
+---
 
 ## [3.5.1] — 2026-03-06
 
 ### Release summary
 
-Performance patch. Three independent wins that compound: same-filesystem moves are now
-atomic renames (~1ms vs 1s/album), scan and apply now overlap via a streaming pipeline,
-and a persistent tag cache eliminates mutagen reads for unchanged files on subsequent runs.
-
----
+Performance patch. Same-filesystem moves are now atomic renames (~1ms vs 1s/album),
+scan and apply overlap via a streaming pipeline, and a persistent tag cache eliminates
+mutagen reads for unchanged files on subsequent runs.
 
 ### Performance
 
-- **Same-filesystem fast path in `safe_move_folder`** — detects when source and destination
-  are on the same device (`st_dev` comparison, walking up ancestry for non-existent paths).
-  Uses `os.rename()` instead of `copytree → verify → rmtree`. Atomic, ~1ms per folder
-  regardless of size. Falls back to copy+verify for cross-device moves. Typical DJ setup
-  (everything on one drive): 500 albums moves from ~8 minutes to ~0.5 seconds.
-
-- **Streaming scan→apply pipeline** — scan and apply now overlap. Candidates are split
-  into configurable batches (`scan.streaming_batch_size`, default 50). A background scanner
-  thread fills a queue; the main thread drains it, routes proposals, applies moves, and
-  renames tracks per batch immediately. First folder moves within seconds of starting even
-  on large libraries. Within-run duplicate tracking is maintained correctly across batches
-  via a shared accumulator.
-
-- **Persistent tag cache** — `TagCache` persisted to `logs/tag_cache.json`, keyed by
-  `(absolute_path, mtime)`. On warm runs (files unchanged), mutagen is skipped entirely.
-  Parallel-safe with `threading.Lock`. Atomic disk write via temp-file replace. Managed
-  via `raagdosa cache` (status / clear / evict).
-
-- **Parallel scan workers** — `ThreadPoolExecutor` within each batch for concurrent tag
-  reading. I/O-bound so threads give ~7× speedup vs sequential. Configurable via
-  `scan.workers` (default: min(8, cpu_count)).
-
-- **Thread-safe progress bar** — `Progress` now uses `Lock` for concurrent tick() calls,
-  shows real-time rate (folders/s) and ETA alongside the bar.
-
-- **move_method logged** — history entries now include `move_method: rename|copy` and
-  elapsed ms. `--dry-run` previews which method would be used per folder.
+- **Same-filesystem fast path** — `os.rename()` instead of copytree → verify → rmtree. Atomic, ~1ms per folder. 500 albums: ~8 min → ~0.5 sec.
+- **Streaming scan→apply pipeline** — configurable batches (`scan.streaming_batch_size`, default 50). First folder moves within seconds.
+- **Persistent tag cache** — `logs/tag_cache.json`, keyed by `(path, mtime)`. Warm runs skip mutagen entirely.
+- **Parallel scan workers** — `ThreadPoolExecutor`, ~7× speedup vs sequential.
+- **Thread-safe progress bar** — real-time rate (folders/s) and ETA.
+- **move_method logged** — `rename|copy` and elapsed ms in history entries.
 
 ### Config
 
-- `scan.workers: 8` — parallel scan workers
-- `scan.tag_cache_enabled: true` — persistent tag cache on/off
-- `scan.streaming_batch_size: 50` — folders per batch in streaming pipeline
+`scan.workers`, `scan.tag_cache_enabled`, `scan.streaming_batch_size`
 
 ### Commands
 
-- `raagdosa cache` — show cache status (entries, size, last saved)
-- `raagdosa cache clear` — force full re-read on next scan
-- `raagdosa cache evict` — remove stale entries for missing files
+`cache`, `cache clear`, `cache evict`
 
+---
 
 ## [3.5.0] — 2026-03-06
 
 ### Release summary
 
-v3.5 delivers the intelligence layer on top of the v3.0 foundation: deeper naming logic,
-a richer multi-factor confidence system, mix/EP classification, seven new commands, and a suite
-of quality-of-life improvements from the 3.1 planning backlog. No database — stays
-fully CLI-only and file-system-based.
+Intelligence layer: deeper naming logic, multi-factor confidence system, mix/EP
+classification, seven new commands.
 
----
+### New
 
-### New — Logic / Naming Intelligence
-
-- **EP detection** — folders with 3–6 tracks classified as EPs, labelled `[EP]` in
-  proposed folder name (configurable via `ep_detection`).
-- **Garbage naming** — three-stage pipeline: bracket stack stripper (noise/promo/format
-  bracket groups removed from album names), token flood guard (5+ parenthetical groups
-  flagged), promo watermark detection (`www.`, `.com`, `free download` etc.).
-- **Mojibake detection** — garbled double-encoded Unicode flagged; folder routed to Review.
-- **Title resolution priority chain** — tag-first; numeric filename prefix fallback; heuristic last.
-- **Vinyl track notation** — A1/B2/C3/D4 side-track format recognised and converted to
-  absolute track numbers (A1=1, B1=9, C1=17, D1=25).
-- **Capitalisation pathologies** — ALL CAPS and all-lowercase album/title names converted
-  to intelligent title case. Configurable via `title_case.never_cap` and
-  `title_case.always_cap` (e.g. always-cap `DJ`, `MC`, `UK`, `EP`).
-- **Bracket content classifier** — each bracket group tagged as
-  year | format | edition | remix_credit | promo | noise | unknown.
-- **Per-folder `.raagdosa` override file** — place YAML inside any folder to force
-  `album`, `artist`, `year`, `skip`, or `confidence_boost`.
-- **Disc indicator stripping** — `Album - Disc 1`, `Album (CD2)` normalised to `Album`
-  for voting and deduplication.
-- **Display name noise stripping** — `(Official Audio)`, `[HD]`, `(Lyrics)` stripped
-  from album names and titles before voting.
-
-### New — Completeness + Confidence
-
-- **Named confidence factor breakdown** — `confidence_factors` dict in `decision`:
-  - `dominance` (0.40 weight) — vote quality
-  - `tag_coverage` (0.15) — fraction of tracks with tags
-  - `title_quality` (0.12) — meaningful title ratio
-  - `completeness` (0.12) — track gap and duplicate penalties
-  - `filename_consistency` (0.10) — filename vs tag agreement
-  - `aa_consistency` (0.06) — albumartist uniformity
-  - `folder_alignment` (0.05) — source folder name match bonus
-- **Track gap detection** — missing track numbers penalise `completeness` factor.
-- **Duplicate track numbers** — same track number on two files penalises score.
-- **Meaningful title ratio** — garbage/watermark titles reduce `title_quality`.
-- **Filename-vs-tag consistency** — `Artist - Title` filename pattern scored against tags.
-- **`raagdosa show` confidence bar chart** — each factor shown as colour-coded bar.
-
-### New — Large Folder / Mix Handling
-
-- **Mix / chart classifier** — keyword matching plus unique-artist ratio heuristic.
-- **Mix routing** — mix folders go to `Clean/_Mixes/` (configurable via `library.mixes_folder`).
-- **`raagdosa extract --by-artist FOLDER`** — splits a VA/mix folder into per-artist groups.
-- **`raagdosa compare --folder A B`** — diffs two folders: track overlap, tag comparison.
-
-### New — Commands
-
-- **`raagdosa orphans`** — find loose audio files in Clean/Review outside album subfolders.
-- **`raagdosa artists --list`** — list artist directories with album and track counts.
-- **`raagdosa artists --find <query>`** — fuzzy-find an artist in Clean.
-- **`raagdosa review-list`** — tabular view of Review folders with age, confidence, reason.
-- **`raagdosa review-list --older-than <days>`** — filter to long-stale folders.
-- **`raagdosa clean-report`** — Clean library audit: counts, formats, quality issues.
-- **`raagdosa show --tracks`** — per-track rename preview alongside folder analysis.
-- **`raagdosa diff <session_a> <session_b>`** — compare two sessions side-by-side.
-  Accepts `last` and `prev` as shorthand.
-
-### Improved — From 3.1 planning backlog
-
-- **Extension case normalisation** — `.MP3` → `.mp3` during track rename pass.
-- **Windows reserved filename sanitisation** — `CON`, `NUL`, `PRN`, `COMn`, `LPTn`
-  get a trailing underscore before use as folder names.
-- **Empty parent cleanup** — empty parent dirs left after folder moves are removed.
-- **`ignore_folder_names` glob support** — patterns like `_*`, `tmp*` now work.
-- **Collision detail in route reasons** — `duplicate_in_run` now includes colliding name.
-- **`.raagdosa` override shown in `raagdosa show`** — override applied and displayed.
+- EP detection (3–6 tracks → EP). Garbage naming pipeline (bracket stripper, promo watermark). Mojibake detection. Vinyl track notation (A1/B2 → absolute track number). ALL CAPS / all-lowercase normalisation. Bracket content classifier.
+- Per-folder `.raagdosa` override file. Disc indicator stripping. Display name noise stripping.
+- 7-factor confidence score with named breakdown: `dominance` (0.40) · `tag_coverage` (0.15) · `title_quality` (0.12) · `completeness` (0.12) · `filename_consistency` (0.10) · `aa_consistency` (0.06) · `folder_alignment` (0.05).
+- Mix/chart classifier. Mix routing to `Clean/_Mixes/`. `raagdosa extract --by-artist`. `raagdosa compare --folder A B`.
+- Commands: `orphans`, `artists --list`, `artists --find`, `review-list`, `review-list --older-than`, `clean-report`, `show --tracks`, `diff`.
 
 ---
 
@@ -242,208 +297,25 @@ fully CLI-only and file-system-based.
 
 ### Release summary
 
-v3.0 is the first public release. Core architecture is stable and field-tested.
-This version is intentionally scoped to library structure and normalisation —
-tag writing, duplicate resolution, and MusicBrainz lookup are v4 targets.
+First public release. Core architecture stable.
 
----
+### New
 
-### New — Library structure
-
-- **`library.template` system** — folder destination is now driven by a configurable
-  path template. Default `{artist}/{album}` places albums under an artist subfolder.
-  Supports tokens: `{artist}`, `{album}`, `{year}`, `{album_year}`.
-- **FLAC segregation** (`library.flac_segregation`) — all-FLAC folders are placed under
-  `Artist/FLAC/Album/` when enabled, keeping archival masters separate from MP3 copies.
-- **Library template presets** — `{artist}/{album}` (recommended) and `{album}` (flat).
-  Full custom templates supported.
-
-### New — Artist normalisation
-
-- **`artist_normalization` config section** — complete fuzzy normalisation pipeline:
-  1. Unicode NFC
-  2. Unicode char map (user-defined, e.g. `Ø → O` for `MØ → MO`)
-  3. ALL-CAPS → Title Case
-  4. Alias map (exact canonical mapping, case-insensitive)
-  5. Hyphen variant normalisation (en-dash, em-dash → ASCII hyphen)
-  6. "The" prefix policy: `keep-front` | `move-to-end` | `strip`
-- **`artist_normalization.the_prefix`** — controls "The" handling globally.
-  Default `keep-front` (The Beatles stays The Beatles).
-- **`artist_normalization.unicode_map`** — per-character substitution before everything else.
-- **`artist_normalization.aliases`** — canonical name map. Add `"jay z": "Jay-Z"` and
-  all variants collapse to one artist folder automatically.
-- **`artist_normalization.fuzzy_dedup_threshold`** — Jaccard word-set similarity
-  threshold for fuzzy artist comparison (default 0.92).
-- **`artist_normalization.normalize_hyphens`** — normalise typographic hyphens to ASCII.
-
-### New — Incremental scanning (`--since`)
-
-- **`raagdosa go --since last_run`** — only scans folders modified after the last
-  successful run timestamp (stored in `logs/clean_manifest.json`). Safe to use every
-  time new music is added to source.
-- **`raagdosa go --since 2026-01-15`** — scan folders modified after any ISO date.
-- **Manifest-based exclusion** — folders already committed to Clean are excluded from
-  all future scans regardless of `--since`. Re-scanning is always safe.
-
-### New — Progress indicators
-
-- **Live progress bar** — `Scanning [████████████░░░░░░░░░░] 142/500 28%  Artist - Album`
-  printed with carriage-return overwrite during scan and apply passes.
-- **Colour-coded output** — CLEAN in green, REVIEW in yellow, DUPES in red,
-  confidence scores colour-coded by value (green ≥ 0.90, yellow ≥ 0.75, red below).
-- Auto-detects TTY; falls back to plain text for pipes, cron, and log redirection.
-
-### New — Graceful stop
-
-- **Ctrl+C (once)** — sets `stop_after_current` flag. Current folder completes fully,
-  then the run stops cleanly. State is logged. Use `raagdosa resume <session_id>` to
-  continue from where it left off.
-- **Ctrl+C (twice)** — immediate force stop (`sys.exit(130)`). Partially moved folders
-  are left in place.
-
-### New — `raagdosa show` (debug command)
-
-```bash
-raagdosa show "/path/to/folder"
-```
-
-Full breakdown for a single folder without moving anything: tags read per file,
-voting results, confidence calculation, proposed name, routing decision, and
-actionable tips to get a Review folder into Clean.
-
-### New — `raagdosa verify` (library audit)
-
-```bash
-raagdosa verify
-```
-
-Read-only audit of `Clean/Albums/`:
-- Manifest entries missing from disk
-- Disk folders not recorded in manifest (appeared outside RaagDosa)
-- Empty folders
-- Track filenames that don't match the expected pattern
-Writes a timestamped `logs/verify_YYYYMMDD_HHMMSS.txt` report.
-
-### New — `raagdosa learn` (config suggestion)
-
-```bash
-raagdosa learn
-```
-
-Analyses Review folders from recent sessions, identifies patterns, and interactively
-proposes config changes:
-- Lower `min_confidence_for_clean` when many folders cluster near the threshold
-- Add bracket suffixes (e.g. `deluxe`, `remastered`) to `strip_common_suffixes_for_voting`
-- Flag tag-less folders for pre-processing with a tag editor
-Writes proposed changes directly to `config.yaml` on confirmation.
-
-### New — Improved session reports (TXT + CSV + HTML)
-
-Every scan now produces three report formats in `logs/sessions/<session_id>/`:
-
-- **`report.txt`** — human-readable summary with aligned columns, confidence scores,
-  routing reasons, and format duplicate warnings
-- **`report.csv`** — properly formatted CSV with columns: status, confidence,
-  original_folder, proposed_name, target_path, track_count, tagged_count,
-  unreadable_count, extensions, route_reasons, heuristic, format_duplicates.
-  Import directly into Excel or Numbers.
-- **`report.html`** — self-contained dark-theme HTML report with colour-coded rows
-  (green/yellow/red by status), sortable table, confidence colour coding.
-  Open in any browser. `raagdosa report --format html` to regenerate/view.
-
-```bash
-raagdosa report                     # view last session (txt)
-raagdosa report --format csv        # path to CSV
-raagdosa report --format html       # path to HTML
-raagdosa report --session <id>      # specific session
-```
-
-### New — `raagdosa init` (guided setup)
-
-```bash
-raagdosa init
-```
-
-Interactive wizard: source folder, library template, FLAC segregation, "The" prefix
-policy. Writes a complete `config.yaml`. Followed automatically by next-step instructions.
-
-### New — Python packaging
-
-- `pyproject.toml` with `[project.scripts]` entry point — `raagdosa` command available
-  immediately after `pip install raagdosa`.
-- Explicit `requires-python = ">=3.9"` and pinned dependencies (`mutagen>=1.46`, `pyyaml>=6.0`).
-- `raagdosa --version` flag.
-
-### Improved — `raagdosa status`
-
-- New since-last-run folder count
-- Disk space display for destination
-- DJ database scan inline
-- Manifest entry count and last run timestamp
-
-### Improved — `raagdosa doctor`
-
-- Library template and FLAC segregation summary
-- Artist normalisation summary (the_prefix, alias count)
-- Mutagen read test on a real file from source
+- `library.template` system (`{artist}/{album}` default). FLAC segregation.
+- Full artist normalisation pipeline: Unicode NFC → char map → alias map → hyphen normalisation → "The" prefix policy. Jaccard fuzzy dedup threshold.
+- `raagdosa go --since last_run`. Manifest-based exclusion.
+- `show`, `verify`, `learn`, `status`, `init`, `resume` commands.
+- TXT + CSV + HTML session reports.
+- Live progress bar, colour-coded output. Graceful Ctrl+C stop.
 
 ---
 
 ## [2.0.0] — 2026-03-04
 
-### Release summary
-
-v2.0 was an internal hardening release focused on correctness and safety.
-
-### Fixed — Logic bugs
-
-- **Display-case name recovery** — dominant album/albumartist now uses the most-common
-  raw display form (e.g. `"Mezzanine"`) rather than the normalised voting key
-  (`"mezzanine"`). Folder names now have correct capitalisation.
-- **Confidence formula** — replaced broken max-of-two formula with true weighted blend:
-  `album_share * 0.60 + albumartist_share * 0.40`. Artist fallback penalty applied
-  consistently.
-- **Clean/Review skip logic** — now uses `str.startswith()` against resolved root paths
-  rather than substring match on path components. Fixes false positives for folders
-  whose names contain "clean" or "review" (e.g. `/Music/Clean Bandit/`).
-- **Sanitize_name slash handling** — slashes/backslashes → space before other illegal
-  char substitution. Fixes `AC/DC → AC DC` (not `AC - DC`).
-
-### Added — Missing MVP features
-
-- **Folder name heuristic parser** — `Artist - Album (YYYY)`, `[YYYY] Artist - Album`,
-  `Artist_-_Album_YYYY`, ALL-CAPS normalisation, format suffix stripping.
-  Heuristic folders always route to Review.
-- **Track dry-run preview** — `--dry-run` now prints proposed renames with confidence.
-- **`raagdosa status` command** — library overview including folder/track counts,
-  manifest entries, pending candidates, DJ database scan, disk space.
-- **Cross-run duplicate detection** — scans existing `Clean/Albums/` before routing
-  to detect folders already processed in prior sessions.
-- **Collision warnings** — target name conflicts produce clear warning and suffix.
-
-### Added — Safeguards
-
-- **Copy-verify-delete** (`safe_move_folder`) — replaces all `shutil.move()` calls.
-  Verifies file count and byte size before deleting source.
-- **Checksum verification** — optional MD5 per-file verification (`move.use_checksum`).
-- **Disk space pre-check** — requires 110% of source size free before starting.
-- **Locked file detection** — warns and prompts when files cannot be opened for write.
-- **DJ database detection** — scans for Rekordbox/Serato files with configurable
-  halt/warn policy.
-- **Interrupted-run recovery** — `raagdosa resume <session_id>`.
-- **Unicode normalisation** — NFC applied to all path comparisons.
-- **Hidden file filtering** — `.DS_Store`, `Thumbs.db`, `._*`, `__MACOSX` excluded.
-- **Symlink handling** — `scan.follow_symlinks: false` default.
-- **Path length validation** — warns on paths > 260 chars (Windows limit).
-- **Config schema validation** — version mismatch, missing sections, out-of-range values.
-- **Log rotation** — archives logs exceeding `rotate_log_max_mb`.
-- **Proposal path validation** — anti-traversal check on all target paths.
-- **Clean manifest** — persistent `logs/clean_manifest.json` for cross-run tracking.
-- **Format duplicate detection** — flags same-stem multi-format files (`.mp3` + `.flac`).
+Internal hardening release. Fixed display-case recovery, confidence formula, Clean/Review skip logic, slash sanitisation. Added copy-verify-delete, disk space check, DJ database detection, clean manifest, format duplicate detection.
 
 ---
 
 ## [1.0.0] — 2026-03-03
 
 Initial internal release. Core scan → vote → propose → move → rename pipeline.
-Single-file Python script with YAML config. No packaging, no tests.

@@ -116,3 +116,16 @@ ENV/
 config.local.yaml
 .env
 .env.*
+
+# ─────────────────────────────
+# AI / Claude local tooling
+# ─────────────────────────────
+
+# Claude Code project config
+.claude/
+
+# Claude project memory file
+CLAUDE.md
+
+# Local documentation used by agents
+docs/

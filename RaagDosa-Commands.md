@@ -1,4 +1,4 @@
-# RaagDosa — Command Reference (v3.81)
+# RaagDosa — Command Reference (v4.3)
 
 > **CLI-first. Safe by default. Always undoable.**
 > RaagDosa never silently reorganises your music. Every action is sessioned, logged, and reversible.
@@ -54,8 +54,6 @@ raagdosa go --interactive           # confirm each folder before it moves
 raagdosa go --since last_run        # only folders added since your last run
 raagdosa go --since 2026-01-15      # only folders modified after a specific date
 raagdosa go --profile bandcamp      # use a different source profile
-raagdosa go --performance slow      # gentle on older machines (see Performance Tiers below)
-raagdosa go --performance ultra     # full speed on M3/M4 with fast storage
 ```
 
 ### `run` — same as `go`, explicit alias
@@ -99,8 +97,8 @@ raagdosa apply logs/sessions/<id>/proposals.json  # apply from a specific file
 ## Single-folder debug
 
 ```bash
-raagdosa show "/Music/Incoming/some folder"
-raagdosa show "/Music/Incoming/some folder" --tracks
+raagdosa show "~/Music/Incoming/some folder"
+raagdosa show "~/Music/Incoming/some folder" --tracks
 ```
 
 `show` gives you a full breakdown for one folder without moving anything:
@@ -183,14 +181,14 @@ RaagDosa automatically detects mix folders (via keywords like "Mixed By", "Prese
 
 ### `extract --by-artist` — split a VA or mix folder
 ```bash
-raagdosa extract "/Music/Incoming/DJ Mix 2024" --by-artist
-raagdosa extract "/Music/Incoming/DJ Mix 2024" --by-artist --dry-run
+raagdosa extract "~/Music/Incoming/DJ Mix 2024" --by-artist
+raagdosa extract "~/Music/Incoming/DJ Mix 2024" --by-artist --dry-run
 ```
 Groups tracks by their artist tag and moves each group into `Clean/Albums/Artist/_Singles/`. The `--dry-run` shows you the groups before anything moves.
 
 ### `compare --folder` — diff two folders
 ```bash
-raagdosa compare --folder "/Music/Folder A" "/Music/Folder B"
+raagdosa compare --folder "~/Music/Folder A" "~/Music/Folder B"
 ```
 Shows which tracks are in A only, B only, or both — plus a tag comparison on matching files. Useful for spotting duplicates or checking a re-rip against an existing copy.
 
@@ -255,8 +253,8 @@ Profiles let you run RaagDosa against different source folders (Bandcamp downloa
 ```bash
 raagdosa profile list
 raagdosa profile show incoming
-raagdosa profile add bandcamp --source "/Music/Bandcamp" --clean-mode inside_root
-raagdosa profile set incoming --source "/Users/you/Music/Incoming"
+raagdosa profile add bandcamp --source "~/Music/Bandcamp" --clean-mode inside_root
+raagdosa profile set incoming --source "~/Music/Incoming"
 raagdosa profile use bandcamp        # set as active
 raagdosa profile delete bandcamp
 ```
@@ -281,12 +279,9 @@ If you hit Ctrl+C during a run (once = graceful stop after current folder, twice
 | Destination | When |
 |---|---|
 | `Clean/Albums/` | High confidence, no duplicates, tags look solid |
-| `Clean/Albums/Artist/FLAC/Album/` | FLAC version of an album already in Clean as MP3 (when `flac_segregation: true`) |
 | `Clean/_Mixes/` | Detected as a DJ mix or chart folder _(v3.5)_ |
 | `Review/Albums/` | Low confidence, heuristic fallback, high unreadable ratio |
-| `Review/Duplicates/` | Same proposed name already exists in Clean — after content comparison |
-| `Review/Artifacts/` | `.nfo`, `.sfv`, `.log`, `.png`, `.m3u` and other non-audio files _(v3.81)_ |
-| _(merged into existing)_ | Incoming has tracks missing from existing Clean folder — tracks copied in, source goes to Duplicates |
+| `Review/Duplicates/` | Same proposed name already exists in Clean or current run |
 
 **Nothing is ever deleted.** Review is a holding area, not a bin.
 
@@ -321,67 +316,6 @@ Useful for folders with bad tags where you know the answer and don't want to bot
 
 ---
 
-## Performance tiers _(v3.81)_
-
-Pick the tier that matches your machine. RaagDosa sets workers, lookahead buffer, and copy-path sleep automatically.
-
-| Tier | Best for | Workers | Behaviour |
-|---|---|---|---|
-| `slow` | 2017 Intel MBP, 8 GB RAM, old MacBook Air | 1 | Serial. 50ms pause between copy-path moves to keep system responsive. |
-| `medium` | 2019–2021 Intel MBP, 16 GB RAM | 2 | Light parallelism. 10ms pause on copy-path moves. |
-| `fast` | 2021+ M1/M2, 16 GB RAM | 4 | Good parallelism. No artificial sleep. |
-| `ultra` | 2023+ M3/M4, 32 GB+, NVMe | 8 | Full blast. No throttle. |
-
-```bash
-raagdosa go --performance slow    # override for one run
-raagdosa doctor                   # shows your hardware + recommended tier
-```
-
-Set a default in `config.yaml`:
-```yaml
-performance:
-  tier: medium    # slow | medium | fast | ultra
-```
-
-The pause (`sleep_between_moves_ms`) only applies on **copy-path moves** (cross-device). Same-filesystem moves are atomic renames (~1ms) and are never throttled regardless of tier.
-
----
-
-## Artifact handling _(v3.81)_
-
-Non-audio files found in album folders get an explicit policy when `go` runs.
-
-| File type | What happens |
-|---|---|
-| `.jpg`, `.jpeg` | Kept — moves with the album into Clean/ |
-| `.pdf` | Kept — liner notes, booklets |
-| `.cue` | Kept **if** a matching `.flac`, `.ape`, or `.wav` exists in the same folder |
-| `.png` | Quarantined — sent to `Review/Artifacts/<album>/` |
-| `.nfo`, `.sfv`, `.log`, `.txt`, `.url`, `.m3u`, `.m3u8` | Quarantined |
-| Unknown extensions | Quarantined (conservative default) |
-
-Quarantine happens **before** the album move. The album folder is processed normally without those files. `raagdosa show` displays the artifact breakdown alongside the tag analysis.
-
-Disable with `artifacts.enabled: false` in `config.yaml` if you want the old behaviour (all files move with the folder).
-
----
-
-## Duplicate resolution _(v3.81)_
-
-When a proposed folder name matches an existing Clean folder, RaagDosa compares contents before routing.
-
-| Outcome | What RaagDosa does |
-|---|---|
-| **Missing tracks** — incoming has tracks not in existing | Copies missing tracks into the existing Clean folder, re-runs track rename. Source goes to `Review/Duplicates/` tagged `[merged_N_tracks]`. |
-| **FLAC upgrade** — incoming is FLAC, existing is MP3 | With `flac_segregation: true`: routes FLAC to `Artist/FLAC/Album/`. Without: routes to Review tagged `format_upgrade`. |
-| **Lower quality** — incoming is MP3, existing has FLAC | Routes to `Review/Duplicates/` tagged `lower_quality_mp3`. Never downgrades. |
-| **Exact duplicate** | Routes to `Review/Duplicates/` tagged `exact_duplicate`. |
-| **Partial overlap** | Routes to `Review/Duplicates/` tagged `partial_overlap` with per-track counts. |
-
-Disable intelligent comparison and return to name-only routing with `duplicates.compare_before_routing: false`.
-
----
-
 ## Common flags (work on most commands)
 
 | Flag | What it does |
@@ -393,7 +327,6 @@ Disable intelligent comparison and return to name-only routing with `duplicates.
 | `--since 2026-01-01` | Only process folders modified after a date |
 | `--verbose` | Extra detail in output |
 | `--quiet` | Suppress non-error output |
-| `--performance <tier>` | Hardware tier: `slow` / `medium` / `fast` / `ultra` (overrides config) |
 
 ---
 
@@ -427,7 +360,6 @@ Disable intelligent comparison and return to name-only routing with `duplicates.
 | `undo` | Reverse folder moves or track renames |
 | `learn` | Suggest config improvements from Review patterns |
 | `profile` | Manage source profiles (list/show/add/set/use/delete) |
-| `cache` | Tag cache: `status` / `clear` / `evict` |
 
 ---
 

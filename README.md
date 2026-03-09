@@ -11,17 +11,18 @@
 
 **Deterministic music library cleanup for DJs and collectors.**
 
-[![PyPI version](https://img.shields.io/pypi/v/raagdosa?style=flat-square&color=0d1117&labelColor=21262d&logo=pypi&logoColor=f5f5f5)](https://pypi.org/project/raagdosa/)
+[![Version](https://img.shields.io/badge/version-5.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
 [![Python versions](https://img.shields.io/pypi/pyversions/raagdosa?style=flat-square&color=0d1117&labelColor=21262d&logo=python&logoColor=f5f5f5)](https://pypi.org/project/raagdosa/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square&color=0d1117&labelColor=21262d)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=flat-square&color=0d1117&labelColor=21262d&logo=github-actions&logoColor=f5f5f5)](https://github.com/YOUR_USERNAME/raagdosa/actions)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square)](https://github.com/psf/black)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=flat-square&color=0d1117&labelColor=21262d&logo=github-actions&logoColor=f5f5f5)](https://github.com/raagdosa/raagdosa/actions)
 
 </div>
 
 ---
 
-RaagDosa is **Calibre for DJs** — a local-first, CLI-driven tool that transforms a chaotic music folder into a clean, coherent library structure you can trust. It reads your tags, votes across tracks to find consensus metadata, assigns a confidence score, and routes each album to `Clean/` or `Review/` accordingly.
+RaagDosa is **Calibre for DJs** — a local-first, CLI-driven tool that transforms a chaotic music folder into a clean, coherent library structure you can trust. It reads your audio file tags, votes across all tracks to find consensus metadata, assigns a confidence score, and routes each album to `Clean/` or `Review/` accordingly.
+
+**The ID3/Vorbis/AAC tag is the source of truth.** The folder name supplements when tags are missing — it never overrides them.
 
 It never touches your source. Every action is sessioned, logged, and fully undoable.
 
@@ -36,18 +37,18 @@ raagdosa undo --session last  # change your mind
 ## What it looks like
 
 ```
-Session:   2026-03-06_14-30-00_a3f1
-Pipeline:  streaming batches of 50, 8 scan workers
+Session:   2026-03-08_14-30-00_a3f1
+Pipeline:  streaming batches of 50, 4 scan workers
 
 Scanning [██████████████████████] 833/833 100%  42/s  ~0s  Portishead - Dummy
 
-  MOVED ✦ clean   Massive Attack - Mezzanine (1998)   conf=0.97
-  MOVED ✦ clean   Portishead - Dummy (1994)           conf=0.95
-  MOVED ◐ review  Unknown Artist - 2024-03-01         conf=0.52  [low_confidence, heuristic_fallback]
+  MOVED ✦ clean   Massive Attack - Mezzanine (1998)                conf=0.97
+  MOVED ✦ clean   Portishead - Dummy (1994)                        conf=0.95
+  MOVED ◐ review  Unknown Artist - 2024-03-01                      conf=0.52  [low_confidence, heuristic_fallback]
   MOVED ✦ clean   The Prodigy - Music for the Jilted Generation (1994)  conf=0.91
-  MOVED ◈ dupes   Massive Attack - Mezzanine (1998)   conf=0.97  [duplicate_in_run]
-  MOVED ✦ clean   DJ Shadow - Endtroducing..... (1996)  conf=0.94
-  MOVED ✦ clean   Björk - Homogenic (1997)            conf=0.93
+  MOVED ◈ dupes   Massive Attack - Mezzanine (1998)                conf=0.97  [duplicate_in_run]
+  MOVED ✦ clean   DJ Shadow - Endtroducing..... (1996)             conf=0.94
+  MOVED ✦ clean   Björk - Homogenic (1997)                         conf=0.93
 
   All 502 folder(s) moved via instant rename (same filesystem)
 
@@ -68,7 +69,7 @@ pip install raagdosa
 Or run from source:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/raagdosa
+git clone https://github.com/raagdosa/raagdosa
 cd raagdosa
 pip install -e .
 ```
@@ -88,7 +89,7 @@ raagdosa go --dry-run
 raagdosa go
 ```
 
-That's it for most sessions. On subsequent runs:
+On subsequent runs:
 
 ```bash
 raagdosa go --since last_run   # only process music added since last time
@@ -105,15 +106,15 @@ RaagDosa's pipeline has six stages — each folder goes through all of them:
   │  SOURCE FOLDER                                                  │
   │                                                                 │
   │  1. SCAN      Walk source tree, find candidate album folders    │
-  │               8 parallel workers, tag cache for warm runs       │
+  │               Parallel workers, tag cache for warm runs         │
   │                                                                 │
-  │  2. READ      mutagen reads audio tags from every track         │
-  │               Cache keyed by (path, mtime) — zero cost if       │
-  │               file unchanged                                    │
+  │  2. READ      mutagen reads every tag from every track          │
+  │               genre, compilation, grouping, comment, label,     │
+  │               bpm, key — all used as classification signals      │
   │                                                                 │
   │  3. VOTE      Plurality vote across all tags in the folder      │
-  │               Winner: most common non-empty value per field     │
-  │               Ties broken by track count                        │
+  │               Tags win over folder name. Folder name used       │
+  │               only when tags are absent or incomplete.          │
   │                                                                 │
   │  4. SCORE     7-factor confidence score (0.0 → 1.0)            │
   │               dominance · coverage · title quality · gaps       │
@@ -131,10 +132,52 @@ RaagDosa's pipeline has six stages — each folder goes through all of them:
 
 ---
 
+## Tag-first philosophy
+
+RaagDosa reads every audio tag it can find — not just artist and album, but `compilation` (iTunes TCMP flag), `genre`, `grouping`, `comment`, `label`, `bpm`, and `key`. These all feed the classification engine:
+
+| Tag | How it's used |
+|-----|---------------|
+| `compilation` / `TCMP` | If majority of tracks are flagged, folder → VA |
+| `genre` | "EP" or "Single" in genre tag → EP/Single classification |
+| `grouping` | EP/Single signals from grouping field |
+| `comment` | Year fallback — scans comment text for 4-digit year when year tag is missing |
+| `label` | Detects when a record label name has contaminated the albumartist tag |
+| `albumartist` | Primary artist for folder naming and VA detection |
+| `artist` | Per-track artist for VA ratio calculation |
+| `bpm`, `key` | Available for future DJ-specific routing |
+| `isrc` | Available for future deduplication |
+
+When both a tag and the folder name agree on a value, confidence is boosted. When they disagree, the tag wins but confidence is reduced — potentially routing to Review.
+
+**Year recovery chain:** ID3 date/year tags → comment tag year → folder name year. Each fallback level penalises confidence proportionally.
+
+---
+
+## Folder name cleaning
+
+Before any parsing, folder names pass through a 28-step pre-processor that strips noise patterns confirmed in real library data (968 folders, 13,588 files analysed):
+
+```
+13th_Ward_Social_Club-Afrobeat_Vol_1-WEB-2023-FTD  →  13th Ward Social Club - Afrobeat Vol 1
+bonobo - black sands remixed [zencd178] 2012 cd 320  →  bonobo - black sands remixed
+aukai.  [2016] aukai                                 →  aukai. - aukai
+Www.ElectronicFresh.Com - Artist - Title             →  Artist - Title
+[www.freestep.net] Artist - Title                    →  Artist - Title
+flying lotus - los angeles                           →  Flying Lotus - Los Angeles
+Tropical Twista Records - 2024 - Cigarra - Limbica   →  Cigarra - 2024 - Limbica
+```
+
+Noise stripped: scene release group suffixes (`-WEB-2023-FTD`), format brackets/parens (`[MP3]`, `( FLAC )`), catalog codes (`[zencd178]`), duplicate years, label-year-artist-album 4-dash slugs, double-dash slugs, website domains and URLs (all positions, any case), promo watermarks, hash/checksum tails.
+
+All-lowercase folder names (~10% of real libraries) are automatically rescued to Smart Title Case — with DJ/EP/VA/UK acronyms preserved.
+
+---
+
 ## Debug a single folder
 
 ```bash
-raagdosa show "/Music/Incoming/some strange folder" --tracks
+raagdosa show "~/Music/Incoming/some folder" --tracks
 ```
 
 ```
@@ -142,7 +185,7 @@ raagdosa show "/Music/Incoming/some strange folder" --tracks
 raagdosa show — DJ Shadow - Endtroducing..... (1996)
 ══════════════════════════════════════════════════════════════════
 
-Source:   /Music/Incoming/DJ Shadow - Endtroducing (1996)
+Source:   ~/Music/Incoming/DJ Shadow - Endtroducing (1996)
 Files:    16 × .flac
 
 Tag votes
@@ -163,11 +206,6 @@ Confidence  0.94  ██████████████████░░  
 
 Proposed:   DJ Shadow - Endtroducing..... (1996)
 Routing:    ✦ clean → Clean/Albums/DJ Shadow/Endtroducing..... (1996)/
-
-Track renames (--tracks)
-  01 Stem And a Hum.flac             → 01 - Stem And a Hum.flac
-  02 Building Steam with a Grain.flac → 02 - Building Steam with a Grain of Salt.flac
-  ...
 ══════════════════════════════════════════════════════════════════
 ```
 
@@ -178,16 +216,13 @@ Track renames (--tracks)
 | Condition | Destination |
 |-----------|-------------|
 | Confidence ≥ threshold, not a duplicate | `Clean/Albums/Artist/Album/` |
-| Detected as DJ mix / chart folder | `Clean/_Mixes/` |
+| Detected as DJ mix / chart / playlist | `Clean/_Mixes/` |
+| Detected as EP (3–6 tracks or "EP" in name) | `Clean/Albums/Artist/Album (EP)/` |
+| Single (1–2 tracks or "Single" in name) | `Clean/_Singles/` |
 | Confidence < threshold | `Review/Albums/` |
 | Same proposed name appears twice in this run | `Review/Duplicates/` |
-| Exists in Clean AND incoming has missing tracks | Tracks merged into existing folder |
-| Exists in Clean as MP3, incoming is FLAC | `Clean/Albums/Artist/FLAC/Album/` (if `flac_segregation: true`) |
-| Exists in Clean as FLAC, incoming is MP3 | `Review/Duplicates/` tagged `lower_quality_mp3` |
-| Already exists in Clean (exact or partial) | `Review/Duplicates/` |
+| Already exists in Clean (manifest or disk) | `Review/Duplicates/` |
 | Tags absent, folder name used as fallback | `Review/Albums/` |
-| Too many unreadable files | `Review/Albums/` |
-| Non-audio junk (`.nfo`, `.log`, `.png`, etc.) | `Review/Artifacts/<album>/` |
 
 Review is a **holding area**, not a bin. Nothing is ever deleted.
 
@@ -195,52 +230,68 @@ Review is a **holding area**, not a bin. Nothing is ever deleted.
 
 ## Performance
 
-RaagDosa is fast even on large libraries:
+| Library | First scan | Warm scan (cached) | Same-drive apply |
+|---------|------------|--------------------|------------------|
+| 600 tracks | ~2s | <1s | ~0s |
+| 6k tracks | ~8s | <1s | <1s |
+| 60k tracks | ~25s | ~2s | <5s |
 
-| Library | Old (sequential) | v3.81 (same drive) | v3.81 (first scan) | v3.81 (warm cache) |
-|---------|-----------------|-------------------|-------------------|-------------------|
-| 600 tracks | ~50s | **<1s** | ~2s | **<1s** |
-| 6k tracks | ~8m | **<2s** | ~8s | **<1s** |
-| 60k tracks | ~90m | **<5s** | ~25s | **~2s** |
-
-**Same-drive moves** use `os.rename()` (atomic, ~1ms per folder) instead of copy+verify+delete.  
-**Parallel scan** runs 8 concurrent workers reading tags — ~7× faster than sequential.  
-**Tag cache** persists tag data between runs keyed by `(path, mtime)` — warm scans cost almost nothing.  
-**Streaming pipeline** starts moving folders immediately rather than waiting for the full scan to complete.
+**Same-drive moves** use `os.rename()` (atomic, ~1ms per folder regardless of album size).
+**Parallel scan** runs concurrent workers reading tags — ~7× faster than sequential.
+**Tag cache** persists tag data between runs keyed by `(path, mtime)` — warm scans cost almost nothing.
+**Streaming pipeline** starts moving folders immediately rather than waiting for the full scan.
 
 ---
 
 ## Configuration
 
-RaagDosa is configured through a single `config.yaml`. Key sections:
+RaagDosa is configured through a single `config.yaml` split into two zones.
 
-### Confidence threshold
+### SETTINGS — operational behaviour
 
 ```yaml
 review_rules:
   min_confidence_for_clean: 0.85  # below this → Review/
-```
 
-### Artist normalisation — fix "Jay-Z" vs "Jay Z" vs "JAYZ"
-
-```yaml
 artist_normalization:
-  the_prefix: keep-front      # keep-front | move-to-end | strip
+  the_prefix: keep-front          # keep-front | move-to-end | strip
+  fuzzy_dedup_threshold: 0.92     # Jaccard threshold for artist matching
 
-  aliases:
-    "jay z":   "Jay-Z"
-    "jayz":    "Jay-Z"
-    "mos def": "Yasiin Bey"
-    "beatles": "The Beatles"
+title_cleanup:
+  strip_trailing_domains: true    # strip www.site.com from titles/albums
+  strip_trailing_phrases:
+    - "free download"
+    - "official video"
+    - "ncs release"
+    # ... full list in config.yaml
 ```
 
-### Library template
+### BRAIN — learned knowledge about your library
 
 ```yaml
-library:
-  template: "{artist}/{album}"    # how Clean/ is structured
-  flac_segregation: false         # true → Artist/FLAC/Album/ for archival masters
+brain:
+  artist_aliases:
+    # Diacritics — fuzzy matching handles Björk↔Bjork automatically
+    # but aliases control the *display form* used in folder names:
+    "bjork":         "Björk"
+    "sigur ros":     "Sigur Rós"
+    "mo":            "MØ"
+    "jay z":         "Jay-Z"
+    "mos def":       "Yasiin Bey"
+
+  known_labels:
+    # Record labels to detect in albumartist tags (prevents
+    # "Cosmovision Records - Album" being used as folder name)
+    - "Cosmovision Records"
+    - "Tropical Twista Records"
+
+  va_rescue_prefixes:
+    # Artist prefixes that should never be classified as VA
+    - "sven wunder"
+    - "blend mishkin"
 ```
+
+When `brain:` grows large, move it to `raagdosa-brain.yaml` and add `brain_file: raagdosa-brain.yaml` in config.
 
 ### Per-folder override
 
@@ -254,34 +305,6 @@ year: 1998
 confidence_boost: 0.15
 ```
 
-### Performance tier
-
-```yaml
-performance:
-  tier: medium    # slow | medium | fast | ultra
-  # Individual overrides (optional):
-  # workers: 4
-  # sleep_between_moves_ms: 0
-```
-
-### Artifact handling
-
-```yaml
-artifacts:
-  enabled: true
-  keep_extensions: [.jpg, .jpeg, .pdf, .cue]
-  quarantine_extensions: [.png, .nfo, .sfv, .txt, .url, .log, .m3u, .m3u8]
-  quarantine_folder: Review/Artifacts
-
-### Duplicate resolution
-
-```yaml
-duplicates:
-  compare_before_routing: true   # compare contents before routing to Duplicates
-  merge_missing_tracks: true     # auto-copy missing tracks into existing folder
-  flac_mp3_coexistence: keep_both
-```
-
 ---
 
 ## Track naming
@@ -291,10 +314,26 @@ duplicates:
 | Standard album | `01 - Title.ext` |
 | Multi-disc album | `1-01 - Title.ext` |
 | Various Artists | `01 - Artist - Title.ext` |
-| EP (3–6 tracks) | Folder labelled `[EP]`, tracks use album pattern |
+| EP | Folder labelled `(EP)`, tracks use album pattern |
+| Single | Routed to `_Singles/`, track number stripped |
 | Mixed bag | `Artist - Title.ext` |
 
-Title cleanup removes: domains (`free-mp3s.net`), upload watermarks, bitrate tags (`320kbps`), and YouTube suffixes (`[Official Audio]`, `(Lyrics Video)`) — while preserving meaningful DJ suffixes (`Original Mix`, `Extended`, `Dub`, `Remix`).
+Supported source filename formats: `01 - Title`, `01. Title`, `02. - Title`, `01-slug-title`, `001/12 Title`, `D-NN Title`, `A1 - Title`, and 4-part `Artist - Album - 01 - Title`.
+
+Title cleanup removes: domains (`free-mp3s.net`), upload watermarks, bitrate tags (`320kbps`), promo labels (`NCS Release`, `EDM Sauce`), and YouTube suffixes (`[Official Audio]`) — while preserving meaningful suffixes (`Original Mix`, `Extended`, `Dub`, `Remix`, `feat.`).
+
+---
+
+## Artist matching and diacritics
+
+RaagDosa uses a 4-step fuzzy artist matching pipeline:
+
+1. Exact Unicode NFC match
+2. "The"-prefix strip then exact match
+3. ASCII-fold comparison — `Björk ↔ Bjork`, `MØ ↔ MO`, `Sigur Rós ↔ Sigur Ros`
+4. Jaccard word-set similarity ≥ 0.92
+
+This means tags and folder names with diacritic variants are always matched and deduplicated correctly. Use `brain.artist_aliases` to control which display form appears in the final folder name.
 
 ---
 
@@ -307,9 +346,7 @@ Title cleanup removes: domains (`free-mp3s.net`), upload watermarks, bitrate tag
 2. Re-import the `Clean/` folder into Rekordbox or Serato as a new collection
 3. Re-analyse — you get fresh, accurate waveforms for the clean copies
 
-This is intentional: you're building a clean foundation, not patching the old one.
-
-**FLAC segregation** (`library.flac_segregation: true`) keeps archival masters under `Artist/FLAC/Album/` and MP3 working copies under `Artist/Album/` — physically separate, no filename collisions.
+**FLAC segregation** (`library.flac_segregation: true`) keeps archival masters under `Artist/FLAC/Album/` and MP3 working copies under `Artist/Album/`.
 
 ---
 
@@ -317,13 +354,13 @@ This is intentional: you're building a clean foundation, not patching the old on
 
 | Mechanism | What it does |
 |-----------|-------------|
-| **Copy-verify-delete** | Files copied, count+size verified, source deleted only on success. No raw `mv`. |
-| **Same-fs fast path** | Uses atomic `os.rename()` where possible — if it fails, no partial state. |
-| **Manifest** | Every Clean folder recorded in `logs/clean_manifest.json`. Used for cross-run dedup and `verify`. |
-| **History log** | Append-only `logs/history.jsonl`. Full undo by session, action ID, or original path. |
-| **Disk space check** | Aborts if destination has less than 110% of source size available. |
-| **Path validation** | Proposed destinations validated against allowed roots before any move. |
-| **Stop handling** | Ctrl+C once = graceful stop after current folder. Ctrl+C twice = force quit. `resume <session_id>` continues from where it left off. |
+| **Copy-verify-delete** | Files copied, count+size verified, source deleted only on success |
+| **Same-fs fast path** | Atomic `os.rename()` — if it fails, no partial state |
+| **Manifest** | Every Clean folder recorded in `logs/clean_manifest.json` for cross-run dedup |
+| **History log** | Append-only `logs/history.jsonl`. Full undo by session, action ID, or path |
+| **Disk space check** | Aborts if destination has less than 110% of source size available |
+| **Path validation** | Anti-traversal check on all target paths before any move |
+| **Stop handling** | Ctrl+C once = graceful stop after current folder. `resume` continues from checkpoint |
 
 ---
 
@@ -385,9 +422,10 @@ Profiles
 
 ## Project links
 
-- **Documentation:** [RaagDosa-Commands.md](https://github.com/YOUR_USERNAME/raagdosa/blob/main/RaagDosa-Commands.md)
-- **Changelog:** [CHANGELOG.md](https://github.com/YOUR_USERNAME/raagdosa/blob/main/CHANGELOG.md)
-- **Issues:** [GitHub Issues](https://github.com/YOUR_USERNAME/raagdosa/issues)
+- **Documentation:** [RaagDosa-Commands.md](https://github.com/raagdosa/raagdosa/blob/main/RaagDosa-Commands.md)
+- **Changelog:** [CHANGELOG.md](https://github.com/raagdosa/raagdosa/blob/main/CHANGELOG.md)
+- **Design document:** [RaagDosa_v5_Design.docx](https://github.com/raagdosa/raagdosa/blob/main/RaagDosa_v5_Design.docx)
+- **Issues:** [GitHub Issues](https://github.com/raagdosa/raagdosa/issues)
 - **License:** [MIT](LICENSE)
 
 ---
