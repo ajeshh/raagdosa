@@ -5,6 +5,146 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [6.0.0] — 2026-03-09
+
+### Release summary
+
+v6 introduces **library profiles with template-based folder structures**. Instead of a single
+`{artist}/{album}` layout, you can now organise your library by genre, decade, BPM, musical key,
+or record label — using 9 built-in templates or your own custom pattern. Each profile can have
+its own template and library settings, so your archive collection and DJ prep folder can use
+completely different structures. All settings live in `config.yaml` — set once, then just run.
+
+This release was built in three phases:
+- **Phase 1** — Foundation: template system, per-profile `library:` overrides, `resolve_library_path()` refactor
+- **Phase 2** — Genre & decade tokens with 150+ entry genre normalisation map
+- **Phase 3** — BPM bucketing, Camelot key mapping, and label normalisation
+
+---
+
+### New — Library template system
+
+9 built-in templates cover the most common folder structures for collectors and DJs:
+
+| Template | Pattern | Use case |
+|----------|---------|----------|
+| `standard` | `{artist}/{album}` | Default archive layout |
+| `dated` | `{artist}/{year} - {album}` | Chronological discography |
+| `flat` | `{artist} - {album}` | Minimal depth |
+| `genre` | `{genre}/{artist}/{album}` | Multi-genre collections |
+| `decade` | `{decade}/{genre}/{artist} - {album}` | Era-first browsing |
+| `bpm` | `{bpm_range}/{artist} - {album}` | Tempo-sorted DJ library |
+| `genre-bpm` | `{genre}/{bpm_range}/{artist} - {album}` | Open-format DJ |
+| `genre-bpm-key` | `{genre}/{bpm_range}/{camelot_key}/{artist} - {album}` | Harmonic mixing |
+| `label` | `{label}/{artist} - {album}` | Label-focused collectors |
+
+Commands: `raagdosa template list`, `raagdosa template show <id>`.
+
+### New — Per-profile library overrides
+
+Each profile can now include a `library:` block that overrides the global library settings.
+This means your archive can use `{artist}/{album}` while your DJ prep folder uses
+`{genre}/{bpm_range}/{artist} - {album}` — all in the same config file.
+
+```yaml
+profiles:
+  archive:
+    source_root: ~/Music/Archive
+    library:
+      template: "{artist}/{year} - {album}"
+  dj-usb:
+    source_root: ~/Music/DJ-Prep
+    library:
+      template: "{genre}/{bpm_range}/{artist} - {album}"
+```
+
+### New — Genre normalisation (`genre_map`)
+
+A 150+ entry mapping in `config.yaml` normalises raw genre tags to canonical folder names.
+Case-insensitive. Unmapped genres pass through as-is.
+
+Coverage: Electronic (25 variants), House (8), Techno (6), Drum & Bass (5), Ambient (4),
+Hip-Hop (8), Jazz (6), Soul & Funk (5), Reggae & Dub (4), World (5), Rock (6),
+Classical (4), Soundtrack (3), Pop (4), Metal (4), Folk (3), Experimental (4), Trance (4).
+
+### New — BPM bucketing (`{bpm_range}` token)
+
+Tracks' BPM values are collected per folder (using median for robustness) and bucketed into
+configurable ranges. Named zones are checked first, then numeric ranges:
+
+```yaml
+bpm_buckets:
+  width: 10
+  named_zones:
+    "Downtempo":    [60, 99]
+    "House":        [120, 132]
+    "Techno":       [133, 145]
+    "D&B / Jungle": [160, 180]
+```
+
+A 128 BPM album → `House/`. A 150 BPM album → `150-159/`. Configurable fallback: `_Unknown BPM`.
+
+### New — Camelot key mapping (`{camelot_key}` token)
+
+Raw musical key tags are converted to Camelot wheel notation (1A–12B), the standard system
+DJs use for harmonic mixing. Handles multiple input formats:
+
+- Standard: `Am` → `8A`, `C` → `8B`, `F#m` → `11A`
+- Long form: `A minor` → `8A`, `C major` → `8B`
+- Case-insensitive: `am` → `8A`, `ebm` → `2A`
+- Enharmonic equivalents: `G#m` = `Abm` → `1A`, `F#` = `Gb` → `2B`
+
+All 24 keys mapped. Configurable fallback: `_Unknown Key`.
+
+### New — Label normalisation (`{label}` token)
+
+Record label tags are read from `organization`, `label`, `publisher`, and `TPUB` fields.
+Corporate suffixes are stripped: Records, Recordings, Music, Entertainment, Ltd, Inc, LLC.
+Handles stacked suffixes: `Sub Pop Records LLC` → `Sub Pop`.
+
+Configurable fallback: `_Unknown Label`.
+
+### New — Tag reading expanded
+
+`read_audio_tags()` now reads genre, BPM, key, and label from all audio formats:
+
+| Tag | Keys searched |
+|-----|---------------|
+| `genre` | `genre`, `TCON` |
+| `bpm` | `bpm`, `tbpm`, `TBPM` |
+| `key` | `initialkey`, `key`, `tkey`, `TKEY` |
+| `label` | `organization`, `label`, `publisher`, `TPUB` |
+
+### New — Vote counting for BPM, key, and label
+
+`build_folder_proposal()` now collects BPM (median of all tracks), key (plurality vote),
+and label (plurality vote) alongside existing album/artist/genre votes. All values are
+passed to `resolve_library_path()` for template substitution.
+
+### New — Tag coverage report after scan
+
+After scanning, RaagDosa detects which tokens your active template uses and reports per-token
+tag coverage with colour-coded bars (green ≥80%, yellow ≥50%, red <50%).
+
+### New — `--template` flag on profile commands
+
+`raagdosa profile add --template genre` and `raagdosa profile set --template dated` bind a
+built-in template to a profile. The template ID is stored in the profile's `library.template` key.
+
+### Config keys added
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `tags.label_keys` | `[organization, label, publisher, TPUB]` | Tag keys to read for label |
+| `bpm_buckets.width` | `10` | Numeric BPM bucket width |
+| `bpm_buckets.named_zones` | 5 zones | Named BPM ranges (checked first) |
+| `genre_map` | 150+ entries | Raw genre → canonical name mapping |
+| `library.bpm_fallback` | `_Unknown BPM` | Folder name when BPM tag is missing |
+| `library.key_fallback` | `_Unknown Key` | Folder name when key tag is missing |
+| `library.label_fallback` | `_Unknown Label` | Folder name when label tag is missing |
+
+---
+
 ## [5.5.0] — 2026-03-08
 
 ### Release summary

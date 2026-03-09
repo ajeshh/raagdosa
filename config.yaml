@@ -159,8 +159,10 @@ tags:
   discnumber_keys:  [discnumber, disc, TPOS]
   # originaldate preferred — captures original release year, not remaster date
   year_keys_prefer: [originaldate, original_date, date, year, TDRC, TYER]
+  genre_keys:       [genre, TCON]
   bpm_keys:         [bpm, tbpm, TBPM]
   key_keys:         [initialkey, key, tkey, TKEY]
+  label_keys:       [organization, label, publisher, TPUB]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # VOTING NORMALISATION
@@ -442,6 +444,236 @@ dj_safety:
     - Serato Scratch
     - Serato DJ
     - PIONEER
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GENRE MAP
+# ──────────────────────────────────────────────────────────────────────────────
+# BPM BUCKETS
+# Used when the template contains {bpm_range}.
+# Tracks are bucketed into ranges. Named zones override numeric ranges.
+# ──────────────────────────────────────────────────────────────────────────────
+bpm_buckets:
+  width: 10               # Numeric bucket width: 120-129, 130-139, etc.
+  named_zones:             # Optional named overrides (checked first, order matters)
+    "Downtempo":    [60, 99]
+    "Mid-Tempo":    [100, 119]
+    "House":        [120, 132]
+    "Techno":       [133, 145]
+    "D&B / Jungle": [160, 180]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalizes messy genre tags into canonical folder names.
+# Used when the template contains {genre}. Raw tag value → canonical name.
+# Case-insensitive matching. Unmapped genres pass through as-is.
+# ──────────────────────────────────────────────────────────────────────────────
+genre_map:
+  # ── Electronic ──
+  "Electronica":           "Electronic"
+  "Electro":               "Electronic"
+  "IDM":                   "Electronic"
+  "Synth-pop":             "Electronic"
+  "Synthwave":             "Electronic"
+  "Chillwave":             "Electronic"
+  "Downtempo":             "Electronic"
+  "Trip-Hop":              "Electronic"
+  "Trip Hop":              "Electronic"
+  "Glitch":                "Electronic"
+  "Experimental Electronic": "Electronic"
+
+  # ── House ──
+  "Tech House":            "House"
+  "Deep House":            "House"
+  "Afro House":            "House"
+  "Soulful House":         "House"
+  "Acid House":            "House"
+  "Progressive House":     "House"
+  "Melodic House":         "House"
+  "Disco House":           "House"
+  "Jackin House":          "House"
+  "Funky House":           "House"
+  "Organic House":         "House"
+  "Minimal House":         "House"
+  "Chicago House":         "House"
+  "Electro House":         "House"
+  "Nu-Disco":              "House"
+  "Nu Disco":              "House"
+
+  # ── Techno ──
+  "Minimal Techno":        "Techno"
+  "Melodic Techno":        "Techno"
+  "Peak Time Techno":      "Techno"
+  "Hard Techno":           "Techno"
+  "Industrial Techno":     "Techno"
+  "Acid Techno":           "Techno"
+  "Detroit Techno":        "Techno"
+  "Dub Techno":            "Techno"
+  "Minimal":               "Techno"
+
+  # ── Drum & Bass ──
+  "Drum and Bass":         "Drum & Bass"
+  "DnB":                   "Drum & Bass"
+  "D&B":                   "Drum & Bass"
+  "Liquid DnB":            "Drum & Bass"
+  "Liquid Drum and Bass":  "Drum & Bass"
+  "Neurofunk":             "Drum & Bass"
+  "Jump Up":               "Drum & Bass"
+  "Jungle":                "Drum & Bass"
+  "Breakcore":             "Drum & Bass"
+
+  # ── Bass ──
+  "Dubstep":               "Bass"
+  "Future Bass":           "Bass"
+  "Trap":                  "Bass"
+  "Grime":                 "Bass"
+  "UK Bass":               "Bass"
+  "UK Garage":             "Bass"
+  "UKG":                   "Bass"
+  "Garage":                "Bass"
+  "2-Step":                "Bass"
+  "Bassline":              "Bass"
+  "Future Garage":         "Bass"
+
+  # ── Ambient ──
+  "Dark Ambient":          "Ambient"
+  "Drone":                 "Ambient"
+  "New Age":               "Ambient"
+  "Space Music":           "Ambient"
+  "Meditation":            "Ambient"
+
+  # ── Hip-Hop ──
+  "Hip Hop":               "Hip-Hop"
+  "Rap":                   "Hip-Hop"
+  "Boom Bap":              "Hip-Hop"
+  "Trap Rap":              "Hip-Hop"
+  "East Coast Hip Hop":    "Hip-Hop"
+  "West Coast Hip Hop":    "Hip-Hop"
+  "Instrumental Hip Hop":  "Hip-Hop"
+  "Lo-Fi Hip Hop":         "Hip-Hop"
+  "Lofi Hip Hop":          "Hip-Hop"
+  "Abstract Hip Hop":      "Hip-Hop"
+
+  # ── Jazz ──
+  "Nu-Jazz":               "Jazz"
+  "Nu Jazz":               "Jazz"
+  "Acid Jazz":             "Jazz"
+  "Jazz Fusion":           "Jazz"
+  "Fusion":                "Jazz"
+  "Smooth Jazz":           "Jazz"
+  "Latin Jazz":            "Jazz"
+  "Free Jazz":             "Jazz"
+  "Spiritual Jazz":        "Jazz"
+  "Modal Jazz":            "Jazz"
+
+  # ── Soul / Funk / R&B ──
+  "Neo-Soul":              "Soul & Funk"
+  "Neo Soul":              "Soul & Funk"
+  "Soul":                  "Soul & Funk"
+  "Funk":                  "Soul & Funk"
+  "R&B":                   "Soul & Funk"
+  "RnB":                   "Soul & Funk"
+  "Motown":                "Soul & Funk"
+  "Disco":                 "Soul & Funk"
+  "Boogie":                "Soul & Funk"
+
+  # ── Reggae / Dub ──
+  "Dub":                   "Reggae & Dub"
+  "Reggae":                "Reggae & Dub"
+  "Dancehall":             "Reggae & Dub"
+  "Roots Reggae":          "Reggae & Dub"
+  "Ska":                   "Reggae & Dub"
+  "Rocksteady":            "Reggae & Dub"
+
+  # ── World ──
+  "Afrobeat":              "World"
+  "Afrobeats":             "World"
+  "Latin":                 "World"
+  "Cumbia":                "World"
+  "Bossa Nova":            "World"
+  "Fado":                  "World"
+  "Highlife":              "World"
+  "Tropicalia":            "World"
+  "Balearic":              "World"
+  "Ethio-Jazz":            "World"
+
+  # ── Rock / Indie ──
+  "Indie Rock":            "Rock"
+  "Alternative":           "Rock"
+  "Alternative Rock":      "Rock"
+  "Post-Punk":             "Rock"
+  "Post-Rock":             "Rock"
+  "Shoegaze":              "Rock"
+  "Psychedelic Rock":      "Rock"
+  "Krautrock":             "Rock"
+  "Math Rock":             "Rock"
+  "Noise Rock":            "Rock"
+  "Garage Rock":           "Rock"
+  "Grunge":                "Rock"
+  "Punk":                  "Rock"
+  "Punk Rock":             "Rock"
+  "Hardcore Punk":         "Rock"
+
+  # ── Classical / Soundtrack ──
+  "Classical":             "Classical"
+  "Contemporary Classical": "Classical"
+  "Modern Classical":      "Classical"
+  "Orchestral":            "Classical"
+  "Chamber Music":         "Classical"
+  "Opera":                 "Classical"
+  "Soundtrack":            "Soundtrack"
+  "Score":                 "Soundtrack"
+  "Film Score":            "Soundtrack"
+  "Video Game Music":      "Soundtrack"
+
+  # ── Pop ──
+  "Indie Pop":             "Pop"
+  "Synth Pop":             "Pop"
+  "Art Pop":               "Pop"
+  "Dream Pop":             "Pop"
+  "K-Pop":                 "Pop"
+  "J-Pop":                 "Pop"
+  "Europop":               "Pop"
+  "Dance Pop":             "Pop"
+
+  # ── Metal ──
+  "Heavy Metal":           "Metal"
+  "Death Metal":           "Metal"
+  "Black Metal":           "Metal"
+  "Doom Metal":            "Metal"
+  "Stoner Metal":          "Metal"
+  "Progressive Metal":     "Metal"
+  "Thrash Metal":          "Metal"
+  "Metalcore":             "Metal"
+
+  # ── Folk / Country ──
+  "Folk":                  "Folk"
+  "Indie Folk":            "Folk"
+  "Neofolk":               "Folk"
+  "Country":               "Folk"
+  "Americana":             "Folk"
+  "Bluegrass":             "Folk"
+  "Singer-Songwriter":     "Folk"
+
+  # ── Experimental ──
+  "Experimental":          "Experimental"
+  "Noise":                 "Experimental"
+  "Musique Concrète":      "Experimental"
+  "Sound Art":             "Experimental"
+  "Field Recordings":      "Experimental"
+  "Avant-Garde":           "Experimental"
+
+  # ── Trance ──
+  "Psytrance":             "Trance"
+  "Progressive Trance":    "Trance"
+  "Goa Trance":            "Trance"
+  "Uplifting Trance":      "Trance"
+  "Vocal Trance":          "Trance"
+
+  # ── Catch-all cleanup ──
+  "Dance":                 "Electronic"
+  "Club":                  "Electronic"
+  "Other":                 "Electronic"
+  "Unknown":               "Electronic"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UNDO
 # ──────────────────────────────────────────────────────────────────────────────

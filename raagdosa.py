@@ -904,12 +904,148 @@ def folder_matches_ignore(folder_name:str,patterns:List[str])->bool:
     return False
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Library templates — builtin presets
+# ─────────────────────────────────────────────
+BUILTIN_TEMPLATES:Dict[str,Dict[str,Any]]={
+    "standard":      {"name":"Standard Archive",   "template":"{artist}/{album}",
+                      "description":"Artist → Album. Safe default for any collection.",
+                      "requires":[]},
+    "dated":         {"name":"Dated Archive",       "template":"{artist}/{year} - {album}",
+                      "description":"Artist → Year - Album. Chronological discography view.",
+                      "requires":["year"]},
+    "flat":          {"name":"Flat",                "template":"{artist} - {album}",
+                      "description":"Artist - Album in one folder. Minimal depth, fast browsing.",
+                      "requires":[]},
+    "bpm":           {"name":"DJ — BPM Zones",      "template":"{bpm_range}/{artist} - {album}",
+                      "description":"BPM range → Artist - Album. Tempo-first for single-genre DJs.",
+                      "requires":["bpm"],"note":"Best for track-level use. Album BPM uses average."},
+    "genre-bpm":     {"name":"DJ — Genre + BPM",    "template":"{genre}/{bpm_range}/{artist} - {album}",
+                      "description":"Genre → BPM → Artist - Album. Open-format DJ structure.",
+                      "requires":["genre","bpm"],"note":"Best for track-level use."},
+    "genre-bpm-key": {"name":"DJ — Harmonic",       "template":"{genre}/{bpm_range}/{camelot_key}/{artist} - {album}",
+                      "description":"Genre → BPM → Key → Artist. Harmonic mixing structure.",
+                      "requires":["genre","bpm","key"],"note":"Track-level only. Albums span multiple keys."},
+    "genre":         {"name":"Genre Curator",       "template":"{genre}/{artist}/{album}",
+                      "description":"Genre → Artist → Album. Best for large multi-genre collections.",
+                      "requires":["genre"]},
+    "label":         {"name":"Label Archive",       "template":"{label}/{artist} - {album}",
+                      "description":"Label → Artist - Album. For label-focused collectors.",
+                      "requires":["label"],"note":"Label tag is often unpopulated."},
+    "decade":        {"name":"Era / Decade",        "template":"{decade}/{genre}/{artist} - {album}",
+                      "description":"Decade → Genre → Artist - Album. Era-first browsing.",
+                      "requires":["year","genre"]},
+}
+
+# ─────────────────────────────────────────────
 # Library path template
 # ─────────────────────────────────────────────
+def _resolve_lib_cfg(profile:Dict[str,Any],cfg:Dict[str,Any])->Dict[str,Any]:
+    """Merge library config: profile-level overrides global, key by key."""
+    global_lib=cfg.get("library",{})
+    profile_lib=profile.get("library",{})
+    if not profile_lib: return dict(global_lib)
+    merged=dict(global_lib)
+    merged.update(profile_lib)
+    return merged
+
+def _derive_decade(year:Optional[int])->str:
+    if not year: return ""
+    return f"{(year//10)*10}s"
+
+def _normalize_genre(genre:Optional[str],cfg:Dict[str,Any])->str:
+    """Normalize a raw genre tag using the genre_map in config, if present."""
+    if not genre: return ""
+    g=genre.strip()
+    genre_map=cfg.get("genre_map",{})
+    # Case-insensitive lookup
+    for raw,canonical in genre_map.items():
+        if g.lower()==raw.lower(): return canonical
+    return g
+
+# ── Camelot wheel mapping ─────────────────────────────────────────────────
+# Maps raw musical key names to Camelot notation (used by DJs for harmonic mixing)
+_CAMELOT_MAP:Dict[str,str]={
+    # Minor keys → A column
+    "Abm":"1A","G#m":"1A",
+    "Ebm":"2A","D#m":"2A",
+    "Bbm":"3A","A#m":"3A",
+    "Fm":"4A",
+    "Cm":"5A",
+    "Gm":"6A",
+    "Dm":"7A",
+    "Am":"8A",
+    "Em":"9A",
+    "Bm":"10A",
+    "F#m":"11A","Gbm":"11A",
+    "C#m":"12A","Dbm":"12A",
+    # Major keys → B column
+    "B":"1B","Cb":"1B",
+    "F#":"2B","Gb":"2B",
+    "C#":"3B","Db":"3B",
+    "Ab":"4B","G#":"4B",
+    "Eb":"5B","D#":"5B",
+    "Bb":"6B","A#":"6B",
+    "F":"7B",
+    "C":"8B",
+    "G":"9B",
+    "D":"10B",
+    "A":"11B",
+    "E":"12B",
+}
+
+def _raw_key_to_camelot(key:Optional[str])->str:
+    """Convert a raw musical key tag to Camelot notation. Returns '' if unmapped."""
+    if not key: return ""
+    k=key.strip()
+    # Direct lookup (case-sensitive first for speed)
+    if k in _CAMELOT_MAP: return _CAMELOT_MAP[k]
+    # Normalize: try common formats — "A minor" → "Am", "C major" → "C"
+    k2=re.sub(r"\s*(minor|min)\s*$","m",k,flags=re.IGNORECASE)
+    k2=re.sub(r"\s*(major|maj)\s*$","",k2,flags=re.IGNORECASE)
+    k2=k2.strip()
+    if k2 in _CAMELOT_MAP: return _CAMELOT_MAP[k2]
+    # Try capitalizing first letter (e.g. "am" → "Am", "c" → "C")
+    k3=k2[0].upper()+k2[1:] if len(k2)>1 else k2.upper()
+    if k3 in _CAMELOT_MAP: return _CAMELOT_MAP[k3]
+    return ""
+
+def _compute_bpm_range(bpm:Optional[float],cfg:Dict[str,Any])->str:
+    """Bucket a BPM value into a range string using config-defined buckets."""
+    if not bpm or bpm<=0: return ""
+    bpm_cfg=cfg.get("bpm_buckets",{})
+    # Check named zones first (order matters)
+    named=bpm_cfg.get("named_zones",{})
+    for zone_name,bounds in named.items():
+        if isinstance(bounds,(list,tuple)) and len(bounds)==2:
+            if bounds[0]<=bpm<=bounds[1]:
+                return zone_name
+    # Fall back to numeric bucket
+    width=int(bpm_cfg.get("width",10))
+    lo=int(bpm//width)*width
+    hi=lo+width-1
+    return f"{lo}-{hi}"
+
+def _normalize_label(label:Optional[str],cfg:Dict[str,Any])->str:
+    """Normalize a raw label/publisher tag. Strips common suffixes."""
+    if not label: return ""
+    l=label.strip()
+    # Strip common corporate suffixes (loop to handle stacked: "Records LLC")
+    for _ in range(3):
+        l2=re.sub(r"\s*(Records?|Recordings?|Music|Entertainment|Ltd\.?|Inc\.?|LLC)\s*$","",l,flags=re.IGNORECASE).strip()
+        if l2==l: break
+        l=l2
+    return l
+
 def resolve_library_path(base:Path,artist:str,album:str,year:Optional[int],
                           is_flac_only:bool,is_va:bool,is_single:bool,
-                          is_mix:bool,cfg:Dict[str,Any])->Path:
-    lib=cfg.get("library",{})
+                          is_mix:bool,cfg:Dict[str,Any],
+                          profile:Optional[Dict[str,Any]]=None,
+                          genre:Optional[str]=None,
+                          bpm:Optional[float]=None,
+                          key:Optional[str]=None,
+                          label:Optional[str]=None)->Path:
+    lib=_resolve_lib_cfg(profile or {},cfg)
     template=lib.get("template","{artist}/{album}")
     va_folder=lib.get("va_folder","_Various Artists")
     singles_folder=lib.get("singles_folder","_Singles")
@@ -926,8 +1062,30 @@ def resolve_library_path(base:Path,artist:str,album:str,year:Optional[int],
     if is_single: return base/artist_c/singles_folder
     if flac_seg and is_flac_only: return base/artist_c/"FLAC"/album_c
 
+    # Resolve all token values for template substitution
+    genre_val=_normalize_genre(genre,cfg)
+    decade_val=_derive_decade(year)
+    bpm_range_val=_compute_bpm_range(bpm,cfg)
+    camelot_val=_raw_key_to_camelot(key)
+    label_val=_normalize_label(label,cfg)
+    # Fallback labels for missing token data
+    genre_fallback=lib.get("genre_fallback","_Unsorted")
+    decade_fallback=lib.get("decade_fallback","_Unknown Era")
+    bpm_fallback=lib.get("bpm_fallback","_Unknown BPM")
+    key_fallback=lib.get("key_fallback","_Unknown Key")
+    label_fallback=lib.get("label_fallback","_Unknown Label")
+
+    tokens={
+        "artist":artist_c, "album":album_c,
+        "year":year or "", "album_year":album_y,
+        "genre":genre_val or genre_fallback,
+        "decade":decade_val or decade_fallback,
+        "bpm_range":bpm_range_val or bpm_fallback,
+        "camelot_key":camelot_val or key_fallback,
+        "label":label_val or label_fallback,
+    }
     try:
-        sub=template.format(artist=artist_c,album=album_c,year=year or "",album_year=album_y)
+        sub=template.format(**tokens)
     except KeyError:
         sub=f"{artist_c}/{album_c}"
     return base/sub
@@ -1238,7 +1396,7 @@ def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
         if cached is not None: return cached
 
     keys=cfg.get("tags",{})
-    result:Dict[str,Optional[str]]={k:None for k in ["album","albumartist","artist","title","tracknumber","discnumber","year","bpm","key"]}
+    result:Dict[str,Optional[str]]={k:None for k in ["album","albumartist","artist","title","tracknumber","discnumber","year","bpm","key","genre","label"]}
     if MutagenFile is None: return result
     try:
         mf=MutagenFile(str(path),easy=True)
@@ -1254,6 +1412,8 @@ def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
         result["discnumber"] =mutagen_first(t,keys.get("discnumber_keys",["discnumber"]))
         result["bpm"]        =mutagen_first(t,keys.get("bpm_keys",["bpm","tbpm"]))
         result["key"]        =mutagen_first(t,keys.get("key_keys",["initialkey","key"]))
+        result["genre"]      =mutagen_first(t,keys.get("genre_keys",["genre"]))
+        result["label"]      =mutagen_first(t,keys.get("label_keys",["organization","label","publisher"]))
         for yk in keys.get("year_keys_prefer",["date","year"]):
             if yk in t:
                 yv=t.get(yk); yv=yv[0] if isinstance(yv,list) else yv
@@ -2053,6 +2213,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     if override and override.get("skip"): return None
 
     albums_norm:Counter=Counter(); albumartists_norm:Counter=Counter(); track_artists_norm:Counter=Counter(); years:Counter=Counter()
+    genres:Counter=Counter(); labels:Counter=Counter(); bpms:List[float]=[]; keys_raw:Counter=Counter()
     albums_raw:Dict[str,Counter]={}; albumartists_raw:Dict[str,Counter]={}
     tracks_with_year=0; tagged=0; unreadable=0
     extensions:Counter=Counter(p.suffix.lower() for p in audio_files)
@@ -2064,6 +2225,10 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         if all(v is None for v in tags.values()): unreadable+=1; continue
         alb_r=(tags.get("album") or "").strip(); aa_r=(tags.get("albumartist") or "").strip()
         art_r=(tags.get("artist") or "").strip(); yr_r=(tags.get("year") or "").strip()
+        genre_r=(tags.get("genre") or "").strip()
+        label_r=(tags.get("label") or "").strip()
+        bpm_r=(tags.get("bpm") or "").strip()
+        key_r=(tags.get("key") or "").strip()
 
         # Strip display noise and disc indicators from album for voting
         alb_r_clean=strip_disc_indicator(strip_display_noise(alb_r)) if alb_r else alb_r
@@ -2074,6 +2239,12 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         if alb_n: albums_norm[alb_n]+=1; albums_raw.setdefault(alb_n,Counter())[alb_r_clean or alb_r]+=1
         if aa_n:  albumartists_norm[aa_n]+=1; albumartists_raw.setdefault(aa_n,Counter())[aa_r]+=1
         if art_n: track_artists_norm[art_n]+=1
+        if genre_r: genres[genre_r]+=1
+        if label_r: labels[label_r]+=1
+        if key_r: keys_raw[key_r]+=1
+        if bpm_r:
+            try: bpms.append(float(re.sub(r"[^\d.]","",bpm_r)))
+            except ValueError: pass
         if yr_r:
             m=re.search(r"(\d{4})",yr_r)
             if m: years[m.group(1)]+=1; tracks_with_year+=1
@@ -2200,9 +2371,21 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
             proposed=f"{proposed} [{ext1.lstrip('.').upper()}]"
 
     is_flac_only=set(extensions.keys())=={".flac"}
+    # Genre/label: plurality vote (raw display form — normalization happens in resolve_library_path)
+    dom_genre,_,_=compute_dominant(genres)
+    dom_label,_,_=compute_dominant(labels)
+    dom_key,_,_=compute_dominant(keys_raw)
+    # BPM: use median of all tracks (more robust than mode for continuous values)
+    avg_bpm:Optional[float]=None
+    if bpms:
+        sorted_bpms=sorted(bpms)
+        mid=len(sorted_bpms)//2
+        avg_bpm=sorted_bpms[mid] if len(sorted_bpms)%2 else (sorted_bpms[mid-1]+sorted_bpms[mid])/2
     clean_albums=derive_clean_albums_root(profile,source_root)
     target_dir=resolve_library_path(clean_albums,artist_for_folder,dom_alb,year_val,
-                                     is_flac_only,is_va,False,is_mix,cfg)
+                                     is_flac_only,is_va,False,is_mix,cfg,
+                                     profile=profile,genre=dom_genre,
+                                     bpm=avg_bpm,key=dom_key,label=dom_label)
 
     # ── named confidence factors ─────────────────────────────────────────
     conf_factors=compute_confidence_factors(
@@ -2221,6 +2404,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         "dominant_artist":dom_art_n,"dominant_artist_share":art_share,
         "is_va":is_va,"is_mix":is_mix,"is_ep":is_ep,"folder_type":folder_type,
         "albumartist_display":artist_for_folder,"year":year_val,"year_meta":year_meta,
+        "genre":dom_genre,"label":dom_label,"bpm":avg_bpm,"key":dom_key,
         "unreadable_ratio":(unreadable/total) if total else 0.0,
         "used_heuristic":used_heuristic,"is_flac_only":is_flac_only,
         "garbage_reasons":garbage,"confidence_factors":conf_factors,
@@ -2405,6 +2589,27 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     since_note=f"  (since {since.strftime('%Y-%m-%d %H:%M')})" if since else ""
     out(f"\n{C.BOLD}Session:{C.RESET}   {session_id}")
     out(f"{C.BOLD}Results:{C.RESET}   {len(proposals)} proposals{since_note} | {C.GREEN}Clean: {clean_n}{C.RESET} | {C.YELLOW}Review: {rev_n}{C.RESET} | {C.RED}Dupes: {dup_n}{C.RESET}")
+
+    # Tag coverage summary — shows how well populated the tags are for the active template
+    lib=_resolve_lib_cfg(profile,cfg)
+    tpl=lib.get("template","{artist}/{album}")
+    # Detect which tokens the template uses
+    tpl_tokens=set(re.findall(r"\{(\w+)\}",tpl))
+    # Map tokens to the tag field needed
+    _TOKEN_TAG_MAP={"genre":"genre","decade":"year","bpm_range":"bpm","camelot_key":"key","label":"label"}
+    needed={tok:_TOKEN_TAG_MAP[tok] for tok in tpl_tokens if tok in _TOKEN_TAG_MAP}
+    if needed and proposals:
+        total_folders=len(proposals)
+        out(f"\n{C.BOLD}Tag coverage{C.RESET} (for template: {tpl})")
+        for tok,tag_key in sorted(needed.items()):
+            has_count=sum(1 for p in proposals if p.decision.get(tag_key))
+            pct=int(has_count/total_folders*100) if total_folders else 0
+            color=C.GREEN if pct>=80 else (C.YELLOW if pct>=50 else C.RED)
+            out(f"  {tok:<14} {color}{has_count}/{total_folders} folders ({pct}%){C.RESET}")
+        missing_count=sum(1 for p in proposals for tok,tag_key in needed.items() if not p.decision.get(tag_key))
+        if missing_count:
+            out(f"  {C.DIM}Folders with missing tags will be placed under fallback folders (_Unsorted, etc.){C.RESET}")
+
     out(f"{C.DIM}Reports:   {session_dir}/report.{{txt,csv,html}}{C.RESET}")
     return session_id,session_dir,proposals
 
@@ -4250,22 +4455,44 @@ def profile_show(cfg:Dict[str,Any],name:str)->None:
     if not p: err("No such profile."); return
     out(json.dumps(p,indent=2))
 
-def profile_add(cfg_path:Path,cfg:Dict[str,Any],name:str,source:str,clean_mode:str,clean_folder:str,review_folder:str)->None:
+def profile_add(cfg_path:Path,cfg:Dict[str,Any],name:str,source:str,clean_mode:str,clean_folder:str,review_folder:str,template:Optional[str]=None)->None:
     cfg.setdefault("profiles",{})
     if name in cfg["profiles"]: raise ValueError("Profile already exists.")
-    cfg["profiles"][name]={"source_root":source,"clean_mode":clean_mode,"clean_folder_name":clean_folder,
-                            "review_folder_name":review_folder,"clean_albums_folder_name":"Albums",
-                            "clean_tracks_folder_name":"Tracks","review_albums_folder_name":"Albums",
-                            "duplicates_folder_name":"Duplicates","orphans_folder_name":"Orphans"}
+    prof:Dict[str,Any]={"source_root":source,"clean_mode":clean_mode,"clean_folder_name":clean_folder,
+                         "review_folder_name":review_folder,"clean_albums_folder_name":"Albums",
+                         "clean_tracks_folder_name":"Tracks","review_albums_folder_name":"Albums",
+                         "duplicates_folder_name":"Duplicates","orphans_folder_name":"Orphans"}
+    if template:
+        tpl=BUILTIN_TEMPLATES.get(template)
+        if tpl:
+            prof["library"]={"template":tpl["template"]}
+            out(f"  Template: {template} ({tpl['name']})")
+            if tpl.get("requires"):
+                out(f"  {C.DIM}Requires tags: {', '.join(tpl['requires'])}{C.RESET}")
+        else:
+            prof["library"]={"template":template}
+            out(f"  Template: {template}")
+    cfg["profiles"][name]=prof
     write_yaml(cfg_path,cfg); out(f"Added profile: {name}")
 
-def profile_set(cfg_path:Path,cfg:Dict[str,Any],name:str,source:Optional[str],clean_mode:Optional[str],clean_folder:Optional[str],review_folder:Optional[str])->None:
+def profile_set(cfg_path:Path,cfg:Dict[str,Any],name:str,source:Optional[str],clean_mode:Optional[str],clean_folder:Optional[str],review_folder:Optional[str],template:Optional[str]=None)->None:
     prof=cfg.get("profiles",{}).get(name)
     if not prof: raise ValueError("No such profile.")
     if source:        prof["source_root"]=source
     if clean_mode:    prof["clean_mode"]=clean_mode
     if clean_folder:  prof["clean_folder_name"]=clean_folder
     if review_folder: prof["review_folder_name"]=review_folder
+    if template:
+        tpl=BUILTIN_TEMPLATES.get(template)
+        if tpl:
+            prof.setdefault("library",{})["template"]=tpl["template"]
+            out(f"  Template set to: {template} ({tpl['name']})")
+            if tpl.get("requires"):
+                out(f"  {C.DIM}Requires tags: {', '.join(tpl['requires'])}{C.RESET}")
+        else:
+            # Assume it's a raw template string like "{genre}/{artist}/{album}"
+            prof.setdefault("library",{})["template"]=template
+            out(f"  Template set to: {template}")
     write_yaml(cfg_path,cfg); out(f"Updated profile: {name}")
 
 def profile_delete(cfg_path:Path,cfg:Dict[str,Any],name:str)->None:
@@ -4277,6 +4504,68 @@ def profile_delete(cfg_path:Path,cfg:Dict[str,Any],name:str)->None:
 def profile_use(cfg_path:Path,cfg:Dict[str,Any],name:str)->None:
     if name not in cfg.get("profiles",{}): raise ValueError("No such profile.")
     cfg["active_profile"]=name; write_yaml(cfg_path,cfg); out(f"Active profile: {name}")
+
+# ─────────────────────────────────────────────
+# Template commands
+# ─────────────────────────────────────────────
+_TEMPLATE_EXAMPLES:Dict[str,List[str]]={
+    "standard":["Bicep/","  Isles (2021)/","  Isles Deluxe (2022)/","Floating Points/","  Crush (2019)/"],
+    "dated":["Aphex Twin/","  1994 - Selected Ambient Works Vol II/","  2001 - Drukqs/","Burial/","  2007 - Untrue/"],
+    "flat":["Bicep - Isles/","Burial - Untrue/","Four Tet - There Is Love In You/"],
+    "bpm":["120-124 BPM/","  Bicep - Isles/","125-129 BPM/","  Amelie Lens - Higher/","_Unsorted/","  Unknown - Untitled/"],
+    "genre-bpm":["House/","  120-124/","    Bicep - Isles/","Techno/","  130-134/","    Charlotte de Witte - Doppler/"],
+    "genre-bpm-key":["Melodic Techno/","  125-129/","    8A/","      Tale Of Us - Afterlife 001/"],
+    "genre":["Electronic/","  Bicep/","    Isles (2021)/","Jazz/","  Kamasi Washington/","    The Epic (2015)/","_Unsorted/","  Unknown Artist/","    Untitled/"],
+    "label":["Warp Records/","  Aphex Twin - Selected Ambient Works/","4AD/","  Cocteau Twins - Heaven or Las Vegas/","_Unsorted/","  Unknown - Demo/"],
+    "decade":["1990s/","  Drum & Bass/","    Goldie - Timeless/","2020s/","  Electronic/","    Bicep - Isles/"],
+}
+
+def cmd_template_list(cfg:Dict[str,Any])->None:
+    """List all builtin templates and show which one is active per profile."""
+    active_profile=cfg.get("active_profile","")
+    active_tpl=""
+    if active_profile:
+        prof=cfg.get("profiles",{}).get(active_profile,{})
+        lib=_resolve_lib_cfg(prof,cfg)
+        active_tpl=lib.get("template","{artist}/{album}")
+
+    out(f"\n{C.BOLD}Library Templates{C.RESET}")
+    out(f"{'  ID':<18}{'Name':<22}{'Pattern':<45}{'Tags'}")
+    out(f"  {'─'*16}  {'─'*20}  {'─'*43}  {'─'*15}")
+    for tid,t in BUILTIN_TEMPLATES.items():
+        marker=""
+        if t["template"]==active_tpl:
+            marker=f" {C.GREEN}← active{C.RESET}"
+        reqs=", ".join(t.get("requires",[])) or "—"
+        out(f"  {tid:<16}  {t['name']:<20}  {t['template']:<43}  {reqs}{marker}")
+    out(f"\n  {C.DIM}Set on a profile: raagdosa profile set <name> --template <id>{C.RESET}")
+    out(f"  {C.DIM}Or in config.yaml under profiles.<name>.library.template{C.RESET}\n")
+
+def cmd_template_show(cfg:Dict[str,Any],name:str)->None:
+    """Show details and example tree for a template."""
+    t=BUILTIN_TEMPLATES.get(name)
+    if not t:
+        # Check if it matches an active profile's custom template
+        err(f"Unknown template: {name}")
+        out(f"  Available: {', '.join(BUILTIN_TEMPLATES.keys())}")
+        return
+    out(f"\n{C.BOLD}Template: {name}{C.RESET} — {t['name']}")
+    out(f"Pattern:  {t['template']}")
+    out(f"{t['description']}")
+    if t.get("note"):
+        out(f"{C.YELLOW}Note:{C.RESET} {t['note']}")
+    reqs=t.get("requires",[])
+    if reqs:
+        out(f"\n{C.BOLD}Required tags:{C.RESET} {', '.join(reqs)}")
+        out(f"  {C.DIM}Albums missing these tags will go to the fallback folder (_Unsorted).{C.RESET}")
+    else:
+        out(f"\n{C.BOLD}Required tags:{C.RESET} none (works with any metadata)")
+    examples=_TEMPLATE_EXAMPLES.get(name,[])
+    if examples:
+        out(f"\n{C.BOLD}Example tree:{C.RESET}  Clean/Albums/")
+        for line in examples:
+            out(f"  {C.CYAN}{line}{C.RESET}")
+    out("")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4781,8 +5070,13 @@ Examples:
     add=psub.add_parser("add"); add.add_argument("name"); add.add_argument("--source",required=True)
     add.add_argument("--clean-mode",default="inside_root",choices=["inside_root","inside_parent"])
     add.add_argument("--clean-folder",default="Clean"); add.add_argument("--review-folder",default="Review")
+    add.add_argument("--template",metavar="TEMPLATE",help="Builtin template ID or custom pattern (e.g. 'genre' or '{genre}/{artist}/{album}')")
     setp=psub.add_parser("set"); setp.add_argument("name"); setp.add_argument("--source"); setp.add_argument("--clean-mode"); setp.add_argument("--clean-folder"); setp.add_argument("--review-folder")
+    setp.add_argument("--template",metavar="TEMPLATE",help="Builtin template ID or custom pattern")
     psub.add_parser("delete").add_argument("name"); psub.add_parser("use").add_argument("name")
+    # Template commands
+    tp=sub.add_parser("template",help="Library organisation templates"); tsub=tp.add_subparsers(dest="template_cmd",required=True)
+    tsub.add_parser("list",help="List all builtin templates"); tsub.add_parser("show",help="Show template details and example tree").add_argument("name")
     sc=sub.add_parser("scan",help="Scan → proposals.json"); sc.add_argument("--profile"); sc.add_argument("--out"); sc.add_argument("--since")
     sc.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
     sc.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
@@ -4881,10 +5175,14 @@ def main()->None:
         pc=args.profile_cmd
         if pc=="list":    profile_list(cfg)
         elif pc=="show":  profile_show(cfg,args.name)
-        elif pc=="add":   profile_add(cfg_path,cfg,args.name,args.source,args.clean_mode,args.clean_folder,args.review_folder)
-        elif pc=="set":   profile_set(cfg_path,cfg,args.name,args.source,args.clean_mode,args.clean_folder,args.review_folder)
+        elif pc=="add":   profile_add(cfg_path,cfg,args.name,args.source,args.clean_mode,args.clean_folder,args.review_folder,template=getattr(args,"template",None))
+        elif pc=="set":   profile_set(cfg_path,cfg,args.name,args.source,args.clean_mode,args.clean_folder,args.review_folder,template=getattr(args,"template",None))
         elif pc=="delete": profile_delete(cfg_path,cfg,args.name)
         elif pc=="use":   profile_use(cfg_path,cfg,args.name)
+    elif cmd=="template":
+        tc=args.template_cmd
+        if tc=="list":   cmd_template_list(cfg)
+        elif tc=="show": cmd_template_show(cfg,args.name)
     elif cmd=="scan":
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
         cmd_scan(cfg_path,cfg,gp(),args.out,getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))

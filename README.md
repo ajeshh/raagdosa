@@ -11,7 +11,7 @@
 
 **Deterministic music library cleanup for DJs and collectors.**
 
-[![Version](https://img.shields.io/badge/version-5.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-6.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
 [![Python versions](https://img.shields.io/pypi/pyversions/raagdosa?style=flat-square&color=0d1117&labelColor=21262d&logo=python&logoColor=f5f5f5)](https://pypi.org/project/raagdosa/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square&color=0d1117&labelColor=21262d)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=flat-square&color=0d1117&labelColor=21262d&logo=github-actions&logoColor=f5f5f5)](https://github.com/raagdosa/raagdosa/actions)
@@ -142,10 +142,11 @@ RaagDosa reads every audio tag it can find — not just artist and album, but `c
 | `genre` | "EP" or "Single" in genre tag → EP/Single classification |
 | `grouping` | EP/Single signals from grouping field |
 | `comment` | Year fallback — scans comment text for 4-digit year when year tag is missing |
-| `label` | Detects when a record label name has contaminated the albumartist tag |
+| `label` | Detects label-as-albumartist contamination; `{label}` template token for label-first folder structures |
 | `albumartist` | Primary artist for folder naming and VA detection |
 | `artist` | Per-track artist for VA ratio calculation |
-| `bpm`, `key` | Available for future DJ-specific routing |
+| `bpm` | `{bpm_range}` template token — buckets into named zones (House, Techno, D&B) or numeric ranges |
+| `key` | `{camelot_key}` template token — converts to Camelot notation (1A–12B) for harmonic mixing folders |
 | `isrc` | Available for future deduplication |
 
 When both a tag and the folder name agree on a value, confidence is boosted. When they disagree, the tag wins but confidence is reduced — potentially routing to Review.
@@ -225,6 +226,106 @@ Routing:    ✦ clean → Clean/Albums/DJ Shadow/Endtroducing..... (1996)/
 | Tags absent, folder name used as fallback | `Review/Albums/` |
 
 Review is a **holding area**, not a bin. Nothing is ever deleted.
+
+---
+
+## Library profiles & templates
+
+Profiles let you run RaagDosa against different source folders with different settings. Each profile can use a different **library template** to control how albums land in your Clean folder.
+
+```bash
+raagdosa template list              # see all 9 built-in templates
+raagdosa template show genre-bpm    # full details + example tree
+raagdosa profile add vinyl --source ~/Music/Vinyl --template dated
+raagdosa profile set default --template genre
+```
+
+### Built-in templates
+
+| ID | Pattern | Best for |
+|----|---------|----------|
+| `standard` | `{artist}/{album}` | Safe default for any collection |
+| `dated` | `{artist}/{year} - {album}` | Chronological discography view |
+| `flat` | `{artist} - {album}` | Minimal depth, fast browsing |
+| `genre` | `{genre}/{artist}/{album}` | Large multi-genre collections |
+| `decade` | `{decade}/{genre}/{artist} - {album}` | Era-first browsing |
+| `bpm` | `{bpm_range}/{artist} - {album}` | Tempo-first for single-genre DJs |
+| `genre-bpm` | `{genre}/{bpm_range}/{artist} - {album}` | Open-format DJ structure |
+| `genre-bpm-key` | `{genre}/{bpm_range}/{camelot_key}/{artist} - {album}` | Harmonic mixing structure |
+| `label` | `{label}/{artist} - {album}` | Label-focused collectors |
+
+### Template tokens
+
+| Token | Source | Fallback |
+|-------|--------|----------|
+| `{artist}` | Voted albumartist tag | `_Unknown` |
+| `{album}` | Voted album tag | `_Untitled` |
+| `{year}` | Year tag or folder name | empty |
+| `{album_year}` | `Album (Year)` combined | album only |
+| `{genre}` | Voted genre tag, normalised via `genre_map` | `_Unsorted` |
+| `{decade}` | Derived from year (e.g. `1990s`) | `_Unknown Era` |
+| `{bpm_range}` | Median BPM bucketed into named zones or numeric ranges | `_Unknown BPM` |
+| `{camelot_key}` | Voted key tag converted to Camelot notation (1A–12B) | `_Unknown Key` |
+| `{label}` | Voted label tag, corporate suffixes stripped | `_Unknown Label` |
+
+All fallback labels are configurable in `config.yaml` under `library:`.
+
+### Per-profile library overrides
+
+Each profile can override the global `library:` block:
+
+```yaml
+profiles:
+  default:
+    source_root: ~/Music/Incoming
+    library:
+      template: "{artist}/{album}"
+
+  dj-usb:
+    source_root: ~/Music/DJ-Prep
+    library:
+      template: "{genre}/{bpm_range}/{artist} - {album}"
+      genre_fallback: "_Unsorted"
+      bpm_fallback: "_Unknown BPM"
+```
+
+### BPM buckets
+
+BPM bucketing is configurable. Named zones are checked first; unmatched BPMs fall to numeric ranges:
+
+```yaml
+bpm_buckets:
+  width: 10                 # 120-129, 130-139, etc.
+  named_zones:
+    "Downtempo":    [60, 99]
+    "House":        [120, 132]
+    "Techno":       [133, 145]
+    "D&B / Jungle": [160, 180]
+```
+
+### Genre normalisation
+
+A 150+ entry `genre_map` in config.yaml maps raw genre tags to canonical folder names:
+
+```yaml
+genre_map:
+  "Electronica":     "Electronic"
+  "Deep House":      "House"
+  "Boom Bap":        "Hip-Hop"
+  "Nu Jazz":         "Jazz"
+  # ... 150+ entries covering all major genres
+```
+
+### Tag coverage report
+
+After a scan, RaagDosa shows how well your library's tags support your chosen template:
+
+```
+Tag coverage for template: {genre}/{bpm_range}/{artist} - {album}
+  genre      ████████████████████  92%
+  bpm        ████████░░░░░░░░░░░░  41%
+  artist     ████████████████████  99%
+```
 
 ---
 
@@ -414,8 +515,10 @@ Maintenance
   cache evict                  Remove stale entries for missing files
   learn                        Analyse Review patterns, suggest config improvements
 
-Profiles
+Profiles & templates
   profile list / show / add / set / use / delete
+  template list                  Show all 9 built-in library templates
+  template show <id>             Full details, required tags, example tree
 ```
 
 ---
