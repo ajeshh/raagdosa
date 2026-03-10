@@ -114,6 +114,7 @@ ENV/
 # ─────────────────────────────
 
 config.local.yaml
+paths.local.yaml
 .env
 .env.*
 

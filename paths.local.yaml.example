@@ -1,0 +1,46 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RaagDosa — Private Paths
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# This file holds all filesystem paths — source folders, destination folders,
+# and log directories. It is NEVER shared or committed to version control.
+#
+# Copy this file to paths.local.yaml and fill in your own paths:
+#   cp paths.local.yaml.example paths.local.yaml
+#
+# RaagDosa loads config.yaml first, then overlays paths.local.yaml on top.
+# Any path key here overrides the same key in config.yaml.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PROFILES — source roots and clean modes per profile
+# Only path-related keys go here. Settings stay in config.yaml.
+# ──────────────────────────────────────────────────────────────────────────────
+profiles:
+  incoming:
+    source_root: ~/Music/Incoming
+
+    # clean_mode: inside_root   → raagdosa/ sits inside source_root
+    #             inside_parent → raagdosa/ is a sibling of source_root
+    clean_mode: inside_root
+
+  # Add more profiles as needed:
+  # bandcamp:
+  #   source_root: ~/Music/Bandcamp
+  #   clean_mode: inside_root
+  # beatport:
+  #   source_root: ~/Music/Beatport
+  #   clean_mode: inside_parent
+
+active_profile: incoming
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING — where logs, sessions, and history are stored
+# ──────────────────────────────────────────────────────────────────────────────
+logging:
+  root_dir:           ~/appy/raagdosa/logs
+  session_dir:        ~/appy/raagdosa/logs/sessions
+  history_log:        ~/appy/raagdosa/logs/history.jsonl
+  skipped_log:        ~/appy/raagdosa/logs/skipped.jsonl
+  track_history_log:  ~/appy/raagdosa/logs/track-history.jsonl
+  track_skipped_log:  ~/appy/raagdosa/logs/track-skipped.jsonl

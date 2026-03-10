@@ -5,6 +5,141 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [7.0.0] — 2026-03-10
+
+### Release summary
+
+v7 is the **"Review Before Commit"** release. Instead of batch-processing everything automatically,
+you can now step through each folder one at a time — see before/after state, confidence breakdown,
+and approve, reject, override, or send to Review with a note. This is the CLI implementation of the
+Intake Engine PRD's Staging concept.
+
+This release also separates private paths from shareable config, renames Brain to Musical Reference,
+ships 100+ built-in artist aliases, and adds community-shareable reference import/export.
+
+Built in four phases:
+- **Phase 1** — Private paths: filesystem paths moved to `paths.local.yaml`
+- **Phase 2** — Smarter Review: per-factor score breakdown, review sidecars, structured rejection notes
+- **Phase 3** — Interactive review: folder-by-folder approval with override actions
+- **Phase 4** — Musical Reference: import/export for community-shareable knowledge
+
+---
+
+### New — Interactive folder-by-folder review mode
+
+`raagdosa go --interactive` presents each folder with a full review card showing:
+
+- Before/after folder names (source → proposed clean name)
+- Confidence bar with per-factor breakdown (7 factors, colour-coded)
+- Artist, album, year, genre, VA status, track count, format
+- Route reasons explaining why the system chose Clean or Review
+
+Actions at each folder (single keystroke + Enter):
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `y` / Enter | Approve | Accept proposed routing, move the folder |
+| `s` | Skip | Leave in source, optionally note why |
+| `r` | Review | Send to Review with a required note (structured pick-list) |
+| `a` | Set Artist | Override detected artist, re-route as single-artist album |
+| `v` | Toggle VA | Flip VA/single-artist status, re-derive destination |
+| `t` | Tracks | Show track listing with tag coverage summary |
+| `q` | Stop | End session, keep all moves done so far |
+
+Folders are sorted by confidence ascending (hardest decisions first). Use `--threshold 0.8` to
+only review folders below a confidence score. Stop at any point — partial runs are safe and can
+be resumed by re-running the same command.
+
+### New — Private paths (`paths.local.yaml`)
+
+All filesystem paths (source roots, clean mode, logging directories) are now stored in
+`paths.local.yaml`, separate from `config.yaml`. This makes `config.yaml` safe to share
+publicly — no risk of accidentally exposing your music folder paths.
+
+- On first v7.0 run, paths are auto-extracted from `config.yaml` to `paths.local.yaml`
+- `paths.local.yaml` is gitignored by default
+- `paths.local.yaml.example` ships as a template
+- Paths in config.yaml still work during the transition (overridden by paths.local.yaml)
+
+### New — Musical Reference (renamed from Brain)
+
+The "Brain" section is now called "Musical Reference" (`reference:` in config). This better
+reflects its purpose — accumulated knowledge about artists, labels, and naming patterns that
+can be shared with the community.
+
+Ships with **100+ built-in artist aliases** covering:
+- Hip-Hop/R&B (Jay-Z, MF DOOM, Notorious B.I.G., Tupac, Wu-Tang Clan, ...)
+- Electronic/DJ (Aphex Twin, deadmau5, Four Tet, Flying Lotus, Kaytranada, ...)
+- Rock/Alternative (AC/DC, Led Zeppelin, Radiohead, Arctic Monkeys, ...)
+- Jazz/Soul/Funk (Thelonious Monk, D'Angelo, Erykah Badu, Jamiroquai, ...)
+- Pop (Bjork, Beyonce, Sigur Ros, ...)
+- Techno/House (Nina Kraviz, BadBadNotGood, Kerri Chandler, ...)
+
+Migration: `brain:` keys in existing config.yaml are automatically loaded as `reference:`.
+
+### New — Reference import/export (community sharing)
+
+Share your musical reference with others — like adblock filter subscriptions for music knowledge.
+
+```bash
+raagdosa reference list                       # see what's in your reference
+raagdosa reference export                     # export to reference_export.yaml
+raagdosa reference export --section artist_aliases  # export one section
+raagdosa reference import community_ref.yaml  # merge with conflict detection
+```
+
+Import merges new entries, flags conflicts (different canonical names for the same alias),
+and tracks provenance (where each entry came from).
+
+### New — Review sidecars and score breakdown
+
+Every folder routed to Review/ now gets a `.raagdosa_review.json` sidecar file explaining WHY
+it landed in Review:
+
+```json
+{
+  "confidence": 0.48,
+  "review_summary": "Confidence score below threshold. Weak: Tag readability (30%), Album/artist vote consensus (50%)",
+  "route_reasons": ["low_confidence"],
+  "confidence_factors": {
+    "tag_coverage": 0.300,
+    "dominance": 0.500,
+    "title_quality": 0.750,
+    "completeness": 1.000
+  }
+}
+```
+
+### New — Structured rejection reasons
+
+When skipping or sending a folder to Review in interactive mode, reasons are captured from
+a structured pick-list: `va-misclass`, `wrong-artist`, `bad-tags`, `incomplete-release`,
+`duplicate`, `not-music`, `wrong-genre`, `needs-research`, or free-text custom notes.
+
+Session notes are stored in `logs/sessions/<id>/review_notes.jsonl` for pattern learning.
+
+### New — `--threshold` flag
+
+`raagdosa go --interactive --threshold 0.7` only presents folders with confidence below 0.7
+for interactive review. Everything above is processed normally.
+
+### Config changes
+
+| Change | Details |
+|--------|---------|
+| `brain:` → `reference:` | Renamed. Old `brain:` keys auto-migrate |
+| `reference.artist_aliases` | 100+ built-in entries (was empty) |
+| Paths → `paths.local.yaml` | Auto-extracted on first v7 run |
+| `.raagdosa_review.json` | Written in Review/ folders (configurable) |
+
+### Breaking changes
+
+- Config file split: paths now live in `paths.local.yaml` (auto-migrated)
+- `brain:` key renamed to `reference:` (auto-migrated)
+- `--interactive` mode now uses the new folder-by-folder review instead of simple y/N prompts
+
+---
+
 ## [6.0.0] — 2026-03-09
 
 ### Release summary

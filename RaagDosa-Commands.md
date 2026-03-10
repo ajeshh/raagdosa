@@ -1,4 +1,4 @@
-# RaagDosa — Command Reference (v4.3)
+# RaagDosa — Command Reference (v7.0)
 
 > **CLI-first. Safe by default. Always undoable.**
 > RaagDosa never silently reorganises your music. Every action is sessioned, logged, and reversible.
@@ -50,11 +50,15 @@ raagdosa doctor   # verify your setup is ready to run
 ```bash
 raagdosa go
 raagdosa go --dry-run               # preview: proposals printed, nothing moves
-raagdosa go --interactive           # confirm each folder before it moves
+raagdosa go --interactive           # v7.0: folder-by-folder review with approve/reject/override
+raagdosa go --interactive --threshold 0.7  # v7.0: only review folders below 0.7 confidence
 raagdosa go --since last_run        # only folders added since your last run
 raagdosa go --since 2026-01-15      # only folders modified after a specific date
 raagdosa go --profile bandcamp      # use a different source profile
 ```
+
+In v7.0, `--interactive` activates the full review mode with per-folder cards showing confidence
+breakdown, before/after state, and action keys: approve, skip, review, set artist, toggle VA.
 
 ### `run` — same as `go`, explicit alias
 ```bash
@@ -151,9 +155,24 @@ raagdosa review-list --older-than 90    # good for a quarterly cleanup pass
 ```
 
 Shows each Review folder with:
+- Original folder name → proposed name (FROM → TO)
 - How many days it's been sitting there (red if >60 days)
 - Last-known confidence score
-- The reason it was routed to Review
+- Artist, VA flag, folder type, and route reason
+
+### `review-promote` — force a VA folder to re-evaluate as album _(v6.1)_
+```bash
+raagdosa review-promote "Album Name"              # re-evaluate as album, not VA
+raagdosa review-promote "Album Name" --artist "X"  # force artist + re-evaluate
+raagdosa review-promote "Album Name" --dry-run     # preview only
+```
+When a folder in Review was wrongly classified as VA (Various Artists), this command
+forces a re-evaluation as a single-artist album. It:
+- Rebuilds the proposal with VA detection overridden
+- If albumartist was a VA keyword, derives artist from track-level tags instead
+- Shows before/after comparison
+- If the new proposal passes confidence, offers to move it to Clean/
+- Use `--artist` to explicitly set the artist when tags are missing/wrong
 
 ### `learn` — let RaagDosa suggest config improvements
 ```bash
@@ -321,12 +340,29 @@ Useful for folders with bad tags where you know the answer and don't want to bot
 | Flag | What it does |
 |---|---|
 | `--dry-run` | Show what would happen, move nothing |
-| `--interactive` | Confirm each folder/track before acting |
+| `--interactive` | v7.0: Full review mode — approve/reject/override each folder |
+| `--threshold N` | v7.0: In interactive mode, only review folders below this confidence |
 | `--profile <name>` | Use a named profile instead of the active one |
 | `--since last_run` | Only process folders new since last run |
 | `--since 2026-01-01` | Only process folders modified after a date |
 | `--verbose` | Extra detail in output |
 | `--quiet` | Suppress non-error output |
+
+---
+
+## Musical Reference _(v7.0)_
+
+```bash
+raagdosa reference list                       # show reference contents summary
+raagdosa reference export                     # export to reference_export.yaml
+raagdosa reference export --section artist_aliases  # export one section only
+raagdosa reference export --out my_ref.yaml   # custom output path
+raagdosa reference import community_ref.yaml  # merge with conflict detection
+```
+
+The Musical Reference (formerly Brain) holds accumulated knowledge: artist aliases, known labels,
+VA rescue prefixes, and noise patterns. Import/export enables community sharing — like adblock
+filter subscriptions for music metadata.
 
 ---
 
@@ -350,6 +386,8 @@ Useful for folders with bad tags where you know the answer and don't want to bot
 | `orphans` | Find loose audio files |
 | `review-list` | Tabular view of Review folder contents |
 | `review-list --older-than N` | Filter to long-stale Review folders |
+| `review-promote "Name"` | Force VA→album re-evaluation in Review |
+| `review-promote "Name" --artist "X"` | Force artist + re-evaluate |
 | `artists --list` | List all artists in Clean/ |
 | `artists --find` | Fuzzy-search for an artist |
 | `extract --by-artist` | Split a VA/mix folder into per-artist groups |
@@ -359,6 +397,9 @@ Useful for folders with bad tags where you know the answer and don't want to bot
 | `history` | Show action log |
 | `undo` | Reverse folder moves or track renames |
 | `learn` | Suggest config improvements from Review patterns |
+| `reference list` | Show musical reference contents summary |
+| `reference import` | Import a community reference file |
+| `reference export` | Export reference for sharing |
 | `profile` | Manage source profiles (list/show/add/set/use/delete) |
 
 ---

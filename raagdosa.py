@@ -38,7 +38,7 @@ except Exception:
     _PILImage = None
     _HAS_PIL = False
 
-APP_VERSION = "5.5.0"
+APP_VERSION = "7.0.0"
 
 # ─────────────────────────────────────────────────────────────────
 # Hardware performance tiers
@@ -220,6 +220,87 @@ def read_yaml(path:Path)->Dict[str,Any]:
 def write_yaml(path:Path,cfg:Dict[str,Any])->None:
     if yaml is None: raise RuntimeError("Missing: pyyaml — pip install pyyaml")
     path.write_text(yaml.safe_dump(cfg,sort_keys=False,allow_unicode=True),encoding="utf-8")
+
+def _deep_merge(base:Dict[str,Any],overlay:Dict[str,Any])->Dict[str,Any]:
+    """Recursively merge overlay into base. overlay values win for non-dict leaves."""
+    merged=dict(base)
+    for k,v in overlay.items():
+        if k in merged and isinstance(merged[k],dict) and isinstance(v,dict):
+            merged[k]=_deep_merge(merged[k],v)
+        else:
+            merged[k]=v
+    return merged
+
+def load_paths_overlay(cfg_path:Path)->Dict[str,Any]:
+    """Load paths.local.yaml if it exists alongside the config file."""
+    paths_file=cfg_path.parent/"paths.local.yaml"
+    if paths_file.exists():
+        return read_yaml(paths_file)
+    return {}
+
+_PATH_KEYS_IN_PROFILE={"source_root","clean_mode"}
+_PATH_KEYS_TOPLEVEL={"active_profile"}
+
+def _has_paths_in_config(cfg:Dict[str,Any])->bool:
+    """Check if config.yaml still contains path-related keys that should be in paths.local.yaml."""
+    for pname,pdata in (cfg.get("profiles") or {}).items():
+        if isinstance(pdata,dict) and "source_root" in pdata:
+            return True
+    lcfg=cfg.get("logging",{})
+    if lcfg.get("root_dir") and not lcfg.get("_paths_migrated"):
+        return True
+    return False
+
+def _migrate_paths_to_local(cfg_path:Path,cfg:Dict[str,Any])->None:
+    """Offer to extract paths from config.yaml into paths.local.yaml."""
+    paths_file=cfg_path.parent/"paths.local.yaml"
+    if paths_file.exists():
+        return  # already migrated
+    if not _has_paths_in_config(cfg):
+        return
+    out(f"\n{C.YELLOW}v7.0 change:{C.RESET} Paths now belong in {C.BOLD}paths.local.yaml{C.RESET} (keeps config.yaml safe to share).")
+    out(f"  Found paths in config.yaml — extracting to paths.local.yaml...")
+    paths_data:Dict[str,Any]={}
+    # Extract profile paths
+    if cfg.get("profiles"):
+        paths_data["profiles"]={}
+        for pname,pdata in cfg["profiles"].items():
+            if isinstance(pdata,dict):
+                extracted={}
+                for k in list(pdata.keys()):
+                    if k in _PATH_KEYS_IN_PROFILE:
+                        extracted[k]=pdata[k]
+                if extracted:
+                    paths_data["profiles"][pname]=extracted
+    if cfg.get("active_profile"):
+        paths_data["active_profile"]=cfg["active_profile"]
+    # Extract logging paths
+    lcfg=cfg.get("logging",{})
+    log_keys=["root_dir","session_dir","history_log","skipped_log","track_history_log","track_skipped_log"]
+    extracted_log={k:lcfg[k] for k in log_keys if k in lcfg}
+    if extracted_log:
+        paths_data["logging"]=extracted_log
+    if paths_data:
+        write_yaml(paths_file,paths_data)
+        out(f"  {C.GREEN}Created:{C.RESET} {paths_file}")
+        out(f"  {C.DIM}Paths in config.yaml still work but are now overridden by paths.local.yaml.{C.RESET}")
+        out(f"  {C.DIM}You can safely remove path keys from config.yaml when ready.{C.RESET}\n")
+
+def load_config_with_paths(cfg_path:Path)->Dict[str,Any]:
+    """Load config.yaml, then overlay paths.local.yaml, then handle brain→reference migration."""
+    cfg=read_yaml(cfg_path)
+    # Migrate paths on first v7 run
+    _migrate_paths_to_local(cfg_path,cfg)
+    # Overlay paths.local.yaml
+    paths=load_paths_overlay(cfg_path)
+    if paths:
+        cfg=_deep_merge(cfg,paths)
+    # brain → reference migration (v7.0)
+    if "brain" in cfg and "reference" not in cfg:
+        cfg["reference"]=cfg.pop("brain")
+    elif "brain" in cfg and "reference" in cfg:
+        cfg["reference"]=_deep_merge(cfg.pop("brain"),cfg["reference"])
+    return cfg
 
 def ensure_dir(path:Path)->None: path.mkdir(parents=True,exist_ok=True)
 def write_json(path:Path,obj:Any)->None: path.write_text(json.dumps(obj,indent=2,ensure_ascii=False),encoding="utf-8")
@@ -413,8 +494,11 @@ def normalize_artist_name(name:str,cfg:Dict[str,Any])->str:
         s=" ".join(w.capitalize() if i==0 or w.lower() not in small else w.lower() for i,w in enumerate(words))
 
     # Alias map (case-insensitive exact match wins immediately)
+    # Check artist_normalization.aliases first, then reference.artist_aliases
     aliases:Dict[str,str]=acfg.get("aliases",{}) or {}
-    for alias_key,canonical in aliases.items():
+    ref_aliases:Dict[str,str]=cfg.get("reference",{}).get("artist_aliases",{}) or {}
+    merged_aliases={**ref_aliases,**aliases}  # artist_normalization wins on conflict
+    for alias_key,canonical in merged_aliases.items():
         if alias_key.lower()==s.lower(): return canonical
 
     # Hyphen variants → ASCII hyphen
@@ -695,16 +779,28 @@ def classify_folder_content(
     tagged=[t for t in all_tags if any(v for v in t.values())]
     if not tagged: return "album"
 
-    # High unique-artist ratio
+    # High unique-artist ratio — but only classify as mix/VA with strong evidence.
+    # v6.1: Also check albumartist — if it's a real artist (not VA keyword), this is
+    # a normal album regardless of how many different track artists there are.
     artists=[t.get("artist","").strip().lower() for t in tagged if t.get("artist")]
+    albumartists=[t.get("albumartist","").strip().lower() for t in tagged if t.get("albumartist")]
+    _va_kw_set={"various artists","various","va","v/a","v.a.","v.a","vvaa","varios artistas","varios","artistes variés","aa.vv.",
+                 "разные исполнители","различные исполнители","сборник","verschiedene interpreten","diverse interpreten",
+                 "artistas varios","vários artistas","vários intérpretes"}
+
+    # If albumartist is present and NOT a VA keyword, it's a normal album
+    if albumartists:
+        _aa_dom = Counter(albumartists).most_common(1)[0][0] if albumartists else ""
+        if _aa_dom and _aa_dom not in _va_kw_set:
+            return "album"
+
     if len(artists)>=3:
         unique_ratio=len(set(artists))/len(artists)
-        if unique_ratio>=float(mc.get("unique_artist_ratio_mix",0.65)):
-            # Check for explicit VA albumartist tag
-            albumartists=[t.get("albumartist","").strip().lower() for t in tagged if t.get("albumartist")]
+        # v6.1: raised from 0.65→0.80 to match the conservative VA philosophy
+        if unique_ratio>=float(mc.get("unique_artist_ratio_mix",0.80)):
             if albumartists:
                 aa_set=set(albumartists)
-                if any(x in aa_set for x in ["various artists","various","va","v/a"]): return "va"
+                if any(x in aa_set for x in _va_kw_set): return "va"
             return "mix"
 
     return "album"
@@ -1315,34 +1411,33 @@ def ensure_roots(profile:Dict,source_root:Path)->Dict[str,Path]:
     for p in roots.values(): ensure_dir(p)
     return roots
 
-def setup_logging_paths(cfg:Dict[str,Any],profile:Dict[str,Any],source_root:Path)->None:
+def setup_logging_paths(cfg:Dict[str,Any],profile:Dict[str,Any],source_root:Path,profile_name:str="")->None:
     """
-    Resolve all logging paths relative to the raagdosa wrapper folder and mutate
-    cfg["logging"] in-place with absolute paths.  Call once per command after
-    profile and source_root are known.
+    Resolve all logging paths and mutate cfg["logging"] in-place with absolute paths.
+    Call once per command after profile and source_root are known.
 
-    Result structure on disk:
-      <source_root>/raagdosa/
-        Clean/
-        Review/
-        logs/
-          history.jsonl          ← folder-move history (used by undo)
-          skipped.jsonl          ← folders that were skipped
-          track-history.jsonl   ← track-rename history (used by undo --tracks)
-          track-skipped.jsonl   ← tracks that were skipped
+    v6.1 structure — logs grouped by profile for easy identification:
+      logs/
+        <profile_name>/              ← e.g. "incoming"
           sessions/
-            2026-03-08_14-30_incoming_test/
+            2026-03-10_11-22/        ← timestamp-only (profile context in path)
               proposals.json
               report.txt / .csv / .html
-          tag_cache.json
           trees/
+          history.jsonl
+          skipped.jsonl
+          track-history.jsonl
+          track-skipped.jsonl
+          tag_cache.json
 
-    Logs live next to the music they describe, so the drive label / path is
-    implicit from the filesystem location — no ambiguity across multiple sources.
+    If logging.root_dir is absolute (recommended), logs stay in the app directory
+    regardless of which source volume is scanned — safe from accidental deletion.
     """
     wrapper=derive_wrapper_root(profile,source_root)
     lcfg=cfg.setdefault("logging",{})
-    log_root=wrapper/lcfg.get("root_dir","logs")
+    log_base=wrapper/lcfg.get("root_dir","logs")
+    # v6.1: nest under profile name so logs for each source are grouped together
+    log_root=log_base/slugify(profile_name,40) if profile_name else log_base
     ensure_dir(log_root)
     # Patch all keys with absolute resolved paths so every downstream caller
     # just does Path(cfg["logging"]["<key>"]) and gets the right location.
@@ -1911,7 +2006,7 @@ def apply_v41_folder_pre_processor(name: str, cfg: Dict[str, Any]) -> Tuple[str,
     # 26. 4-dash label-year-artist-album pattern:
     #     "Cosmovision Records - 2024 - VA - Electropical"
     # Guard: only fires when the first segment looks like a label (contains a label keyword
-    # OR is present in brain.known_labels). Prevents false positives on Artist-Year-Artist-Album.
+    # OR is present in reference.known_labels). Prevents false positives on Artist-Year-Artist-Album.
     lm = _LABEL_4DASH.match(name)
     if lm:
         label   = lm.group("label").strip()
@@ -1919,7 +2014,7 @@ def apply_v41_folder_pre_processor(name: str, cfg: Dict[str, Any]) -> Tuple[str,
         artist  = lm.group("artist").strip()
         album   = lm.group("album").strip()
         known_labels = {lb.lower() for lb in (
-            (cfg or {}).get("brain", {}).get("known_labels", []) or [])}
+            (cfg or {}).get("reference", {}).get("known_labels", []) or [])}
         label_is_label = (
             _detect_label_as_albumartist(label)
             or label.lower() in known_labels
@@ -2157,22 +2252,29 @@ def detect_va(aa_norm: str, track_artists: Any, cfg: Dict[str, Any]) -> bool:
     """
     Return True if this folder looks like a Various Artists release.
 
+    v6.1 PHILOSOPHY: Default to album, not VA.  Only flag VA when:
+      (a) albumartist tag explicitly says "Various Artists" or similar, OR
+      (b) heuristic ratio is HIGH (≥0.75) AND there's no dominant artist.
+    The previous 0.50 threshold caused massive false positives on real albums
+    where featured artists, remixers, or tag variations inflated the unique count.
+
     track_artists may be:
       - a Counter[norm_str → int]  (preferred — one count per track)
       - a list[str]                (legacy — interpreted as per-track list)
-
-    THE CLASSIC BUG TO AVOID: if you pass list(Counter.keys()) you get a
-    single-element list for a single-artist album, yielding ratio=1/1=1.0 → VA.
-    Always pass the Counter or the per-track expanded list, never .keys() alone.
     """
     vc = cfg.get("various_artists", {})
     matches = {m.lower() for m in vc.get("albumartist_matches", [])}
 
-    # Explicit albumartist tag says Various Artists
+    # Explicit albumartist tag says Various Artists — this is definitive
     if aa_norm and aa_norm in matches:
         return True
 
     if not vc.get("enable_heuristics", True):
+        return False
+
+    # If albumartist is present and NOT a VA keyword, this is almost
+    # certainly a single-artist album — don't even run the heuristic.
+    if aa_norm and aa_norm not in matches:
         return False
 
     # Resolve to (unique_artists, total_tracks)
@@ -2183,15 +2285,27 @@ def detect_va(aa_norm: str, track_artists: Any, cfg: Dict[str, Any]) -> bool:
         total = sum(non_empty.values())
         unique = len(non_empty)
     else:
-        # list of per-track artist names (may be repeated)
         non_empty = [a for a in track_artists if a]
         if not non_empty:
             return False
         total = len(non_empty)
         unique = len(set(non_empty))
 
-    threshold = float(vc.get("unique_artist_ratio_above", 0.50))
-    return (unique / total) >= threshold
+    # v6.1: Raised from 0.50 → 0.75 — require strong evidence of VA.
+    # At 0.50, a 6-track album with 3 "feat." variations triggers VA.
+    # At 0.75, you need 6 out of 8 tracks to have genuinely different artists.
+    threshold = float(vc.get("unique_artist_ratio_above", 0.75))
+    if (unique / total) < threshold:
+        return False
+
+    # Extra guard: if there's a dominant primary artist covering ≥40% of tracks,
+    # this is likely a single-artist album with guests, not true VA.
+    if isinstance(track_artists, Counter) and non_empty:
+        top_count = max(non_empty.values())
+        if top_count / total >= 0.40:
+            return False
+
+    return True
 
 def pick_year(year_counts:Counter,tracks_with_year:int,total:int,cfg:Dict[str,Any])->Tuple[Optional[int],Dict[str,Any]]:
     yc=cfg.get("year",{})
@@ -2207,12 +2321,13 @@ def pick_year(year_counts:Counter,tracks_with_year:int,total:int,cfg:Dict[str,An
     if not(amin<=y<=amax): return None,{"included":False,"reason":"year_out_of_range"}
     return y,{"included":True,"presence_ratio":pres,"agreement":ys}
 
-def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,profile:Dict[str,Any],cfg:Dict[str,Any])->Optional[FolderProposal]:
+def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,profile:Dict[str,Any],cfg:Dict[str,Any],force_album:bool=False)->Optional[FolderProposal]:
     # ── per-folder override ──────────────────────────────────────────────
     override=load_folder_override(folder)
     if override and override.get("skip"): return None
 
     albums_norm:Counter=Counter(); albumartists_norm:Counter=Counter(); track_artists_norm:Counter=Counter(); years:Counter=Counter()
+    primary_artists_norm:Counter=Counter()  # v5.5.1: artist before feat/ft — for VA detection
     genres:Counter=Counter(); labels:Counter=Counter(); bpms:List[float]=[]; keys_raw:Counter=Counter()
     albums_raw:Dict[str,Counter]={}; albumartists_raw:Dict[str,Counter]={}
     tracks_with_year=0; tagged=0; unreadable=0
@@ -2230,6 +2345,11 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         bpm_r=(tags.get("bpm") or "").strip()
         key_r=(tags.get("key") or "").strip()
 
+        # v6.2: discard garbage tag values (URLs, domains, musical keys in artist field)
+        if _is_garbage_tag_value(aa_r):  aa_r=""
+        if _is_garbage_tag_value(art_r): art_r=""
+        if _is_garbage_tag_value(alb_r): alb_r=""
+
         # Strip display noise and disc indicators from album for voting
         alb_r_clean=strip_disc_indicator(strip_display_noise(alb_r)) if alb_r else alb_r
 
@@ -2238,7 +2358,11 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         art_n=normalize_for_vote(art_r,cfg)        if art_r        else ""
         if alb_n: albums_norm[alb_n]+=1; albums_raw.setdefault(alb_n,Counter())[alb_r_clean or alb_r]+=1
         if aa_n:  albumartists_norm[aa_n]+=1; albumartists_raw.setdefault(aa_n,Counter())[aa_r]+=1
-        if art_n: track_artists_norm[art_n]+=1
+        if art_n:
+            track_artists_norm[art_n]+=1
+            # v5.5.1: extract primary artist (before feat/ft/featuring/&/vs) for VA detection
+            _prim = re.split(r'\s+(?:feat\.?|ft\.?|featuring|&|and|vs\.?|x)\s+', art_n, maxsplit=1, flags=re.I)[0].strip()
+            if _prim: primary_artists_norm[_prim]+=1
         if genre_r: genres[genre_r]+=1
         if label_r: labels[label_r]+=1
         if key_r: keys_raw[key_r]+=1
@@ -2278,56 +2402,153 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     # CRITICAL: pass the Counter (not .keys()) so ratio = unique/total tracks.
     # Passing list(Counter.keys()) gives a 1-element list for any single-artist
     # album, yielding ratio=1/1=1.0 ≥ 0.5 → false VA for every real album.
-    is_va = detect_va(dom_aa_n or "", track_artists_norm, cfg)
+    # v5.5.1: use primary_artists_norm (feat/ft stripped) for VA detection —
+    # prevents "Artist feat. X", "Artist feat. Y" from each counting as unique.
+    is_va = detect_va(dom_aa_n or "", primary_artists_norm, cfg)
+
+    # v6.2: folder-name VA prefix override — if folder explicitly starts with
+    # "VA -", "VA_", "va -" etc., trust that signal and force VA detection.
+    # This rescues cases where tags have garbage/wrong albumartist but the
+    # user (or uploader) named the folder correctly.
+    _fn_stripped = folder.name.strip()
+    _fn_va_prefix = re.match(r'^(?:va|v\.?a\.?)\s*[-_–—]', _fn_stripped, re.I)
+    _va_forced_by_folder = False
+    if _fn_va_prefix and not force_album:
+        is_va = True
+        _va_forced_by_folder = True
+
+    # v6.1: force_album override — user says this is not VA
+    if force_album:
+        is_va = False
+        # If albumartist was a VA keyword, derive artist from track-level tags instead
+        _va_kws_early = {m.lower() for m in cfg.get("various_artists",{}).get("albumartist_matches",[])}
+        if dom_aa_n and dom_aa_n in _va_kws_early and dom_art_n:
+            dom_aa   = recover_display(dom_art_n, {}) or dom_art_n
+            dom_aa_n = dom_art_n
+            aa_share = art_share
 
     # Pre-compute the set of known VA keywords for safeguard checks
     _va_kws = {m.lower() for m in cfg.get("various_artists",{}).get("albumartist_matches",[])}
 
+    # v6.2: Safeguards A–I can un-flag VA, but NEVER when VA was forced by
+    # an explicit "VA -" folder-name prefix — that's the strongest signal we have.
     # Safeguard A: Strong single-artist signal overrides VA heuristic.
     # If albumartist AND artist tags BOTH point to the same name at ≥75%
     # dominance, this is definitively a single-artist album — not VA.
     # Guard: only fires when the albumartist is NOT itself a VA keyword.
-    if is_va and dom_aa_n and dom_aa_n not in _va_kws and dom_art_n:
+    if is_va and not _va_forced_by_folder and dom_aa_n and dom_aa_n not in _va_kws and dom_art_n:
         if dom_aa_n == dom_art_n and aa_share >= 0.75 and art_share >= 0.75:
             is_va = False
 
     # Safeguard A2: albumartist alone at very high confidence with no
     # counter-evidence — but ONLY for non-VA albumartist tags.
-    if is_va and dom_aa_n and dom_aa_n not in _va_kws and aa_share >= 0.90:
+    if is_va and not _va_forced_by_folder and dom_aa_n and dom_aa_n not in _va_kws and aa_share >= 0.90:
         if dom_art_n and art_share >= 0.75 and dom_art_n == dom_aa_n:
             is_va = False
         elif not dom_art_n:
             # albumartist present & non-VA, artist tag absent → trust albumartist
             is_va = False
 
-    # Safeguard B: Folder name starts with the dominant albumartist name.
-    # "Artist - Album" folder + single AA tag = single artist album.
+    # Safeguard B: Folder name contains the dominant albumartist name.
+    # "Artist - Album" or "Year - Artist - Album" folder + AA tag = single artist.
     # Guard: albumartist must not be a VA keyword.
-    if is_va and dom_aa_n and dom_aa_n not in _va_kws and aa_share >= 0.80:
+    # v6.1: lowered threshold from 0.80→0.60, added contains check (not just startswith).
+    if is_va and not _va_forced_by_folder and dom_aa_n and dom_aa_n not in _va_kws and aa_share >= 0.60:
         fn_norm = normalize_unicode(folder.name.strip().lower())
         aa_norm_str = normalize_unicode((dom_aa or dom_aa_n or "").strip().lower())
-        if aa_norm_str and fn_norm.startswith(aa_norm_str):
+        if aa_norm_str and len(aa_norm_str) >= 3 and aa_norm_str in fn_norm:
             is_va = False
 
     # Safeguard C: No albumartist tag, but artist tag is dominant and
-    # folder name starts with that artist.
-    if is_va and not dom_aa_n and dom_art_n and art_share >= 0.90:
+    # folder name contains that artist.
+    # v6.1: lowered threshold from 0.90→0.70, added contains check.
+    if is_va and not _va_forced_by_folder and not dom_aa_n and dom_art_n and art_share >= 0.70:
         fn_norm = normalize_unicode(folder.name.strip().lower())
         art_norm_str = normalize_unicode(dom_art_n.strip().lower())
-        if art_norm_str and fn_norm.startswith(art_norm_str):
+        if art_norm_str and len(art_norm_str) >= 3 and art_norm_str in fn_norm:
             is_va = False
+
+    # Safeguard E (v5.5.1): No albumartist tag, but dominant artist covers
+    # all tracks — regardless of folder naming.  If every single track
+    # credits the SAME primary artist, this is definitively single-artist.
+    # This rescues "Year - Album" or album-only folder names where
+    # Safeguard C cannot match on folder prefix.
+    if is_va and not _va_forced_by_folder and not dom_aa_n and dom_art_n and art_share >= 0.95:
+        is_va = False
+
+    # Safeguard F (v5.5.1): albumartist present, not a VA keyword,
+    # dominant artist present and matches — even without folder alignment.
+    # Covers cases where albumartist and artist agree but aren't identical
+    # strings (e.g. "artist feat. X" vs "artist").
+    if is_va and not _va_forced_by_folder and dom_aa_n and dom_aa_n not in _va_kws and dom_art_n:
+        # Extract primary artist (before feat/ft/featuring) for comparison
+        _prim_aa = re.split(r'\s+(?:feat\.?|ft\.?|featuring)\s+', dom_aa_n, maxsplit=1, flags=re.I)[0].strip()
+        _prim_art = re.split(r'\s+(?:feat\.?|ft\.?|featuring)\s+', dom_art_n, maxsplit=1, flags=re.I)[0].strip()
+        if _prim_aa == _prim_art and aa_share >= 0.70 and art_share >= 0.70:
+            is_va = False
+
+    # Safeguard G (v6.1): Parent folder name contains the dominant artist.
+    # Structure like "Artist Name/2024 - Album" or "Artist Name/Album Title"
+    # means the parent is an artist folder — this is not VA.
+    if is_va and not _va_forced_by_folder and (dom_aa_n or dom_art_n):
+        _parent_name = normalize_unicode(folder.parent.name.strip().lower())
+        _check_artist = dom_aa_n if (dom_aa_n and dom_aa_n not in _va_kws) else dom_art_n
+        _check_share = aa_share if (dom_aa_n and dom_aa_n not in _va_kws) else art_share
+        if _check_artist and _parent_name and _check_share >= 0.60:
+            _art_norm = normalize_unicode(_check_artist.strip().lower())
+            if _art_norm and (_parent_name == _art_norm or _parent_name.startswith(_art_norm)):
+                is_va = False
+
+    # Safeguard H (v6.1): Sibling folders share the same dominant artist.
+    # If the parent contains multiple album subfolders and sibling folder names
+    # contain the same artist, this is an artist discography — not VA.
+    if is_va and not _va_forced_by_folder and (dom_aa_n or dom_art_n):
+        _check_artist_h = dom_aa_n if (dom_aa_n and dom_aa_n not in _va_kws) else dom_art_n
+        _check_share_h = aa_share if (dom_aa_n and dom_aa_n not in _va_kws) else art_share
+        if _check_artist_h and _check_share_h >= 0.60:
+            _art_norm_h = normalize_unicode(_check_artist_h.strip().lower())
+            try:
+                _siblings = [d.name for d in folder.parent.iterdir() if d.is_dir() and d != folder]
+                if _siblings and _art_norm_h:
+                    _sibling_match = sum(1 for s in _siblings if _art_norm_h in normalize_unicode(s.strip().lower()))
+                    if _sibling_match >= 1:
+                        is_va = False
+            except OSError:
+                pass
+
+    # Safeguard I (v6.1): Remix/remixed album — track artists are remixers,
+    # not evidence of VA.  If the album name or folder name contains remix
+    # indicators, the albumartist (or folder-derived artist) is the real artist.
+    # Remixers inflate the unique artist ratio but don't make it a compilation.
+    if is_va and not _va_forced_by_folder:
+        _remix_pat = re.compile(r'\b(remix(?:ed|es)?|rmx|reworks?)\b', re.I)
+        _alb_is_remix = bool(dom_alb and _remix_pat.search(dom_alb))
+        _fn_is_remix = bool(_remix_pat.search(folder.name))
+        if _alb_is_remix or _fn_is_remix:
+            # If we have an albumartist that isn't a VA keyword, trust it
+            if dom_aa_n and dom_aa_n not in _va_kws:
+                is_va = False
+            # Or if we can parse the artist from the folder name
+            elif not dom_aa_n:
+                _parsed_fn = parse_folder_name_heuristic(folder.name)
+                _fn_artist = _parsed_fn.get("artist")
+                if _fn_artist:
+                    dom_aa = _fn_artist
+                    dom_aa_n = normalize_for_vote(_fn_artist, cfg)
+                    aa_share = 0.60
+                    is_va = False
 
     # Safeguard D (v4.3): albumartist tag is a label name, not an artist.
     # Pattern confirmed in 37 folders (3.7%) in session 2.
     # Re-parse using dominant track artist instead.
-    if dom_aa_n and _detect_label_as_albumartist(dom_aa or dom_aa_n or ""):
+    if not _va_forced_by_folder and dom_aa_n and _detect_label_as_albumartist(dom_aa or dom_aa_n or ""):
         # Folder has pattern "Label - Artist - Album" or "Label - Album"
         # Check if track artist gives us a cleaner single-artist signal
         if dom_art_n and art_share >= 0.70:
             dom_aa   = recover_display(dom_art_n, {}) or dom_art_n
             dom_aa_n = dom_art_n
             aa_share = art_share
-            is_va    = detect_va(dom_aa_n, track_artists_norm, cfg)
+            is_va    = detect_va(dom_aa_n, primary_artists_norm, cfg)
 
     # ── folder content type ─────────────────────────────────────────────
     folder_type=classify_folder_content(audio_files,folder.name,all_tags,cfg)
@@ -2355,12 +2576,27 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     garbage=detect_garbage_name(dom_alb)
     if garbage: dom_alb=strip_bracket_stack(dom_alb)
 
+    # ── strip URL/domain that leaked into voted album name ───────────────
+    dom_alb=strip_trailing_domains(dom_alb)
+    # If the album name IS a bare domain/URL (nothing left after stripping), keep original
+    if not dom_alb.strip():
+        dom_alb=apply_title_case(recover_display(dom_alb_n,albums_raw) or dom_alb_n or "",cfg)
+
     year_val,year_meta=pick_year(years,tracks_with_year,max(total,1) if used_heuristic else total,cfg)
 
     fmt=cfg.get("format",{})
+    # Strip trailing EP/E.P./LP suffixes from album name before adding [EP] label
+    # to prevent doubling like "Ashen EP [EP]"
+    _ep_stripped_alb = dom_alb
+    if is_ep and fmt.get("label_eps",True):
+        _ep_stripped_alb = re.sub(r'\s+E\.?P\.?\s*$', '', dom_alb, flags=re.I).strip()
     ep_suffix=" [EP]" if is_ep and fmt.get("label_eps",True) else ""
-    pat=fmt.get("pattern_with_year" if year_val else "pattern_no_year","{albumartist} - {album}")
-    proposed=pat.format(albumartist=artist_for_folder,album=dom_alb+ep_suffix,year=year_val or "")
+    # Deduplicate year: if the album name already contains the year, skip appending it
+    _alb_for_fmt = _ep_stripped_alb + ep_suffix
+    _year_already_in_album = year_val and re.search(r'\b' + str(year_val) + r'\b', _alb_for_fmt)
+    pat_key = "pattern_with_year" if (year_val and not _year_already_in_album) else "pattern_no_year"
+    pat=fmt.get(pat_key,"{albumartist} - {album}")
+    proposed=pat.format(albumartist=artist_for_folder,album=_alb_for_fmt,year=year_val or "")
     proposed=sanitize_name(proposed,repl=fmt.get("replace_illegal_chars_with"," - "))
     proposed=sanitize_windows_reserved(proposed)
 
@@ -2391,6 +2627,13 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     conf_factors=compute_confidence_factors(
         audio_files,tagged,alb_share,aa_share,art_share,
         used_heuristic,folder.name,proposed,all_tags)
+
+    # v6.2: VA-prefix scene-named folders get penalised on folder_alignment
+    # because scene naming ("VA-Title-CAT-WEB-2023-GRP") never matches the
+    # proposed clean name. Boost alignment to 0.5 minimum for confirmed VA.
+    if is_va and _fn_va_prefix and conf_factors.get("folder_alignment",0) < 0.5:
+        conf_factors["folder_alignment"] = 0.5
+
     confidence=confidence_from_factors(conf_factors,used_heuristic)
 
     # Override confidence boost from .raagdosa
@@ -2412,6 +2655,83 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     stats=FolderStats(tracks_total=total,tracks_tagged=tagged,tracks_unreadable=unreadable,extensions=dict(extensions),format_duplicates=fmt_dupes)
     return FolderProposal(folder_path=str(folder),folder_name=folder.name,proposed_folder_name=proposed,
                           target_path=str(target_dir),destination="clean",confidence=float(confidence),decision=decision,stats=stats)
+
+# ─────────────────────────────────────────────
+# v7.0 — Review summary & sidecar
+# ─────────────────────────────────────────────
+_REASON_DESCRIPTIONS:Dict[str,str]={
+    "low_confidence":"Confidence score below threshold",
+    "generic_folder_name":"Folder name is too generic to classify",
+    "unreadable_ratio_high":"Too many tracks have unreadable tags",
+    "heuristic_fallback":"Name derived from heuristics (no usable tags)",
+    "ep":"Detected as EP release",
+    "mix_folder":"Detected as DJ mix or chart compilation",
+}
+
+_FACTOR_DESCRIPTIONS:Dict[str,str]={
+    "tag_coverage":"Tag readability",
+    "dominance":"Album/artist vote consensus",
+    "title_quality":"Meaningful track titles",
+    "filename_consistency":"Filename ↔ tag alignment",
+    "completeness":"Track numbering completeness",
+    "aa_consistency":"Album-artist consistency",
+    "folder_alignment":"Folder name ↔ proposed name",
+}
+
+def _build_review_summary(reasons:List[str],factors:Dict[str,float],confidence:float)->str:
+    """Build a human-readable summary explaining why a folder was routed the way it was."""
+    parts=[]
+    for r in reasons:
+        base=r.split(":")[0]  # handle "duplicate_in_run:FolderName"
+        if base in _REASON_DESCRIPTIONS:
+            parts.append(_REASON_DESCRIPTIONS[base])
+        elif r.startswith("duplicate"):
+            parts.append(f"Duplicate: {r.split(':',1)[1] if ':' in r else 'name collision'}")
+        elif r.startswith("already_in_clean"):
+            parts.append("Already exists in Clean library")
+        else:
+            parts.append(r.replace("_"," ").capitalize())
+    # Add weak factor details
+    weak=[f"{_FACTOR_DESCRIPTIONS.get(k,k)} ({v:.0%})" for k,v in factors.items()
+          if isinstance(v,float) and v<0.5 and k in _FACTOR_DESCRIPTIONS]
+    if weak:
+        parts.append("Weak: "+", ".join(weak))
+    return ". ".join(parts)
+
+def _write_review_sidecar(folder_path:Path,proposal,session_id:str)->None:
+    """Write .raagdosa_review.json inside a Review folder with routing rationale."""
+    sidecar=folder_path/".raagdosa_review.json"
+    data={
+        "session_id":session_id,
+        "timestamp":now_iso(),
+        "original_folder":proposal.folder_name,
+        "proposed_name":proposal.proposed_folder_name,
+        "confidence":proposal.confidence,
+        "destination":proposal.destination,
+        "route_reasons":proposal.decision.get("route_reasons",[]),
+        "review_summary":proposal.decision.get("review_summary",""),
+        "confidence_factors":{k:round(v,3) for k,v in proposal.decision.get("confidence_factors",{}).items()},
+        "artist":proposal.decision.get("albumartist_display",""),
+        "album":proposal.decision.get("dominant_album_display",""),
+        "is_va":proposal.decision.get("is_va",False),
+        "user_notes":[],
+    }
+    try: write_json(sidecar,data)
+    except Exception: pass
+
+# ─────────────────────────────────────────────
+# v7.0 — Structured review reasons
+# ─────────────────────────────────────────────
+REVIEW_REASON_PRESETS=[
+    "va-misclass",        # VA detection was wrong
+    "wrong-artist",       # Artist name incorrect
+    "bad-tags",           # Tags are unreliable
+    "incomplete-release", # Missing tracks or partial download
+    "duplicate",          # Already have this release elsewhere
+    "not-music",          # Not an album (samples, stems, etc.)
+    "wrong-genre",        # Genre classification wrong
+    "needs-research",     # Need to check Discogs/MusicBrainz
+]
 
 def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->Tuple[str,Path,List[FolderProposal]]:
     profiles=cfg.get("profiles",{})
@@ -2548,10 +2868,26 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
     mixes_root=clean_albums.parent/mixes_folder
 
+    # v6.2: generic/vague folder names that are not album names — force review
+    _generic_folder_names = {
+        "a","music","complete","down tempo","downtempo","warm up","warm-up",
+        "underground house","haifa club","estray","rare tracks","new","misc",
+        "unsorted","temp","incoming","downloads","stuff","tracks","songs",
+        "playlist","mix","mixes","cd1","cd2","cd3","disc 1","disc 2",
+        "electronica-downtempo","world electro - ethno disco - global groove",
+        "jazz house piano bar","master pieces of electro","remixes and other tracks",
+    }
+
     for p in proposals:
         reasons:List[str]=[]; dest="clean"
         if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
             dest="review"; reasons.append("low_confidence")
+        # v6.2: generic folder name → force review with penalty
+        _fn_norm_route = p.folder_name.strip().strip("_- ").lower()
+        if _fn_norm_route in _generic_folder_names:
+            if dest == "clean": dest = "review"
+            reasons.append("generic_folder_name")
+            p.confidence = min(p.confidence, min_conf - 0.05)
         if rr.get("route_duplicates",True) and within_run[p.proposed_folder_name]>1:
             dest="duplicate"
             # Find the other colliding folder name for detail
@@ -2574,6 +2910,9 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
             ensure_dir(mixes_root)
             p.target_path=str(mixes_root/p.proposed_folder_name)
         p.destination=dest; p.decision["route_reasons"]=reasons
+        # v7.0: generate human-readable review summary
+        if reasons:
+            p.decision["review_summary"]=_build_review_summary(reasons,p.decision.get("confidence_factors",{}),p.confidence)
         if dest=="review":    p.target_path=str(review_albums/p.proposed_folder_name)
         elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
 
@@ -2631,7 +2970,9 @@ def _write_session_reports(session_id:str,profile_name:str,source_root:Path,prop
         rr=", ".join(p.decision.get("route_reasons",[]))
         tag={"clean":"CLEAN","review":"REVIEW","duplicate":"DUPE"}.get(p.destination,p.destination.upper())
         heur=" [heuristic]" if p.decision.get("used_heuristic") else ""
-        lines.append(f"{tag:<9} {p.confidence:>6.2f}  {p.folder_name[:45]:<45}  {p.proposed_folder_name}{heur}{('  ['+rr+']') if rr else ''}")
+        va_flag=" [VA]" if p.decision.get("is_va") else ""
+        art_info=f"  artist={p.decision.get('albumartist_display','')}" if p.decision.get("albumartist_display") else ""
+        lines.append(f"{tag:<9} {p.confidence:>6.2f}  {p.folder_name[:45]:<45}  → {p.proposed_folder_name}{heur}{va_flag}{art_info}{('  ['+rr+']') if rr else ''}")
         for fd in (p.stats.format_duplicates or []):
             lines.append(f"{'':>20}  ⚠ format dupe: {fd}")
     (session_dir/"report.txt").write_text("\n".join(lines),encoding="utf-8")
@@ -2818,6 +3159,401 @@ def merge_missing_tracks(
             err(f"    merge copy failed ({f.name}): {e}")
     return copied
 
+# ─────────────────────────────────────────────────────────────────
+# v7.0 — Interactive folder-by-folder review mode
+# ─────────────────────────────────────────────────────────────────
+
+def _conf_bar(c:float,width:int=20)->str:
+    """Render a confidence bar: ████████░░░░ 0.75"""
+    filled=int(c*width); empty=width-filled
+    if c>=0.80: color=C.GREEN
+    elif c>=0.50: color=C.YELLOW
+    else: color=C.RED
+    return f"{color}{'█'*filled}{'░'*empty}{C.RESET}  {c:.2f}"
+
+def _factor_bar(name:str,val:float,width:int=20)->str:
+    """Render a single factor bar line."""
+    desc=_FACTOR_DESCRIPTIONS.get(name,name)
+    filled=int(val*width); empty=width-filled
+    if val>=0.80: color=C.GREEN
+    elif val>=0.50: color=C.YELLOW
+    else: color=C.RED
+    return f"    {desc:28s} {color}{'█'*filled}{'░'*empty}{C.RESET}  {val:.2f}"
+
+def _display_folder_card(idx:int,total:int,p:FolderProposal)->None:
+    """Print the interactive review card for one folder."""
+    d=p.decision; factors=d.get("confidence_factors",{})
+    src_name=p.folder_name; dst_name=p.proposed_folder_name
+    dest_upper=p.destination.upper()
+    dest_color=C.GREEN if p.destination=="clean" else (C.YELLOW if p.destination=="review" else C.RED)
+
+    # Header
+    print(f"\n{'═'*66}")
+    print(f"  {C.BOLD}[{idx:>3} / {total}]{C.RESET}{'':>30}{dest_color}ROUTE: {dest_upper}{C.RESET}")
+    print(f"{'─'*66}")
+    # Before/after
+    if src_name!=dst_name:
+        print(f"  {C.DIM}FROM:{C.RESET}  {src_name}")
+        print(f"  {C.GREEN}  TO:{C.RESET}  {dst_name}")
+    else:
+        print(f"  {C.DIM}FROM:{C.RESET}  {src_name}")
+        print(f"  {C.DIM}  TO:{C.RESET}  {C.DIM}(same){C.RESET}")
+    print()
+    # Metadata line
+    artist=d.get("albumartist_display","--"); album=d.get("dominant_album_display","--")
+    year=d.get("year","--"); genre=d.get("genre","--")
+    va="Yes" if d.get("is_va") else "No"
+    va_color=C.CYAN if d.get("is_va") else C.DIM
+    mix_tag=f"  {C.MAGENTA}[MIX]{C.RESET}" if d.get("is_mix") else ""
+    ep_tag=f"  {C.CYAN}[EP]{C.RESET}" if d.get("is_ep") else ""
+    ext_str=", ".join(f"{k.upper()} {v}" for k,v in (p.stats.extensions or {}).items()) or "--"
+    print(f"  Artist: {C.BOLD}{artist}{C.RESET}{'':>4}VA: {va_color}{va}{C.RESET}{mix_tag}{ep_tag}")
+    print(f"  Album:  {album}{'':>4}Year: {year}")
+    print(f"  Tracks: {p.stats.tracks_total} files  ·  {ext_str}")
+    if genre!="--": print(f"  Genre:  {genre}")
+    print()
+    # Confidence bar
+    print(f"  CONFIDENCE  {_conf_bar(p.confidence)}")
+    # Factor breakdown
+    display_factors=["tag_coverage","dominance","title_quality","filename_consistency",
+                     "completeness","aa_consistency","folder_alignment"]
+    for f in display_factors:
+        if f in factors and isinstance(factors[f],float):
+            print(_factor_bar(f,factors[f]))
+    # Route reasons
+    reasons=d.get("route_reasons",[])
+    if reasons:
+        print(f"\n  {C.DIM}Reasons: {', '.join(reasons)}{C.RESET}")
+    summary=d.get("review_summary","")
+    if summary:
+        print(f"  {C.DIM}{summary}{C.RESET}")
+    print(f"{'─'*66}")
+
+def _display_tracks(p:FolderProposal)->None:
+    """Show track listing for current folder."""
+    folder=Path(p.folder_path)
+    if not folder.exists():
+        print(f"  {C.RED}Folder not found on disk.{C.RESET}")
+        return
+    exts={".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma"}
+    files=sorted([f for f in folder.iterdir() if f.suffix.lower() in exts],key=lambda f:f.name)
+    if not files:
+        print(f"  {C.DIM}No audio files found.{C.RESET}")
+        return
+    print(f"\n  TRACKS ({len(files)} files)")
+    print(f"  {'─'*60}")
+    shown=min(len(files),30)
+    for i,f in enumerate(files[:shown]):
+        print(f"   {i+1:>2}  {f.name}")
+    if len(files)>shown:
+        print(f"   {C.DIM}... and {len(files)-shown} more{C.RESET}")
+    print(f"  {'─'*60}")
+
+def _interactive_action_help()->None:
+    """Print the action key reference."""
+    print(f"\n  {'─'*50}")
+    print(f"  INTERACTIVE REVIEW — ACTIONS")
+    print(f"  {'─'*50}")
+    print(f"  y  or  Enter    Approve (accept proposed routing)")
+    print(f"  s               Skip (leave in source, no move)")
+    print(f"  r               Send to Review (requires a note)")
+    print(f"  a               Set artist name (override detection)")
+    print(f"  v               Toggle VA status")
+    print(f"  t               Show track listing")
+    print(f"  q               Stop processing (keeps moves done so far)")
+    print(f"  ?               Show this help")
+    print(f"  {'─'*50}")
+
+def _prompt_review_note()->str:
+    """Prompt for a review note. Required — loops until provided."""
+    print(f"\n  {C.DIM}Preset reasons:{C.RESET}")
+    for i,r in enumerate(REVIEW_REASON_PRESETS,1):
+        print(f"    {i}. {r}")
+    print(f"    {len(REVIEW_REASON_PRESETS)+1}. Custom note")
+    while True:
+        choice=input(f"  Reason (1-{len(REVIEW_REASON_PRESETS)+1} or text): ").strip()
+        if not choice: continue
+        try:
+            idx=int(choice)
+            if 1<=idx<=len(REVIEW_REASON_PRESETS):
+                return REVIEW_REASON_PRESETS[idx-1]
+            elif idx==len(REVIEW_REASON_PRESETS)+1:
+                note=input("  Custom note: ").strip()
+                if note: return note
+                continue
+        except ValueError:
+            return choice  # free text
+
+def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
+                       session_id:str,dry_run:bool=False,
+                       threshold:Optional[float]=None,
+                       source_root:Optional[Path]=None)->List[Dict[str,Any]]:
+    """
+    v7.0: Interactive folder-by-folder review mode.
+    Sort by confidence ascending (worst first), display card, prompt for action.
+    Returns list of applied move entries (same format as apply_folder_moves).
+    """
+    mc=cfg.get("move",{})
+    policy=mc.get("on_collision","suffix"); sfmt=mc.get("suffix_format"," ({n})")
+    use_cs=bool(mc.get("use_checksum",False))
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+    hist_path=Path(cfg["logging"]["history_log"]); skip_path=Path(cfg["logging"]["skipped_log"])
+
+    # Filter by threshold if specified
+    if threshold is not None:
+        proposals=[p for p in proposals if p.confidence<threshold]
+        if not proposals:
+            out(f"\n  {C.GREEN}All folders above threshold {threshold:.2f}. Nothing to review.{C.RESET}")
+            return []
+
+    # Sort by confidence ascending — hardest decisions first
+    proposals.sort(key=lambda p:p.confidence)
+
+    total=len(proposals)
+    applied:List[Dict[str,Any]]=[]
+    skipped=0; sent_to_review=0; overrides=0
+
+    # Session header
+    clean_n=sum(1 for p in proposals if p.destination=="clean")
+    rev_n=sum(1 for p in proposals if p.destination=="review")
+    print(f"\n{'═'*66}")
+    print(f"  {C.BOLD}RAAGDOSA v{APP_VERSION}  ·  Interactive Review  ·  Session {session_id[:12]}{C.RESET}")
+    print(f"{'─'*66}")
+    print(f"  Folders: {total}  ·  {C.GREEN}Clean: {clean_n}{C.RESET}  ·  {C.YELLOW}Review: {rev_n}{C.RESET}")
+    print(f"  Sorted by confidence (lowest first)")
+    if dry_run: print(f"  {C.YELLOW}DRY RUN — nothing will be moved{C.RESET}")
+    print(f"  Press ? for help at any prompt.")
+    print(f"{'═'*66}")
+
+    # Session notes file for learning
+    session_notes_path=Path(cfg["logging"]["session_dir"])/session_id/"review_notes.jsonl"
+
+    for idx,p in enumerate(proposals,1):
+        if should_stop():
+            out(f"\n{C.YELLOW}Stopped. {len(applied)}/{total} applied.{C.RESET}")
+            break
+
+        src=Path(p.folder_path); dst=Path(p.target_path)
+        if not src.exists(): continue
+
+        _display_folder_card(idx,total,p)
+
+        # Action loop — stays on this folder until an action advances
+        while True:
+            action_labels=f"  [y] Approve  [s] Skip  [r] → Review  [a] Set Artist  [v] Toggle VA  [t] Tracks  [q] Stop  [?] Help"
+            print(action_labels)
+            try:
+                choice=input(f"  Action [y]: ").strip().lower()
+            except (EOFError,KeyboardInterrupt):
+                choice="q"
+
+            if choice in ("","y","yes"):
+                # Approve — proceed with the proposed move
+                dst2=collision_resolve(dst,policy,sfmt)
+                if dst2 is None:
+                    warn(f"Collision skip: {dst.name}")
+                    append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"collision_skip","src":str(src)})
+                    break
+                if dry_run:
+                    out(f"  {C.DIM}[dry-run]{C.RESET} {src.name}  →  {dst2.name}  {status_tag(p.destination)}")
+                    append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dry_run","src":str(src),"dst":str(dst2)})
+                    break
+                ensure_dir(dst2.parent)
+                try:
+                    move_method,move_elapsed=safe_move_folder(src,dst2,use_checksum=use_cs)
+                except RuntimeError as e:
+                    err(f"  Move failed: {e}")
+                    append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":f"move_failed:{e}","src":str(src)})
+                    break
+                action_id=uuid.uuid4().hex[:10]
+                entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+                       "original_path":str(src),"original_parent":str(src.parent),"original_folder_name":src.name,
+                       "target_path":str(dst2),"target_parent":str(dst2.parent),"target_folder_name":dst2.name,
+                       "destination":p.destination,"confidence":p.confidence,"decision":p.decision,
+                       "move_method":move_method,"interactive_action":"approved"}
+                append_jsonl(hist_path,entry); applied.append(entry)
+                if p.destination=="clean": manifest_add(cfg,dst2.name,{"original_path":str(src),"confidence":p.confidence,"session_id":session_id})
+                elif p.destination=="review": _write_review_sidecar(dst2,p,session_id)
+                out(f"  {C.GREEN}✓ Approved{C.RESET} → {dst2.name}")
+                if source_root:
+                    try: cleanup_empty_parents(src,source_root)
+                    except Exception: pass
+                break
+
+            elif choice=="s":
+                # Skip — leave in source
+                reason_text=input(f"  Reason (Enter to skip): ").strip()
+                skip_entry={"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+                            "reason":"user_skipped","src":str(src),"interactive_action":"skipped"}
+                if reason_text:
+                    skip_entry["user_note"]=reason_text
+                    ensure_dir(session_notes_path.parent)
+                    append_jsonl(session_notes_path,{"folder":src.name,"action":"skipped","note":reason_text,"timestamp":now_iso(),"confidence":p.confidence})
+                append_jsonl(skip_path,skip_entry)
+                skipped+=1
+                out(f"  {C.DIM}→ Skipped{C.RESET}")
+                break
+
+            elif choice=="r":
+                # Send to Review with required note
+                note=_prompt_review_note()
+                # Re-route to review
+                profile_name=cfg.get("active_profile","incoming")
+                profiles=cfg.get("profiles",{})
+                profile_obj=profiles.get(profile_name,{})
+                sr=source_root or Path(profile_obj.get("source_root","")).expanduser()
+                review_albums=derive_review_albums_root(profile_obj,sr)
+                review_dst=review_albums/p.proposed_folder_name
+                review_dst2=collision_resolve(review_dst,policy,sfmt)
+                if review_dst2 is None:
+                    warn(f"Review collision skip: {review_dst.name}")
+                    break
+                p.destination="review"; p.decision["route_reasons"]=p.decision.get("route_reasons",[])+["user_review"]
+                p.decision["user_review_note"]=note
+                if dry_run:
+                    out(f"  {C.DIM}[dry-run]{C.RESET} → Review: {note}")
+                    break
+                ensure_dir(review_dst2.parent)
+                try:
+                    move_method,move_elapsed=safe_move_folder(src,review_dst2,use_checksum=use_cs)
+                except RuntimeError as e:
+                    err(f"  Move failed: {e}"); break
+                action_id=uuid.uuid4().hex[:10]
+                entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+                       "original_path":str(src),"original_parent":str(src.parent),"original_folder_name":src.name,
+                       "target_path":str(review_dst2),"target_parent":str(review_dst2.parent),"target_folder_name":review_dst2.name,
+                       "destination":"review","confidence":p.confidence,"decision":p.decision,
+                       "move_method":move_method,"interactive_action":"sent_to_review","user_note":note}
+                append_jsonl(hist_path,entry); applied.append(entry)
+                _write_review_sidecar(review_dst2,p,session_id)
+                # Log note for learning
+                ensure_dir(session_notes_path.parent)
+                append_jsonl(session_notes_path,{"folder":src.name,"action":"sent_to_review","note":note,"timestamp":now_iso(),"confidence":p.confidence})
+                sent_to_review+=1
+                out(f"  {C.YELLOW}→ Review:{C.RESET} {note}")
+                if source_root:
+                    try: cleanup_empty_parents(src,source_root)
+                    except Exception: pass
+                break
+
+            elif choice=="a":
+                # Set artist override
+                current=p.decision.get("albumartist_display","--")
+                print(f"  Current artist: {current}")
+                new_artist=input(f"  New artist name: ").strip()
+                if not new_artist: continue
+                # Update proposal
+                p.decision["albumartist_display"]=new_artist
+                p.decision["is_va"]=False
+                p.decision["override_type"]="set_artist"
+                p.decision["override_original"]=current
+                # Re-derive destination path
+                profile_name=cfg.get("active_profile","incoming")
+                profiles=cfg.get("profiles",{})
+                profile_obj=profiles.get(profile_name,{})
+                sr=source_root or Path(profile_obj.get("source_root","")).expanduser()
+                clean_albums=derive_clean_albums_root(profile_obj,sr)
+                new_target=resolve_library_path(clean_albums,new_artist,p.decision.get("dominant_album_display",""),
+                                               p.decision.get("year"),p.decision.get("is_flac_only",False),
+                                               False,False,p.decision.get("is_mix",False),cfg,profile_obj,
+                                               genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
+                                               key=p.decision.get("key"),label=p.decision.get("label"))
+                p.proposed_folder_name=new_target.name; p.target_path=str(new_target); p.destination="clean"
+                overrides+=1
+                print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
+                print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}  (was: {current})   VA: No")
+                print(f"    TO:   {new_target.name}")
+                print(f"  ROUTE: {C.GREEN}CLEAN{C.RESET}")
+                # Stay in action loop — user can approve or adjust further
+
+            elif choice=="v":
+                # Toggle VA status
+                was_va=p.decision.get("is_va",False)
+                if was_va:
+                    # VA → single artist: need artist name
+                    new_artist=input(f"  Artist name: ").strip()
+                    if not new_artist: continue
+                    p.decision["is_va"]=False
+                    p.decision["albumartist_display"]=new_artist
+                    p.decision["override_type"]="unmark_va"
+                    overrides+=1
+                    # Re-derive path
+                    profile_name=cfg.get("active_profile","incoming")
+                    profiles=cfg.get("profiles",{})
+                    profile_obj=profiles.get(profile_name,{})
+                    sr=source_root or Path(profile_obj.get("source_root","")).expanduser()
+                    clean_albums=derive_clean_albums_root(profile_obj,sr)
+                    new_target=resolve_library_path(clean_albums,new_artist,p.decision.get("dominant_album_display",""),
+                                                   p.decision.get("year"),p.decision.get("is_flac_only",False),
+                                                   False,False,p.decision.get("is_mix",False),cfg,profile_obj,
+                                                   genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
+                                                   key=p.decision.get("key"),label=p.decision.get("label"))
+                    p.proposed_folder_name=new_target.name; p.target_path=str(new_target); p.destination="clean"
+                    print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
+                    print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}   VA: No  (was: VA)")
+                    print(f"    TO:   {new_target.name}")
+                else:
+                    # Single artist → VA
+                    old_artist=p.decision.get("albumartist_display","--")
+                    p.decision["is_va"]=True
+                    p.decision["albumartist_display"]="Various Artists"
+                    p.decision["override_type"]="mark_va"
+                    overrides+=1
+                    profile_name=cfg.get("active_profile","incoming")
+                    profiles=cfg.get("profiles",{})
+                    profile_obj=profiles.get(profile_name,{})
+                    sr=source_root or Path(profile_obj.get("source_root","")).expanduser()
+                    clean_albums=derive_clean_albums_root(profile_obj,sr)
+                    new_target=resolve_library_path(clean_albums,"Various Artists",p.decision.get("dominant_album_display",""),
+                                                   p.decision.get("year"),p.decision.get("is_flac_only",False),
+                                                   True,False,p.decision.get("is_mix",False),cfg,profile_obj,
+                                                   genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
+                                                   key=p.decision.get("key"),label=p.decision.get("label"))
+                    p.proposed_folder_name=new_target.name; p.target_path=str(new_target)
+                    print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
+                    print(f"  Artist: Various Artists  (was: {old_artist})   VA: Yes")
+                    print(f"    TO:   {new_target.name}")
+
+            elif choice=="t":
+                _display_tracks(p)
+
+            elif choice=="q":
+                print(f"\n{'═'*66}")
+                print(f"  Stop processing?")
+                print(f"  Completed: {len(applied)} approved · {skipped} skipped · {sent_to_review} to review")
+                print(f"  Remaining: {total-idx} folders will stay in source.")
+                print(f"  Moves already made will NOT be undone.")
+                print(f"{'─'*66}")
+                confirm=input(f"  Confirm stop? [y/N]: ").strip().lower()
+                if confirm in ("y","yes"):
+                    out(f"\n  Session ended. {len(applied)} moved · {skipped} skipped · {total-idx} remaining.")
+                    out(f"  Undo: raagdosa undo --session {session_id}")
+                    return applied
+                # Otherwise continue with this folder
+
+            elif choice=="?":
+                _interactive_action_help()
+
+            else:
+                print(f"  {C.DIM}Unknown action. Press ? for help.{C.RESET}")
+
+    # Session summary
+    print(f"\n{'═'*66}")
+    print(f"  {C.BOLD}SESSION COMPLETE{C.RESET}")
+    print(f"{'─'*66}")
+    approved_clean=sum(1 for a in applied if a.get("destination")=="clean")
+    approved_review=sum(1 for a in applied if a.get("destination")=="review")
+    print(f"  Approved to Clean:   {C.GREEN}{approved_clean}{C.RESET} folders")
+    print(f"  Sent to Review:      {C.YELLOW}{approved_review}{C.RESET} folders")
+    print(f"  Skipped:             {skipped} folders")
+    if overrides: print(f"  Overrides applied:   {overrides}")
+    print(f"{'─'*66}")
+    print(f"  Undo:  raagdosa undo --session {session_id}")
+    print(f"  Log:   raagdosa history --session {session_id}")
+    print(f"{'═'*66}\n")
+
+    return applied
+
 def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interactive:bool,
                        auto_above:Optional[float],dry_run:bool,session_id:str,
                        source_root:Optional[Path]=None)->List[Dict[str,Any]]:
@@ -2864,7 +3600,14 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
         elif dst2!=dst: warn(f"Collision — renamed to: {dst2.name}")
         should_prompt=(interactive or (req_confirm and p.confidence<interactive_below)) and not(auto_above is not None and p.confidence>=auto_above)
         if should_prompt:
-            print(f"\n  {C.DIM}{src}{C.RESET}\n  → {dst2}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}")
+            # v6.1: Show richer context for review decisions
+            _art_info=f"  artist: {p.decision.get('albumartist_display','?')}" if p.decision.get("albumartist_display") else ""
+            _va_info=f"  {C.YELLOW}[VA]{C.RESET}" if p.decision.get("is_va") else ""
+            _reasons=", ".join(p.decision.get("route_reasons",[]))
+            print(f"\n  {C.DIM}FROM:{C.RESET} {src.name}")
+            print(f"  {C.DIM}  TO:{C.RESET} {dst2.name}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}{_va_info}")
+            if _art_info or _reasons:
+                print(f"  {C.DIM}    {_art_info}{'  |  ' if _art_info and _reasons else ''}{_reasons}{C.RESET}")
             if p.decision.get("used_heuristic"): warn("name from heuristic — no tags")
             if input("  Apply? [y/N] ").strip().lower()!="y":
                 append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"user_skipped","src":str(src)}); continue
@@ -2886,6 +3629,7 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
                "move_method":move_method}
         append_jsonl(hist_path,entry); applied.append(entry)
         if p.destination=="clean": manifest_add(cfg,dst2.name,{"original_path":str(src),"confidence":p.confidence,"session_id":session_id})
+        elif p.destination=="review": _write_review_sidecar(dst2,p,session_id)
         method_tag=f"  {C.DIM}[{move_method} {move_elapsed*1000:.0f}ms]{C.RESET}" if _verbosity>=VERBOSE else ""
         out(f"  MOVED {status_tag(p.destination)} {C.DIM}{src.name}{C.RESET}  →  {dst2.name}  conf={conf_color(p.confidence)}{method_tag}")
         # Clean up empty parent directories left behind in source
@@ -2909,6 +3653,29 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
 # Track renaming
 # ─────────────────────────────────────────────
 _TLDS="com|net|org|info|biz|co|io|me|fm|tv|cc|us|uk|de|fr|es|it|nl|ru|br|mx|in|jp|cn|au|ca|ch|se|no|fi|dk|pl|cz"
+
+# v6.2: URL/domain garbage detection for tag values
+_GARBAGE_URL_RE=re.compile(
+    r"(^https?://)"                        # starts with http(s)://
+    r"|(^www\.)"                            # starts with www.
+    rf"|(\b[\w\-]+\.({_TLDS})\b)",          # contains domain.tld
+    re.IGNORECASE
+)
+# Musical key names that get mis-tagged as artist (e.g. key=Em stored in artist field)
+_MUSICAL_KEY_GARBAGE=frozenset({
+    "a","ab","am","b","bb","bbm","bm","c","cb","cm","d","db","dm","dbm",
+    "e","eb","ebm","em","f","fb","fm","g","gb","gbm","gm",
+    "abm","c#","c#m","d#","d#m","f#","f#m","g#","g#m","a#","a#m",
+    "smg",  # scene-release group, not an artist
+})
+
+def _is_garbage_tag_value(val:str)->bool:
+    """Return True if a tag value looks like a URL/domain or musical key — not a real artist/album."""
+    if not val: return False
+    v=val.strip()
+    if _GARBAGE_URL_RE.search(v): return True
+    if v.lower() in _MUSICAL_KEY_GARBAGE and len(v)<=4: return True
+    return False
 
 def strip_trailing_domains(s:str)->str:
     s=re.sub(rf"(\s*[\(\[]\s*(https?:\/\/)?(www\.)?[\w\-]+(\.[\w\-]+)+\.({_TLDS})\s*[\)\]]\s*)$","",s.strip(),flags=re.IGNORECASE)
@@ -3001,18 +3768,43 @@ def classify_folder_for_tracks(decision:Dict[str,Any],cfg:Dict[str,Any])->str:
 
 def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Path,cfg:Dict[str,Any],decision:Dict[str,Any],disc_multi:bool)->Tuple[Optional[str],float,str,Dict[str,Any]]:
     trc=cfg.get("track_rename",{}); pat=trc.get("patterns",{}); ext=src.suffix.lower()
-    title=(tags.get("title") or "").strip(); artist=(tags.get("artist") or "").strip()
+    tag_title=(tags.get("title") or "").strip(); tag_artist=(tags.get("artist") or "").strip()
     track_raw=(tags.get("tracknumber") or "").strip(); disc_raw=(tags.get("discnumber") or "").strip()
     folder_name = src.parent.name
-    fn_artist, fn_title = parse_artist_title_from_fn(src.stem, folder_name=folder_name, cfg=cfg)
-    if not title and fn_title: title=fn_title
+    meta:Dict[str,Any]={}
+
+    # v6.1: Smart tag vs filename priority.
+    # Parse filename only when needed — if tags are clean, trust them fully.
+    _tag_title_clean = tag_title and len(tag_title) >= 2 and not detect_garbage_name(tag_title) and not detect_mojibake(tag_title)
+    _tag_artist_clean = tag_artist and len(tag_artist) >= 2 and not detect_garbage_name(tag_artist) and not detect_mojibake(tag_artist)
+
+    # Only parse filename when tag data is missing or garbage
+    fn_artist, fn_title = (None, None)
+    if not _tag_title_clean or not _tag_artist_clean:
+        fn_artist, fn_title = parse_artist_title_from_fn(src.stem, folder_name=folder_name, cfg=cfg)
+
+    # Title: prefer clean tag, fall back to filename
+    if _tag_title_clean:
+        title = tag_title; meta["title_src"] = "tag"
+    elif fn_title:
+        title = fn_title; meta["title_src"] = "filename"
+    else:
+        title = tag_title  # last resort: use whatever tag had even if short
+        meta["title_src"] = "tag_fallback" if title else "none"
+
     if title: title=cleanup_title(title,cfg)
     if not title: return None,0.0,"missing_title",{}
     title_c,mix_suf=extract_mix_suffix(title,cfg); title_c=cleanup_title(title_c,cfg)
     if not title_c: return None,0.0,"title_cleaned_empty",{}
-    meta:Dict[str,Any]={}
-    if not artist and fn_artist: artist=fn_artist; meta["artist_src"]="filename"
-    elif artist: meta["artist_src"]="tag"
+
+    # Artist: prefer clean tag, fall back to filename
+    if _tag_artist_clean:
+        artist = tag_artist; meta["artist_src"] = "tag"
+    elif fn_artist:
+        artist = fn_artist; meta["artist_src"] = "filename"
+    else:
+        artist = tag_artist  # last resort
+        meta["artist_src"] = "tag_fallback" if artist else "none"
     if artist and cfg.get("artists",{}).get("feature_handling",{}).get("normalize_tokens",True):
         artist=re.sub(r"\bfeaturing\b|\bft\.?\b|\bfeat\.?\b","feat.",artist,flags=re.IGNORECASE)
         artist=re.sub(r"\s+"," ",artist).strip()
@@ -3241,6 +4033,122 @@ def cmd_verify(cfg:Dict[str,Any],profile_name:str)->None:
 # ─────────────────────────────────────────────
 # learn — config suggestion from Review patterns
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# v7.0 — Reference (Musical Reference) commands
+# ─────────────────────────────────────────────────────────────────
+
+def cmd_reference(cfg_path:Path,cfg:Dict[str,Any],action:str,
+                  import_path:Optional[str]=None,section:Optional[str]=None,
+                  export_path:Optional[str]=None)->None:
+    """Handle `raagdosa reference list|import|export` commands."""
+    ref=cfg.get("reference",{})
+
+    if action=="list":
+        aliases=ref.get("artist_aliases",{}) or {}
+        labels=ref.get("known_labels",[]) or []
+        va_prefixes=ref.get("va_rescue_prefixes",[]) or []
+        noise=ref.get("noise_patterns",[]) or []
+        out(f"\n{C.BOLD}Musical Reference{C.RESET}")
+        out(f"{'─'*50}")
+        out(f"  Artist aliases:     {len(aliases)}")
+        out(f"  Known labels:       {len(labels)}")
+        out(f"  VA rescue prefixes: {len(va_prefixes)}")
+        out(f"  Noise patterns:     {len(noise)}")
+        if aliases:
+            out(f"\n  {C.DIM}Artist aliases (first 20):{C.RESET}")
+            for i,(k,v) in enumerate(sorted(aliases.items(),key=lambda x:x[1].lower())):
+                if i>=20:
+                    out(f"  {C.DIM}  ... and {len(aliases)-20} more{C.RESET}"); break
+                out(f"    {k:30s} → {v}")
+        if labels:
+            out(f"\n  {C.DIM}Known labels:{C.RESET}")
+            for lb in labels[:15]:
+                out(f"    {lb}")
+            if len(labels)>15: out(f"    {C.DIM}... and {len(labels)-15} more{C.RESET}")
+
+    elif action=="export":
+        # Export reference section to a shareable YAML file
+        export_data={
+            "raagdosa_reference_version":1,
+            "exported_at":now_iso(),
+        }
+        if section:
+            if section in ref:
+                export_data[section]=ref[section]
+            else:
+                err(f"Unknown section: {section}. Available: {', '.join(ref.keys())}"); return
+        else:
+            export_data.update(ref)
+        out_path=Path(export_path) if export_path else Path("reference_export.yaml")
+        write_yaml(out_path,export_data)
+        aliases_n=len(export_data.get("artist_aliases",{}))
+        labels_n=len(export_data.get("known_labels",[]))
+        out(f"  {C.GREEN}Exported:{C.RESET} {out_path}")
+        out(f"  {aliases_n} aliases, {labels_n} labels")
+        out(f"  Share this file with the community!")
+
+    elif action=="import":
+        if not import_path:
+            err("Usage: raagdosa reference import <file.yaml>"); return
+        imp_path=Path(import_path)
+        if not imp_path.exists():
+            err(f"File not found: {imp_path}"); return
+        imp_data=read_yaml(imp_path)
+        # Strip metadata keys
+        for meta_key in ("raagdosa_reference_version","exported_at"):
+            imp_data.pop(meta_key,None)
+        # Merge each section
+        added=0; conflicts=0; source=f"imported:{imp_path.name}:{now_iso()[:10]}"
+        # Artist aliases
+        if "artist_aliases" in imp_data:
+            existing=ref.get("artist_aliases",{}) or {}
+            incoming=imp_data["artist_aliases"] or {}
+            for k,v in incoming.items():
+                if k.lower() in {ek.lower() for ek in existing}:
+                    # Check if canonical differs
+                    existing_canonical=next((ev for ek,ev in existing.items() if ek.lower()==k.lower()),None)
+                    if existing_canonical and existing_canonical!=v:
+                        warn(f"Conflict: '{k}' → yours: '{existing_canonical}' vs import: '{v}'")
+                        choice=input(f"    Keep yours (y) or use import (n)? [y/N]: ").strip().lower()
+                        if choice!="n":
+                            conflicts+=1; continue
+                    else:
+                        continue  # identical, skip
+                existing[k]=v; added+=1
+            ref["artist_aliases"]=existing
+        # Known labels
+        if "known_labels" in imp_data:
+            existing_labels=set(ref.get("known_labels",[]) or [])
+            for lb in (imp_data["known_labels"] or []):
+                if lb not in existing_labels:
+                    existing_labels.add(lb); added+=1
+            ref["known_labels"]=sorted(existing_labels)
+        # VA rescue prefixes
+        if "va_rescue_prefixes" in imp_data:
+            existing_va=set(ref.get("va_rescue_prefixes",[]) or [])
+            for p in (imp_data["va_rescue_prefixes"] or []):
+                if p not in existing_va:
+                    existing_va.add(p); added+=1
+            ref["va_rescue_prefixes"]=sorted(existing_va)
+        # Noise patterns
+        if "noise_patterns" in imp_data:
+            existing_noise=ref.get("noise_patterns",[]) or []
+            existing_pats={n.get("pattern","") if isinstance(n,dict) else n for n in existing_noise}
+            for n in (imp_data["noise_patterns"] or []):
+                pat=n.get("pattern","") if isinstance(n,dict) else n
+                if pat and pat not in existing_pats:
+                    existing_noise.append(n); added+=1
+            ref["noise_patterns"]=existing_noise
+
+        # Write back to config
+        cfg["reference"]=ref
+        write_yaml(cfg_path,cfg)
+        out(f"\n  {C.GREEN}Imported:{C.RESET} {added} new entries from {imp_path.name}")
+        if conflicts: out(f"  {C.YELLOW}Conflicts:{C.RESET} {conflicts} kept your version")
+        out(f"  Source: {source}")
+    else:
+        err(f"Unknown reference action: {action}. Use: list, import, export")
+
 def cmd_learn(cfg_path:Path,cfg:Dict[str,Any],session_id:Optional[str])->None:
     _resolve_log_paths_from_active_profile(cfg)
     sdir=Path(cfg["logging"]["session_dir"]); sessions:List[Path]=[]
@@ -3496,8 +4404,9 @@ def cmd_review_list(cfg:Dict[str,Any],profile_name:str,older_than_days:Optional[
     now=dt.datetime.now()
     cutoff=now-dt.timedelta(days=older_than_days) if older_than_days else None
 
-    # Build a lookup from session proposals for confidence/reason data
+    # Build a lookup from session proposals for confidence/reason/origin data
     conf_map:Dict[str,float]={}; reason_map:Dict[str,str]={}
+    origin_map:Dict[str,str]={}; detail_map:Dict[str,Dict[str,Any]]={}
     sdir=Path(cfg["logging"]["session_dir"])
     if sdir.exists():
         for sd in sorted(sdir.iterdir(),key=lambda p:p.name,reverse=True)[:10]:
@@ -3509,7 +4418,13 @@ def cmd_review_list(cfg:Dict[str,Any],profile_name:str,older_than_days:Optional[
                     nm=fp.get("proposed_folder_name","")
                     if nm and nm not in conf_map:
                         conf_map[nm]=float(fp.get("confidence",0.0))
-                        reason_map[nm]=", ".join(fp.get("decision",{}).get("route_reasons",[]))
+                        dec=fp.get("decision",{})
+                        reason_map[nm]=", ".join(dec.get("route_reasons",[]))
+                        origin_map[nm]=fp.get("folder_name","")
+                        detail_map[nm]={"artist":dec.get("albumartist_display",""),
+                                        "is_va":dec.get("is_va",False),
+                                        "folder_type":dec.get("folder_type",""),
+                                        "heuristic":dec.get("used_heuristic",False)}
             except Exception: continue
 
     folders=sorted([d for d in review_albums.rglob("*") if d.is_dir()
@@ -3520,17 +4435,179 @@ def cmd_review_list(cfg:Dict[str,Any],profile_name:str,older_than_days:Optional[
         folders=[d for d in folders if dt.datetime.fromtimestamp(folder_mtime(d))<=cutoff]
 
     if not folders: out(f"No Review folders{' older than '+str(older_than_days)+' days' if older_than_days else ''}."); return
-    out(f"\n{'Folder':<45} {'Age':>7}  {'Conf':>6}  Reason")
-    out("─"*90)
+    out("")
     for d in folders:
         mtime=dt.datetime.fromtimestamp(folder_mtime(d))
         age=(now-mtime).days
         conf=conf_map.get(d.name)
         reason=reason_map.get(d.name,"")
+        origin=origin_map.get(d.name,"")
+        detail=detail_map.get(d.name,{})
         conf_s=conf_color(conf) if conf else f"{C.DIM}n/a{C.RESET}"
         age_col=C.RED if age>60 else (C.YELLOW if age>14 else C.DIM)
-        out(f"  {d.name[:43]:<43}  {age_col}{age:>5}d{C.RESET}  {conf_s}  {C.DIM}{reason[:50]}{C.RESET}")
-    out(f"\n{C.DIM}Total: {len(folders)} folder(s) in Review{C.RESET}")
+        # v6.1: Show FROM → TO transformation so user can evaluate the proposal
+        if origin and origin != d.name:
+            out(f"  {C.DIM}{origin}{C.RESET}")
+            out(f"  → {C.BOLD}{d.name}{C.RESET}  {conf_s}  {age_col}{age}d{C.RESET}")
+        else:
+            out(f"  {C.BOLD}{d.name}{C.RESET}  {conf_s}  {age_col}{age}d{C.RESET}")
+        # Show key decision context
+        flags=[]
+        if detail.get("artist"): flags.append(f"artist={detail['artist']}")
+        if detail.get("is_va"): flags.append("VA")
+        if detail.get("folder_type") and detail["folder_type"] not in ("album",): flags.append(detail["folder_type"])
+        if detail.get("heuristic"): flags.append("heuristic")
+        if reason: flags.append(reason)
+        if flags:
+            out(f"    {C.DIM}{' | '.join(flags)}{C.RESET}")
+        out("")
+    out(f"{C.DIM}Total: {len(folders)} folder(s) in Review{C.RESET}")
+
+# ─────────────────────────────────────────────
+# review promote — force VA→album re-evaluation
+# ─────────────────────────────────────────────
+def cmd_review_promote(cfg:Dict[str,Any],profile_name:str,folder_query:str,dry_run:bool=False,artist_override:Optional[str]=None)->None:
+    """
+    Re-evaluate a Review folder as a single-artist album (force_album=True).
+    If the new proposal passes confidence, move it to Clean/.
+    The user can optionally provide --artist to force the artist name.
+    """
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
+    setup_logging_paths(cfg, profile, source_root)
+    roots=ensure_roots(profile,source_root)
+    review_albums=roots["review_albums"]; clean_albums=roots["clean_albums"]
+    exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
+
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}")
+    out(f"{C.BOLD}raagdosa review promote{C.RESET}\n{'═'*60}")
+
+    if not review_albums.exists():
+        out("Review/Albums not found."); return
+
+    # Find the folder — exact match first, then fuzzy
+    folder_query_p=Path(folder_query).expanduser().resolve()
+    target:Optional[Path]=None
+    if folder_query_p.exists() and folder_query_p.is_dir():
+        target=folder_query_p
+    else:
+        # Search in Review/Albums for matching name
+        candidates=[d for d in review_albums.rglob("*") if d.is_dir()
+                    and any(f.suffix.lower() in exts for f in d.iterdir() if f.is_file())]
+        # Exact name match
+        for d in candidates:
+            if d.name == folder_query:
+                target=d; break
+        # Fuzzy substring match
+        if not target:
+            q_low=folder_query.lower()
+            matches=[d for d in candidates if q_low in d.name.lower()]
+            if len(matches)==1:
+                target=matches[0]
+            elif len(matches)>1:
+                out(f"  Multiple matches for '{folder_query}':")
+                for m in matches[:10]:
+                    out(f"    {m.name}")
+                out(f"  Be more specific."); return
+
+    if not target:
+        err(f"Could not find '{folder_query}' in Review."); return
+
+    audio_files=list_audio_files(target,exts)
+    if not audio_files:
+        err(f"No audio files in {target.name}"); return
+
+    # If user provides --artist, write a temporary .raagdosa override
+    _tmp_override=False
+    override_path=target/".raagdosa"
+    if artist_override and not override_path.exists():
+        try:
+            override_path.write_text(f"albumartist: {artist_override}\n",encoding="utf-8")
+            _tmp_override=True
+        except Exception: pass
+
+    # Build original proposal (as-is) for comparison
+    prop_original=build_folder_proposal(target,audio_files,source_root,profile,cfg)
+
+    # Build new proposal with force_album=True
+    prop_new=build_folder_proposal(target,audio_files,source_root,profile,cfg,force_album=True)
+
+    # Clean up temp override
+    if _tmp_override:
+        try: override_path.unlink()
+        except Exception: pass
+
+    if not prop_new:
+        err(f"Could not build a proposal for {target.name}"); return
+
+    # Show comparison
+    out(f"\n{C.BOLD}Current (VA):{C.RESET}")
+    if prop_original:
+        out(f"  {prop_original.proposed_folder_name}  conf={conf_color(prop_original.confidence)}")
+        out(f"  artist: {prop_original.decision.get('albumartist_display','?')}  VA={prop_original.decision.get('is_va')}")
+    else:
+        out(f"  {C.DIM}(no proposal){C.RESET}")
+
+    out(f"\n{C.BOLD}Re-evaluated (album):{C.RESET}")
+    out(f"  {C.GREEN}{prop_new.proposed_folder_name}{C.RESET}  conf={conf_color(prop_new.confidence)}")
+    out(f"  artist: {prop_new.decision.get('albumartist_display','?')}  VA={prop_new.decision.get('is_va')}")
+
+    # Route the new proposal
+    rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
+    new_dest="clean" if prop_new.confidence>=min_conf else "review"
+    reasons=[]
+    if prop_new.confidence<min_conf:
+        reasons.append(f"low_confidence ({prop_new.confidence:.2f}<{min_conf})")
+    if prop_new.decision.get("used_heuristic"):
+        reasons.append("heuristic_fallback")
+        if new_dest=="clean": new_dest="review"
+
+    if new_dest=="clean":
+        new_target=resolve_library_path(
+            clean_albums,prop_new.decision.get("albumartist_display",""),
+            prop_new.decision.get("dominant_album_display",""),
+            prop_new.decision.get("year"),
+            prop_new.decision.get("is_flac_only",False),False,False,
+            prop_new.decision.get("is_mix",False),cfg,
+            profile=profile,genre=prop_new.decision.get("genre"),
+            bpm=prop_new.decision.get("bpm"),key=prop_new.decision.get("key"),
+            label=prop_new.decision.get("label"))
+        out(f"\n  {C.GREEN}→ Promotes to Clean:{C.RESET} {new_target}")
+
+        if dry_run:
+            out(f"  {C.DIM}[dry-run] No files moved.{C.RESET}")
+        else:
+            confirm=input(f"\n  Move to Clean? [y/N] ").strip().lower()
+            if confirm=="y":
+                ensure_dir(new_target.parent)
+                dst=collision_resolve(new_target,"suffix"," ({n})")
+                if dst is None:
+                    err("Collision — cannot resolve target."); return
+                try:
+                    move_method,_=safe_move_folder(target,dst)
+                    session_id=make_session_id(profile_name,str(source_root))
+                    action_id=uuid.uuid4().hex[:10]
+                    entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,
+                           "type":"folder","subtype":"review_promote",
+                           "original_path":str(target),"original_folder_name":target.name,
+                           "target_path":str(dst),"target_folder_name":dst.name,
+                           "destination":"clean","confidence":prop_new.confidence,
+                           "decision":prop_new.decision,"move_method":move_method}
+                    hist_path=Path(cfg["logging"]["history_log"])
+                    append_jsonl(hist_path,entry)
+                    update_manifest(cfg,dst.name,entry)
+                    ok_msg(f"Promoted: {target.name} → {dst}")
+                except Exception as e:
+                    err(f"Move failed: {e}")
+            else:
+                out("  Skipped.")
+    else:
+        out(f"\n  {C.YELLOW}Still routes to Review:{C.RESET} {', '.join(reasons)}")
+        out(f"  Tips:")
+        out(f"  • Use --artist 'Artist Name' to force the artist")
+        out(f"  • Or tag the files with proper albumartist/artist tags")
+        out(f"  • Or lower review_rules.min_confidence_for_clean below {prop_new.confidence:.2f}")
 
 # ─────────────────────────────────────────────
 # cache — manage the tag cache
@@ -3856,7 +4933,7 @@ def cmd_init(cfg_path:Path)->None:
                           "strip_common_suffixes_for_voting":["deluxe edition","expanded edition","remaster","remastered","anniversary edition","bonus tracks","explicit","special edition"]},
              "fuzzy":{"enabled":True,"similarity_threshold":0.88,"prompt_threshold":0.75},
              "decision":{"album_dominance_threshold":0.75,"allow_artist_fallback":True,"require_confirmation":True,"auto_approve_above":0.92,"interactive_below":0.92},
-             "various_artists":{"label":"VA","albumartist_matches":["various artists","various","va","v/a"],"enable_heuristics":True,"unique_artist_ratio_above":0.50},
+             "various_artists":{"label":"VA","albumartist_matches":["various artists","various","va","v/a"],"enable_heuristics":True,"unique_artist_ratio_above":0.75},
              "year":{"enabled":True,"allowed_range":{"min":1900,"max":2030},"require_presence_ratio":0.50,"agreement_threshold":0.70},
              "format":{"pattern_no_year":"{albumartist} - {album}","pattern_with_year":"{albumartist} - {album} ({year})","replace_illegal_chars_with":" - ","trim_trailing_dots_spaces":True},
              "format_suffix":{"enabled":True,"only_if_all_same_extension":True,"ignore_extension":".mp3","style":"brackets_upper"},
@@ -4074,6 +5151,8 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
             reasons.append("mix_folder"); ensure_dir(mixes_root)
             p.target_path=str(mixes_root/p.proposed_folder_name)
         p.destination=dest; p.decision["route_reasons"]=reasons
+        if reasons:
+            p.decision["review_summary"]=_build_review_summary(reasons,p.decision.get("confidence_factors",{}),p.confidence)
         if dest=="review":      p.target_path=str(review_albums/p.proposed_folder_name)
         elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
         return p
@@ -4202,6 +5281,8 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
                                                        "confidence":p.confidence,"session_id":session_id})
                         existing_clean.add(normalize_unicode(target.name))
                         existing_clean_paths[normalize_unicode(target.name)]=target
+                    elif p.destination=="review":
+                        _write_review_sidecar(target,p,session_id)
                     method_tag=f"  {C.DIM}[{move_method} {move_elapsed*1000:.0f}ms]{C.RESET}" if _verbosity>=VERBOSE else ""
                     art_tag=f"  {C.DIM}[{artifact_count} artifacts quarantined]{C.RESET}" if artifact_count else ""
                     out(f"  [{folder_idx}/{total_n}]  MOVED {status_tag(p.destination)}"
@@ -4245,12 +5326,27 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     manifest_set_last_run(cfg)
 
 
-def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->None:
-    _run_core(cfg_path,cfg,profile,interactive,dry_run,since,perf_tier=perf_tier,genre_roots=genre_roots,itunes_mode=itunes_mode)
+def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,review_threshold:Optional[float]=None)->None:
+    if interactive:
+        # v7.0: Interactive mode uses scan → interactive_review instead of streaming pipeline
+        register_stop_handler()
+        sid,session_dir,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
+        profiles=cfg.get("profiles",{}); profile_obj=profiles.get(profile,{})
+        source_root=Path(profile_obj.get("source_root","")).expanduser()
+        applied=interactive_review(cfg,proposals,session_id=sid,dry_run=dry_run,
+                                   threshold=review_threshold,source_root=source_root)
+        out(f"Applied: {len(applied)} folders"); manifest_set_last_run(cfg)
+    else:
+        _run_core(cfg_path,cfg,profile,interactive,dry_run,since,perf_tier=perf_tier,genre_roots=genre_roots,itunes_mode=itunes_mode)
 
 def cmd_folders_only(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->None:
     register_stop_handler(); sid,_,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
-    applied=apply_folder_moves(cfg,proposals,interactive=interactive,auto_above=None,dry_run=dry_run,session_id=sid)
+    if interactive:
+        profiles=cfg.get("profiles",{}); profile_obj=profiles.get(profile,{})
+        source_root=Path(profile_obj.get("source_root","")).expanduser()
+        applied=interactive_review(cfg,proposals,session_id=sid,dry_run=dry_run,source_root=source_root)
+    else:
+        applied=apply_folder_moves(cfg,proposals,interactive=False,auto_above=None,dry_run=dry_run,session_id=sid)
     out(f"Folders applied: {len(applied)}"); manifest_set_last_run(cfg)
 
 def cmd_tracks_only(cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool)->None:
@@ -5059,6 +6155,8 @@ Examples:
   raagdosa orphans                             # find loose audio files
   raagdosa artists --list                      # list all artists in Clean
   raagdosa review-list --older-than 30         # Review folders >30 days old
+  raagdosa review-promote "Album Name"         # force VA→album re-evaluation
+  raagdosa review-promote "Album" --artist "X" # force artist + re-evaluate
   raagdosa clean-report                        # stats on your Clean library
 """)
     p.add_argument("--config",default="config.yaml"); p.add_argument("--version",action="version",version=f"raagdosa {APP_VERSION}")
@@ -5088,6 +6186,7 @@ Examples:
         c.add_argument("--performance",choices=["slow","medium","fast","ultra"],default=None,metavar="TIER",help="Hardware tier: slow|medium|fast|ultra")
         c.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
         c.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
+        c.add_argument("--threshold",type=float,metavar="SCORE",help="Interactive: only review folders below this confidence score")
     fo=sub.add_parser("folders",help="Folder pass only"); fo.add_argument("--profile"); fo.add_argument("--interactive",action="store_true"); fo.add_argument("--dry-run",action="store_true"); fo.add_argument("--since")
     fo.add_argument("--genre-roots",metavar="ROOTS"); fo.add_argument("--itunes",action="store_true")
     tr=sub.add_parser("tracks",help="Track rename pass"); tr.add_argument("--profile"); tr.add_argument("--interactive",action="store_true"); tr.add_argument("--dry-run",action="store_true")
@@ -5144,6 +6243,10 @@ Examples:
     ar.add_argument("--find",dest="find_query",metavar="QUERY",help="Fuzzy-find an artist")
     rl=sub.add_parser("review-list",help="Summarise Review folder contents"); rl.add_argument("--profile")
     rl.add_argument("--older-than",type=int,metavar="DAYS",help="Only show folders older than N days")
+    rp=sub.add_parser("review-promote",help="Re-evaluate a Review folder as album (not VA)")
+    rp.add_argument("folder",help="Folder name or path in Review/"); rp.add_argument("--profile")
+    rp.add_argument("--artist",metavar="NAME",help="Force artist name for re-evaluation")
+    rp.add_argument("--dry-run",action="store_true",help="Preview only — don't move")
     sub.add_parser("clean-report",help="Stats and health report for Clean library").add_argument("--profile")
     ex=sub.add_parser("extract",help="Extract tracks from a VA/mix folder"); ex.add_argument("folder"); ex.add_argument("--profile")
     ex.add_argument("--by-artist",action="store_true",required=True,help="Group tracks by artist tag")
@@ -5153,6 +6256,15 @@ Examples:
     ca=sub.add_parser("cache",help="Manage the tag cache (status/clear/evict)")
     ca.add_argument("action",nargs="?",default="status",choices=["status","clear","evict"])
     sub.add_parser("orphans",help="Find loose audio files in Clean/Review").add_argument("--profile")
+    # v7.0 — reference (musical reference) commands
+    ref_p=sub.add_parser("reference",help="Manage the musical reference (aliases, labels, patterns)")
+    ref_sub=ref_p.add_subparsers(dest="ref_cmd",required=True)
+    ref_sub.add_parser("list",help="Show reference contents summary")
+    ref_imp=ref_sub.add_parser("import",help="Import a reference file")
+    ref_imp.add_argument("file",help="Path to reference YAML file to import")
+    ref_exp=ref_sub.add_parser("export",help="Export reference to shareable file")
+    ref_exp.add_argument("--section",help="Export only this section (e.g. artist_aliases)")
+    ref_exp.add_argument("--out",metavar="FILE",help="Output file path (default: reference_export.yaml)")
     return p
 
 def _parse_genre_roots_arg(roots_str: Optional[str]) -> Optional[List[str]]:
@@ -5166,7 +6278,7 @@ def main()->None:
     elif getattr(args,"quiet",False): set_verbosity(QUIET)
     cfg_path=Path(args.config); cmd=args.cmd
     if cmd=="init": cmd_init(cfg_path); return
-    cfg=read_yaml(cfg_path)
+    cfg=load_config_with_paths(cfg_path)
     def gp()->str:
         p=getattr(args,"profile",None) or cfg.get("active_profile")
         if not p: raise ValueError("No profile specified and no active_profile set.")
@@ -5192,7 +6304,7 @@ def main()->None:
         cmd_apply(cfg,pp,interactive=bool(args.interactive),auto_above=args.auto_above,dry_run=bool(args.dry_run))
     elif cmd in("run","go"):
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
-        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
+        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),review_threshold=getattr(args,"threshold",None))
     elif cmd=="folders":
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
         cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
@@ -5234,11 +6346,18 @@ def main()->None:
     elif cmd=="orphans":      cmd_orphans(cfg,gp())
     elif cmd=="artists":      cmd_artists(cfg,gp(),list_mode=bool(getattr(args,"list_mode",False)),find_query=getattr(args,"find_query",None))
     elif cmd=="review-list":  cmd_review_list(cfg,gp(),older_than_days=getattr(args,"older_than",None))
+    elif cmd=="review-promote": cmd_review_promote(cfg,gp(),args.folder,dry_run=bool(getattr(args,"dry_run",False)),artist_override=getattr(args,"artist",None))
     elif cmd=="clean-report": cmd_clean_report(cfg,gp())
     elif cmd=="extract":      cmd_extract_by_artist(cfg,gp(),args.folder,dry_run=bool(getattr(args,"dry_run",False)))
     elif cmd=="compare":      cmd_compare_folders(cfg,args.folder[0],args.folder[1])
     elif cmd=="diff":         cmd_diff(cfg,args.session_a,args.session_b)
     elif cmd=="cache":        cmd_cache(cfg,args.action)
+    elif cmd=="reference":
+        rc=args.ref_cmd
+        cmd_reference(cfg_path,cfg,action=rc,
+                      import_path=getattr(args,"file",None),
+                      section=getattr(args,"section",None),
+                      export_path=getattr(args,"out",None))
     else: parser.error(f"Unknown: {cmd}")
 
 if __name__=="__main__":

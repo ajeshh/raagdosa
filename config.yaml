@@ -1,18 +1,22 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # RaagDosa — Configuration
-# v5.5
+# v7.0
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # Run `raagdosa init` to set this file up interactively.
 # Run `raagdosa doctor` to validate it at any time.
 #
 # This file has two zones:
-#   ── SETTINGS ──  Things you configure once (paths, thresholds, toggles).
-#   ── BRAIN ──     Things that accumulate over time (aliases, known labels,
-#                   learned noise patterns). Written by `raagdosa learn`.
+#   ── SETTINGS ──    Things you configure once (thresholds, toggles, templates).
+#   ── REFERENCE ──   Musical reference — accumulated knowledge (artist aliases,
+#                     known labels, noise patterns). Written by `raagdosa learn`.
 #
-# Ready to split? When BRAIN grows large, move it to raagdosa-brain.yaml and
-# add: brain_file: raagdosa-brain.yaml — the split is clean at that point.
+# v7.0: Paths (source_root, logging dirs) now live in paths.local.yaml.
+#       This keeps config.yaml safe to share publicly.
+#       Run `raagdosa doctor` to auto-migrate paths on first v7 run.
+#
+# Ready to split? When REFERENCE grows large, move it to reference.yaml and
+# add: reference_file: reference.yaml — the split is clean at that point.
 # ──────────────────────────────────────────────────────────────────────────────
 
 app:
@@ -32,7 +36,7 @@ profiles:
   incoming:
     # Where your unorganised music lives. RaagDosa never modifies this.
     # Run `raagdosa init` to set this path interactively.
-    source_root: /Volumes/bass/Test
+    source_root: /Volumes/bass/SLSK/complete
 
     # clean_mode: inside_root   → raagdosa/ sits inside source_root
     #             inside_parent → raagdosa/ is a sibling of source_root
@@ -190,7 +194,8 @@ normalize:
 # ──────────────────────────────────────────────────────────────────────────────
 various_artists:
   # VA when: unique_artists / total_tracks >= this value.
-  unique_artist_ratio_above: 0.50
+  # v6.1: raised from 0.50→0.75 — require strong evidence before flagging VA.
+  unique_artist_ratio_above: 0.75
   enable_heuristics: true
   label: "VA"
   albumartist_matches:
@@ -199,10 +204,25 @@ various_artists:
     - va
     - v/a
     - v.a.
+    - v.a
+    - vvaa
     - varios artistas
     - varios
     - artistes variés
     - aa.vv.
+    # Russian
+    - "разные исполнители"
+    - "различные исполнители"
+    - "сборник"
+    # German
+    - verschiedene interpreten
+    - diverse interpreten
+    # Japanese
+    - "ヴァリアス・アーティスト"
+    # Portuguese / Spanish
+    - artistas varios
+    - vários artistas
+    - vários intérpretes
 
 # ──────────────────────────────────────────────────────────────────────────────
 # YEAR
@@ -230,7 +250,9 @@ artist_normalization:
   # Unicode char map (e.g. Ø → O). Leave empty to preserve original characters.
   unicode_map: {}
 
-  # Alias overrides live in the BRAIN section below.
+  # Alias overrides live in the REFERENCE section below (reference.artist_aliases).
+  # The aliases map below is for quick per-config overrides; the reference section
+  # holds the full community-shareable alias database.
   aliases: {}
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -297,7 +319,8 @@ mix_detection:
     - "mixed by"
     - "essentials"
     - "selections"
-  unique_artist_ratio_mix: 0.65
+  # v6.1: raised from 0.65→0.80 to match conservative VA philosophy
+  unique_artist_ratio_mix: 0.80
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ARTIST FEATURE HANDLING
@@ -697,37 +720,249 @@ undo:
 # You rarely need to change these.
 # ──────────────────────────────────────────────────────────────────────────────
 logging:
-  root_dir:           logs
-  session_dir:        logs/sessions
-  history_log:        logs/history.jsonl
-  skipped_log:        logs/skipped.jsonl
-  track_history_log:  logs/track-history.jsonl
-  track_skipped_log:  logs/track-skipped.jsonl
+  # Absolute path → logs stay in the app directory, safe from source volume deletion.
+  # Use a relative path (e.g. "logs") to store logs next to the source instead.
+  root_dir:           /Users/ajesh/appy/raagdosa/logs
+  session_dir:        /Users/ajesh/appy/raagdosa/logs/sessions
+  history_log:        /Users/ajesh/appy/raagdosa/logs/history.jsonl
+  skipped_log:        /Users/ajesh/appy/raagdosa/logs/skipped.jsonl
+  track_history_log:  /Users/ajesh/appy/raagdosa/logs/track-history.jsonl
+  track_skipped_log:  /Users/ajesh/appy/raagdosa/logs/track-skipped.jsonl
   write_human_report: true
   report_filename:    report.txt
   rotate_log_max_mb:  10.0
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── BRAIN ─────────────────────────────────────────────────────────────────────
-# This section accumulates intelligence as you use RaagDosa.
+# ── REFERENCE (Musical Reference) ────────────────────────────────────────────
+# Accumulated knowledge about artists, labels, and naming patterns.
 # `raagdosa learn` writes here. You can also edit it by hand.
+# Share your reference with others: `raagdosa reference export`
 #
-# When this section grows large enough to feel unwieldy, move it to a
-# separate file: raagdosa-brain.yaml — the split is clean at this boundary.
+# When this section grows large, move it to reference.yaml:
+#   reference_file: reference.yaml
 # ══════════════════════════════════════════════════════════════════════════════
 
-brain:
+reference:
 
-  # Artist alias map. Key = any variant seen in tags (case-insensitive).
+  # ── Artist alias map ──
+  # Key = any variant seen in tags (case-insensitive).
   # Value = the canonical folder name to use.
-  artist_aliases: {}
-  # Examples:
-  #   "jay z":             "Jay-Z"
-  #   "jayz":              "Jay-Z"
-  #   "mos def":           "Yasiin Bey"
-  #   "p. diddy":          "Diddy"
-  #   "notorious big":     "The Notorious B.I.G."
-  #   "flying lotus":      "Flying Lotus"
+  # These fix common misspellings, abbreviations, and name changes.
+  artist_aliases:
+    # ── Hip-Hop / R&B ──
+    "jay z":               "Jay-Z"
+    "jayz":                "Jay-Z"
+    "jay - z":             "Jay-Z"
+    "shawn carter":        "Jay-Z"
+    "kanye":               "Kanye West"
+    "ye":                  "Kanye West"
+    "mos def":             "Yasiin Bey"
+    "p. diddy":            "Diddy"
+    "puff daddy":          "Diddy"
+    "sean combs":          "Diddy"
+    "sean puffy combs":    "Diddy"
+    "notorious big":       "The Notorious B.I.G."
+    "notorious b.i.g":     "The Notorious B.I.G."
+    "biggie":              "The Notorious B.I.G."
+    "biggie smalls":       "The Notorious B.I.G."
+    "2pac":                "Tupac Shakur"
+    "tupac":               "Tupac Shakur"
+    "makaveli":            "Tupac Shakur"
+    "snoop dogg":          "Snoop Dogg"
+    "snoop doggy dogg":    "Snoop Dogg"
+    "snoop lion":          "Snoop Dogg"
+    "a tribe called quest": "A Tribe Called Quest"
+    "atcq":                "A Tribe Called Quest"
+    "outkast":             "OutKast"
+    "out kast":            "OutKast"
+    "missy elliot":        "Missy Elliott"
+    "ludacris":            "Ludacris"
+    "luda":                "Ludacris"
+    "de la soul":          "De La Soul"
+    "wu tang":             "Wu-Tang Clan"
+    "wu tang clan":        "Wu-Tang Clan"
+    "wu-tang":             "Wu-Tang Clan"
+    "mf doom":             "MF DOOM"
+    "mf. doom":            "MF DOOM"
+    "m.f. doom":           "MF DOOM"
+    "doom":                "MF DOOM"
+    "viktor vaughn":       "MF DOOM"
+    "king geedorah":       "MF DOOM"
+    "lauryn hill":         "Lauryn Hill"
+    "ms. lauryn hill":     "Lauryn Hill"
+    "l. hill":             "Lauryn Hill"
+    "andre 3000":          "André 3000"
+    "andre three thousand": "André 3000"
+    "childish gambino":    "Childish Gambino"
+    "donald glover":       "Childish Gambino"
+    "tyler the creator":   "Tyler, the Creator"
+    "tyler creator":       "Tyler, the Creator"
+
+    # ── Electronic / DJ ──
+    "aphex twin":          "Aphex Twin"
+    "afx":                 "Aphex Twin"
+    "richard d james":     "Aphex Twin"
+    "richard d. james":    "Aphex Twin"
+    "deadmau5":            "deadmau5"
+    "dead mau5":           "deadmau5"
+    "deadmaus":            "deadmau5"
+    "daft punk":           "Daft Punk"
+    "daftpunk":            "Daft Punk"
+    "the chemical brothers": "The Chemical Brothers"
+    "chemical brothers":   "The Chemical Brothers"
+    "chem bros":           "The Chemical Brothers"
+    "the prodigy":         "The Prodigy"
+    "prodigy":             "The Prodigy"
+    "boards of canada":    "Boards of Canada"
+    "boc":                 "Boards of Canada"
+    "four tet":            "Four Tet"
+    "4 tet":               "Four Tet"
+    "kieran hebden":       "Four Tet"
+    "flylo":               "Flying Lotus"
+    "flying lotus":        "Flying Lotus"
+    "kaytranada":          "Kaytranada"
+    "kaytra":              "Kaytranada"
+    "KAYTRANADA":          "Kaytranada"
+    "skrillex":            "Skrillex"
+    "skillex":             "Skrillex"
+    "disclosure":          "Disclosure"
+    "diclosure":           "Disclosure"
+    "bonobo":              "Bonobo"
+    "simon green":         "Bonobo"
+    "burial":              "Burial"
+    "burial (uk)":         "Burial"
+    "nicolas jaar":        "Nicolas Jaar"
+    "nicholas jaar":       "Nicolas Jaar"
+    "nils frahm":          "Nils Frahm"
+    "nils framh":          "Nils Frahm"
+    "caribou":             "Caribou"
+    "manitoba":            "Caribou"
+    "daphni":              "Caribou"
+    "floating points":     "Floating Points"
+    "sam shepherd":        "Floating Points"
+    "jon hopkins":         "Jon Hopkins"
+    "john hopkins":        "Jon Hopkins"
+    "massive attack":      "Massive Attack"
+    "masive attack":       "Massive Attack"
+    "portishead":          "Portishead"
+    "portis head":         "Portishead"
+
+    # ── Rock / Alternative ──
+    "rhcp":                "Red Hot Chili Peppers"
+    "red hot chilli peppers": "Red Hot Chili Peppers"
+    "red hot chili pepers": "Red Hot Chili Peppers"
+    "acdc":                "AC/DC"
+    "ac dc":               "AC/DC"
+    "ac-dc":               "AC/DC"
+    "led zepplin":         "Led Zeppelin"
+    "led zepelin":         "Led Zeppelin"
+    "led zeppeling":       "Led Zeppelin"
+    "the beatles":         "The Beatles"
+    "beatles":             "The Beatles"
+    "beatels":             "The Beatles"
+    "the rolling stones":  "The Rolling Stones"
+    "rolling stones":      "The Rolling Stones"
+    "pink floyd":          "Pink Floyd"
+    "pinkfloyd":           "Pink Floyd"
+    "radiohead":           "Radiohead"
+    "radio head":          "Radiohead"
+    "artic monkeys":       "Arctic Monkeys"
+    "artic monkey":        "Arctic Monkeys"
+    "the strokes":         "The Strokes"
+    "strokes":             "The Strokes"
+    "gorillaz":            "Gorillaz"
+    "gorillas":            "Gorillaz"
+    "gorrilaz":            "Gorillaz"
+    "nirvana":             "Nirvana"
+    "nervana":             "Nirvana"
+    "nine inch nails":     "Nine Inch Nails"
+    "nin":                 "Nine Inch Nails"
+
+    # ── Jazz / Soul / Funk ──
+    "miles davis":         "Miles Davis"
+    "myles davis":         "Miles Davis"
+    "john coltrane":       "John Coltrane"
+    "coltrane":            "John Coltrane"
+    "thelonious monk":     "Thelonious Monk"
+    "thelonius monk":      "Thelonious Monk"
+    "theloneous monk":     "Thelonious Monk"
+    "charles mingus":      "Charles Mingus"
+    "charlie mingus":      "Charles Mingus"
+    "herbie hancock":      "Herbie Hancock"
+    "herbiehancock":       "Herbie Hancock"
+    "d'angelo":            "D'Angelo"
+    "dangelo":             "D'Angelo"
+    "d angelo":            "D'Angelo"
+    "erykah badu":         "Erykah Badu"
+    "erica badu":          "Erykah Badu"
+    "erika badu":          "Erykah Badu"
+    "sade":                "Sade"
+    "sade adu":            "Sade"
+    "stevie wonder":       "Stevie Wonder"
+    "stevy wonder":        "Stevie Wonder"
+    "steve wonder":        "Stevie Wonder"
+    "jamiroquai":          "Jamiroquai"
+    "jamiroqui":           "Jamiroquai"
+    "jamoroquai":          "Jamiroquai"
+    "earth wind and fire": "Earth, Wind & Fire"
+    "earth wind & fire":   "Earth, Wind & Fire"
+    "earth, wind and fire": "Earth, Wind & Fire"
+
+    # ── Pop / Singer-Songwriter ──
+    "bjork":               "Björk"
+    "björk":               "Björk"
+    "beyonce":             "Beyoncé"
+    "beyoncé":             "Beyoncé"
+    "beyonce knowles":     "Beyoncé"
+    "rihanna":             "Rihanna"
+    "riahanna":            "Rihanna"
+    "rhianna":             "Rihanna"
+    "sia":                 "Sia"
+    "sia furler":          "Sia"
+    "fka twigs":           "FKA twigs"
+    "fka twig":            "FKA twigs"
+    "solange":             "Solange"
+    "solange knowles":     "Solange"
+    "sufjan stevens":      "Sufjan Stevens"
+    "sufjan steven":       "Sufjan Stevens"
+    "sufjian stevens":     "Sufjan Stevens"
+    "bon iver":            "Bon Iver"
+    "bon ivor":            "Bon Iver"
+    "sigur ros":           "Sigur Rós"
+    "sigur rós":           "Sigur Rós"
+
+    # ── Reggae / World ──
+    "bob marley":          "Bob Marley"
+    "bob marley & the wailers": "Bob Marley & The Wailers"
+    "bob marley and the wailers": "Bob Marley & The Wailers"
+    "fela kuti":           "Fela Kuti"
+    "fela":                "Fela Kuti"
+    "fela anikulapo kuti": "Fela Kuti"
+
+    # ── Techno / House specific ──
+    "jeff mills":          "Jeff Mills"
+    "richie hawtin":       "Richie Hawtin"
+    "plastikman":          "Richie Hawtin"
+    "carl cox":            "Carl Cox"
+    "carlcox":             "Carl Cox"
+    "laurent garnier":     "Laurent Garnier"
+    "laurant garnier":     "Laurent Garnier"
+    "nina kraviz":         "Nina Kraviz"
+    "nina kravitz":        "Nina Kraviz"
+    "bicep":               "Bicep"
+    "bi cep":              "Bicep"
+    "ben bohmer":          "Ben Böhmer"
+    "ben böhmer":          "Ben Böhmer"
+    "tale of us":          "Tale Of Us"
+    "taleofus":            "Tale Of Us"
+    "bad bad not good":    "BadBadNotGood"
+    "bbng":                "BadBadNotGood"
+    "badbadnotgood":       "BadBadNotGood"
+    "kerri chandler":      "Kerri Chandler"
+    "kerry chandler":      "Kerri Chandler"
+    "larry heard":         "Larry Heard"
+    "mr fingers":          "Larry Heard"
+    "mr. fingers":         "Larry Heard"
 
   # Record labels that commonly appear in albumartist tags.
   # When detected, RaagDosa re-derives the artist from track-level tags instead.

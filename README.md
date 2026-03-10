@@ -11,7 +11,7 @@
 
 **Deterministic music library cleanup for DJs and collectors.**
 
-[![Version](https://img.shields.io/badge/version-6.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-7.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
 [![Python versions](https://img.shields.io/pypi/pyversions/raagdosa?style=flat-square&color=0d1117&labelColor=21262d&logo=python&logoColor=f5f5f5)](https://pypi.org/project/raagdosa/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square&color=0d1117&labelColor=21262d)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=flat-square&color=0d1117&labelColor=21262d&logo=github-actions&logoColor=f5f5f5)](https://github.com/raagdosa/raagdosa/actions)
@@ -94,6 +94,39 @@ On subsequent runs:
 ```bash
 raagdosa go --since last_run   # only process music added since last time
 ```
+
+### Interactive review (v7.0)
+
+Review each folder one at a time — approve, reject, override artist/VA, or send to Review with a note:
+
+```bash
+raagdosa go --interactive                  # review every folder
+raagdosa go --interactive --threshold 0.8  # only review low-confidence folders
+```
+
+```
+══════════════════════════════════════════════════════════════════════
+  [  3 / 47 ]                                          ROUTE: CLEAN
+──────────────────────────────────────────────────────────────────────
+  FROM:  va - deep house sessions vol 3 (2019) [mp3 320]
+    TO:  Various Artists - Deep House Sessions Vol 3/
+
+  Artist: Various Artists        VA: Yes
+  Album:  Deep House Sessions    Year: 2019
+  Tracks: 24 files  ·  MP3 24
+
+  CONFIDENCE  ██████████░░░░░░░░░░  0.48
+    Tag readability              ██████░░░░░░░░░░░░░░  0.30
+    Album/artist vote consensus  ██████████░░░░░░░░░░  0.50
+    Meaningful track titles      ████████████████░░░░  0.75
+──────────────────────────────────────────────────────────────────────
+  [y] Approve  [s] Skip  [r] → Review  [a] Set Artist
+  [v] Toggle VA  [t] Tracks  [q] Stop  [?] Help
+══════════════════════════════════════════════════════════════════════
+  Action [y]: _
+```
+
+Stop at any point with `q` — all moves already made are kept. Resume later by re-running the same command.
 
 ---
 
@@ -346,7 +379,13 @@ Tag coverage for template: {genre}/{bpm_range}/{artist} - {album}
 
 ## Configuration
 
-RaagDosa is configured through a single `config.yaml` split into two zones.
+RaagDosa uses three configuration files, each with a clear purpose:
+
+| File | Purpose | Share publicly? |
+|------|---------|-----------------|
+| `config.yaml` | Settings + Musical Reference | Yes |
+| `paths.local.yaml` | Filesystem paths (source, destination, logs) | No |
+| `reference.yaml` | (optional) Extracted reference for large collections | Yes |
 
 ### SETTINGS — operational behaviour
 
@@ -367,32 +406,51 @@ title_cleanup:
     # ... full list in config.yaml
 ```
 
-### BRAIN — learned knowledge about your library
+### Private paths (`paths.local.yaml`)
+
+v7.0 moves all filesystem paths to `paths.local.yaml`, keeping `config.yaml` safe to share:
 
 ```yaml
-brain:
+# paths.local.yaml — gitignored, never shared
+profiles:
+  incoming:
+    source_root: ~/Music/Incoming
+    clean_mode: inside_root
+active_profile: incoming
+logging:
+  root_dir: ~/appy/raagdosa/logs
+```
+
+### REFERENCE — Musical Reference (shared knowledge)
+
+```yaml
+reference:
   artist_aliases:
-    # Diacritics — fuzzy matching handles Björk↔Bjork automatically
-    # but aliases control the *display form* used in folder names:
-    "bjork":         "Björk"
-    "sigur ros":     "Sigur Rós"
-    "mo":            "MØ"
+    "bjork":         "Bjork"
     "jay z":         "Jay-Z"
     "mos def":       "Yasiin Bey"
+    "deadmau5":      "deadmau5"
+    "rhcp":          "Red Hot Chili Peppers"
+    # ... 100+ built-in aliases
 
   known_labels:
-    # Record labels to detect in albumartist tags (prevents
-    # "Cosmovision Records - Album" being used as folder name)
     - "Cosmovision Records"
     - "Tropical Twista Records"
 
   va_rescue_prefixes:
-    # Artist prefixes that should never be classified as VA
     - "sven wunder"
     - "blend mishkin"
 ```
 
-When `brain:` grows large, move it to `raagdosa-brain.yaml` and add `brain_file: raagdosa-brain.yaml` in config.
+Share your reference with the community:
+
+```bash
+raagdosa reference export                       # export to reference_export.yaml
+raagdosa reference import community_ref.yaml    # merge someone else's reference
+raagdosa reference list                         # see what's in your reference
+```
+
+When `reference:` grows large, move it to `reference.yaml` and add `reference_file: reference.yaml` in config.
 
 ### Per-folder override
 
@@ -434,7 +492,7 @@ RaagDosa uses a 4-step fuzzy artist matching pipeline:
 3. ASCII-fold comparison — `Björk ↔ Bjork`, `MØ ↔ MO`, `Sigur Rós ↔ Sigur Ros`
 4. Jaccard word-set similarity ≥ 0.92
 
-This means tags and folder names with diacritic variants are always matched and deduplicated correctly. Use `brain.artist_aliases` to control which display form appears in the final folder name.
+This means tags and folder names with diacritic variants are always matched and deduplicated correctly. Use `reference.artist_aliases` to control which display form appears in the final folder name.
 
 ---
 
@@ -527,7 +585,7 @@ Profiles & templates
 
 - **Documentation:** [RaagDosa-Commands.md](https://github.com/raagdosa/raagdosa/blob/main/RaagDosa-Commands.md)
 - **Changelog:** [CHANGELOG.md](https://github.com/raagdosa/raagdosa/blob/main/CHANGELOG.md)
-- **Design document:** [RaagDosa_v5_Design.docx](https://github.com/raagdosa/raagdosa/blob/main/RaagDosa_v5_Design.docx)
+- **Database design:** [docs/database/](https://github.com/raagdosa/raagdosa/tree/main/docs/database)
 - **Issues:** [GitHub Issues](https://github.com/raagdosa/raagdosa/issues)
 - **License:** [MIT](LICENSE)
 
