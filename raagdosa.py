@@ -3486,7 +3486,7 @@ def _display_tracks(p:FolderProposal,cfg:Optional[Dict[str,Any]]=None)->Optional
             disc_multi=folder_is_multidisc(files,cfg)
             for f in files:
                 tags=read_audio_tags(f,cfg)
-                new_name,conf,reason,meta=build_track_filename(classification,tags,f,cfg,p.decision,disc_multi)
+                new_name,conf,reason,meta=build_track_filename(classification,tags,f,cfg,p.decision,disc_multi,total_tracks=len(files))
                 if new_name and normalize_unicode(new_name)!=normalize_unicode(f.name):
                     rename_map[f.name]=new_name
         except Exception:
@@ -3597,7 +3597,8 @@ def _interactive_action_help()->None:
     print(f"  c               Skip (leave in source)")
     print(f"  f               Flag (review again at end)")
     print(f"  {C.BOLD}── Fix ──{C.RESET}")
-    print(f"  e<N>            Edit track N title  (e.g. e3, e12)")
+    print(f"  t               Edit album title  (renames the folder)")
+    print(f"  e<N>            Edit track N title tag  (e.g. e3, e12)")
     print(f"  a               Set artist name")
     print(f"  v               Toggle VA status")
     print(f"  {C.BOLD}── Info ──{C.RESET}")
@@ -3689,7 +3690,7 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
 
         # Action loop — stays on this folder until an action advances
         while True:
-            action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  e<N>:edit-track  a:artist  v:va  q:quit  ?:help"
+            action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  t:album-title  e<N>:track-title  a:artist  v:va  q:quit  ?:help"
             print(action_labels)
             try:
                 choice=input(f"  > ").strip().lower()
@@ -3865,6 +3866,31 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                     print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
                     print(f"  Artist: Various Artists  (was: {old_artist})   VA: Yes")
                     print(f"    TO:   {new_target.name}")
+
+            elif choice=="t":
+                # Edit the album/folder title (separate from track title editing)
+                current_album=p.decision.get("dominant_album_display","")
+                print(f"  {C.DIM}Current album:{C.RESET} {current_album}")
+                new_album=input(f"  New album title (Enter to cancel): ").strip()
+                if not new_album: continue
+                p.decision["dominant_album_display"]=new_album
+                p.decision["override_type"]=p.decision.get("override_type","")+"edit_title"
+                profile_name=cfg.get("active_profile","incoming")
+                profiles=cfg.get("profiles",{}); profile_obj=profiles.get(profile_name,{})
+                sr=source_root or Path(profile_obj.get("source_root","")).expanduser()
+                clean_albums=derive_clean_albums_root(profile_obj,sr)
+                new_target=resolve_library_path(clean_albums,p.decision.get("albumartist_display",""),new_album,
+                                               p.decision.get("year"),p.decision.get("is_flac_only",False),
+                                               p.decision.get("is_va",False),False,p.decision.get("is_mix",False),cfg,profile_obj,
+                                               genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
+                                               key=p.decision.get("key"),label=p.decision.get("label"))
+                p.proposed_folder_name=_apply_format_suffix(new_target.name,cfg,p.stats.extensions if p.stats else None)
+                p.target_path=str(new_target); p.destination="clean"
+                overrides+=1
+                print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
+                print(f"  Album: {C.BOLD}{new_album}{C.RESET}  (was: {current_album})")
+                print(f"    TO:   {new_target.name}")
+                print(f"  ROUTE: {C.GREEN}CLEAN{C.RESET}")
 
             elif choice=="e":
                 print(f"  {C.DIM}Usage: e<N> to edit track title by number  (e.g. e3, e12){C.RESET}")
@@ -4085,6 +4111,9 @@ def cleanup_title(title:str,cfg:Dict[str,Any])->str:
     if n.get("replace_underscores",True): o=o.replace("_"," ")
     if tc.get("strip_trailing_domains",True): o=strip_trailing_domains(o)
     if tc.get("strip_trailing_handles",True): o=re.sub(r"(\s*[-–—]\s*)?@[\w\.\-]+\s*$","",o.strip())
+    # Strip Soundcloud/archive track ID + optional channel name: "Title 959134033 - Channel" → "Title"
+    # 9+ digit numbers are SC-style IDs; regular track numbers are ≤ 4 digits
+    o=re.sub(r'[\s_]+\d{9,}(?:\s*[-–—]\s*\S[^-–—]*)?$','',o).strip()
     phrases=[ph.lower() for ph in (tc.get("strip_trailing_phrases",[]) or [])]
     keep=[k.lower() for k in (tc.get("keep_parenthetical_if_contains",[]) or [])]
     def prot(seg:str)->bool: return any(k in seg.lower() for k in keep)
@@ -4143,6 +4172,8 @@ def parse_artist_title_from_fn(stem: str, folder_name: str = "", cfg: Optional[D
     if detect_bpm_dj_encoding(s): return None, None
     s = re.sub(r"_-_", " - ", s).replace("_", " ")
     s = re.sub(r"\s+", " ", s).strip()
+    # Strip Soundcloud/archive track ID + optional channel name before parsing
+    s = re.sub(r'[\s_]+\d{9,}(?:\s*[-–—]\s*\S[^-–—]*)?$', '', s).strip()
     s = re.sub(r"^[\[\(][^\]\)]+[\]\)]\s*", "", s)
     s2 = re.sub(r"^\(?\d{1,3}\)?\s*[-–—\.]\s*", "", s)
     s2 = re.sub(r"^\d{1,3}\s+", "", s2)
@@ -4196,7 +4227,7 @@ def classify_folder_for_tracks(decision:Dict[str,Any],cfg:Dict[str,Any])->str:
         return "various"
     return "album"
 
-def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Path,cfg:Dict[str,Any],decision:Dict[str,Any],disc_multi:bool)->Tuple[Optional[str],float,str,Dict[str,Any]]:
+def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Path,cfg:Dict[str,Any],decision:Dict[str,Any],disc_multi:bool,total_tracks:int=0)->Tuple[Optional[str],float,str,Dict[str,Any]]:
     trc=cfg.get("track_rename",{}); pat=trc.get("patterns",{}); ext=src.suffix.lower()
     tag_title=(tags.get("title") or "").strip(); tag_artist=(tags.get("artist") or "").strip()
     track_raw=(tags.get("tracknumber") or "").strip(); disc_raw=(tags.get("discnumber") or "").strip()
@@ -4273,19 +4304,48 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
     else:
         track_n=parse_int_prefix(track_raw) if track_raw else None
     if track_n is None:
-        # Always try to extract track number from filename (leading digits)
+        # Try to extract track number from filename (leading digits)
         om=re.match(r"^(\d{1,3})",src.stem.strip())
-        if om: track_n=int(om.group(1)); meta["track_src"]="filename_order"
-    if track_n is None and classification in ("album","various") and trc.get("track_numbers",{}).get("required_for_album",True):
-        return None,0.0,"missing_track_number",{}
+        if om:
+            raw_num=int(om.group(1))
+            # Detect disc-compound format: 101→disc1/track01, 213→disc2/track13
+            if 100<=raw_num<=999 and raw_num%100>=1:
+                track_n=raw_num%100; meta["track_src"]="filename_disc_compound"; meta["fn_disc_n"]=raw_num//100
+            else:
+                track_n=raw_num; meta["track_src"]="filename_order"
+    else:
+        # Sanity-check tag track number: if it's way too high for this folder, use filename instead.
+        # Catches cases where tracknumber is the position on a bigger compilation (e.g. tag=32, folder has 15 tracks).
+        if total_tracks>0 and track_n>total_tracks and meta.get("track_src") not in ("filename_order","filename_disc_compound","vinyl_notation"):
+            om=re.match(r"^(\d{1,3})",src.stem.strip())
+            if om:
+                raw_num=int(om.group(1))
+                fn_n2=raw_num%100 if 100<=raw_num<=999 else raw_num
+                if 1<=fn_n2<=total_tracks:
+                    if 100<=raw_num<=999 and raw_num%100>=1:
+                        track_n=fn_n2; meta["fn_disc_n"]=raw_num//100; meta["track_src"]="filename_disc_compound"
+                    else:
+                        track_n=fn_n2; meta["track_src"]="filename_order_sanity"
+    if track_n is None:
+        if classification=="album" and trc.get("track_numbers",{}).get("required_for_album",True):
+            return None,0.0,"missing_track_number",{}
+        elif classification=="various":
+            # No track number — fall back to mixed pattern (Artist - Title) rather than skip.
+            # Handles DJ download folders (e.g. [MONADA] compilations) with no track numbers.
+            if not artist: return None,0.0,"missing_artist",meta
+            tmpl=pat.get("mixed","{artist} - {title}{mix_suffix}{ext}")
+            return sanitize_name(tmpl.format(artist=artist,title=title_c,mix_suffix=mix_suf,ext=ext,disc_prefix="",track=0)),0.85,"ok_no_tracknum",meta
 
-    # Guard: if the title starts with the same number as the track (and track was inferred
-    # from the filename, not a proper tracknumber tag), the title tag has the BPM/track prefix
-    # baked in — strip it to avoid "100 - 100 - Em - ..." duplication.
-    if track_n and meta.get("track_src")=="filename_order" and title_c:
-        _bpm_m=re.match(r'^(\d{1,3})\s*[-–—]\s*(.+)$',title_c)
-        if _bpm_m and int(_bpm_m.group(1))==int(track_n):
-            title_c=_bpm_m.group(2).strip() or title_c
+    # Guard: strip leading "NN - " from title when the number matches the filename's leading digits.
+    # Catches: (a) filename-inferred track number baked into title, (b) old filename pasted into title tag.
+    if title_c:
+        _stem_m=re.match(r"^(\d{1,3})",src.stem.strip())
+        if _stem_m:
+            _fn_num=int(_stem_m.group(1))
+            _fn_num2=_fn_num%100 if 100<=_fn_num<=999 else _fn_num
+            _num_m=re.match(r'^(\d{1,3})\s*[-–—]\s*(.+)$',title_c)
+            if _num_m and int(_num_m.group(1))==_fn_num2:
+                title_c=_num_m.group(2).strip() or title_c
 
     # Guard: for album folders, strip leading "ArtistName - " from title if it matches the
     # albumartist (some taggers embed the artist in the title field).
@@ -4319,7 +4379,11 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
     disc_prefix=""
     if trc.get("disc",{}).get("enabled",True):
         disc_n=parse_int_prefix(disc_raw) if disc_raw else None
-        if disc_multi and disc_n: disc_prefix=trc.get("disc",{}).get("format","{disc}-").format(disc=disc_n)
+        # Also use disc number derived from filename compound (101→disc1, 201→disc2)
+        if disc_n is None: disc_n=meta.get("fn_disc_n")
+        # Disc-compound filenames are inherently multi-disc even without a discnumber tag
+        use_disc=disc_multi or bool(meta.get("fn_disc_n"))
+        if use_disc and disc_n: disc_prefix=trc.get("disc",{}).get("format","{disc}-").format(disc=disc_n)
     if classification=="album":
         if track_n is None: return None,0.0,"missing_track_number",{}
         tmpl=pat.get("album","{disc_prefix}{track:02d} - {title}{mix_suffix}{ext}")
@@ -4338,7 +4402,15 @@ def folder_is_multidisc(files:List[Path],cfg:Dict[str,Any])->bool:
     discs:set=set()
     for f in files:
         dn=(read_audio_tags(f,cfg).get("discnumber") or ""); d=parse_int_prefix(dn) if dn else None
-        if d: discs.add(d)
+        if d:
+            discs.add(d)
+        else:
+            # Detect disc-compound filename prefix: 101→disc1, 213→disc2 track13
+            m=re.match(r"^(\d{3})",f.stem.strip())
+            if m:
+                raw=int(m.group(1))
+                if 100<=raw<=999 and raw%100>=1:
+                    discs.add(raw//100)
     return len(discs)>1
 
 def rename_tracks_in_clean_folder(cfg:Dict[str,Any],folder:Path,folder_decision:Dict[str,Any],interactive:bool,dry_run:bool,session_id:str)->List[Dict[str,Any]]:
@@ -4357,7 +4429,7 @@ def rename_tracks_in_clean_folder(cfg:Dict[str,Any],folder:Path,folder_decision:
         if ext_fixed and not dry_run:
             try: f.rename(ext_fixed); f=ext_fixed
             except Exception: pass
-        tags=read_audio_tags(f,cfg); new_name,conf,reason,meta=build_track_filename(classification,tags,f,cfg,folder_decision,disc_multi)
+        tags=read_audio_tags(f,cfg); new_name,conf,reason,meta=build_track_filename(classification,tags,f,cfg,folder_decision,disc_multi,total_tracks=len(files))
         if not new_name:
             out(f"    ↷ SKIP {f.name}  ({reason})",level=VERBOSE); skip_count+=1
             append_jsonl(tskip,{"timestamp":now_iso(),"session_id":session_id,"type":"track","reason":reason,"file":str(f),"meta":meta}); continue
@@ -4474,7 +4546,7 @@ def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str,show_tracks:bool
             disc_multi=folder_is_multidisc(tr_files,cfg)
             for f in tr_files:
                 tags=read_audio_tags(f,cfg)
-                new_name,conf,reason,meta=build_track_filename(cls,tags,f,cfg,prop.decision,disc_multi)
+                new_name,conf,reason,meta=build_track_filename(cls,tags,f,cfg,prop.decision,disc_multi,total_tracks=len(tr_files))
                 if new_name:
                     changed=normalize_unicode(new_name)!=normalize_unicode(f.name)
                     sym=f"{C.GREEN}→{C.RESET}" if changed else f"{C.DIM}={C.RESET}"
