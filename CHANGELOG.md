@@ -1,7 +1,191 @@
 # Changelog
 
-All notable changes to RaagDosa are documented here.  
+All notable changes to RaagDosa are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+---
+
+## [8.0.0] — 2026-03-12
+
+### Release summary
+
+v8 is the **"Triage Before You Commit"** release. Instead of moving folders the moment they pass
+confidence threshold, RaagDosa now scans everything first, presents a dashboard showing how the run
+splits (auto-approvable vs needs review), lets you bulk-approve the high-confidence tier with a single
+YES, then hands the rest to interactive folder-by-folder review.
+
+This release also tightens several detection rules that caused confidence mis-scoring in real
+library data: EP detection from folder names (catches EPs with non-standard track counts), identical
+title detection (copy-paste tag contamination), Volume/Vol no longer stripped as disc indicator,
+folder alignment v2 (noise token stripping + year-anchored cutoff), and Smart Title Case applied
+to all-lowercase artist tags.
+
+Version is now read from `pyproject.toml` via `importlib.metadata` — no more duplicate version
+constants in source files.
+
+---
+
+### New — Triage dashboard (default `go` workflow)
+
+The `go` / `run` command now scans all folders first, then presents a triage dashboard before
+moving anything:
+
+```
+══════════════════════════════════════════════════════════════════════
+  RAAGDOSA v8.0.0  ·  Triage  ·  Session 2026-03-12_a3f1
+──────────────────────────────────────────────────────────────────────
+  AUTO tier   (conf ≥ 0.85)   712 folders  →  will go to Clean/
+  HOLD tier   (conf < 0.85)    98 folders  →  manual review needed
+──────────────────────────────────────────────────────────────────────
+  [a] Bulk-approve AUTO + review HOLD   [r] Review all   [q] Quit
+══════════════════════════════════════════════════════════════════════
+```
+
+| Action | Behaviour |
+|--------|-----------|
+| `a` | Bulk-approve AUTO tier (requires typing `YES`), then interactive review for HOLD |
+| `r` | Skip bulk-approve, review ALL folders 1-by-1 |
+| `q` | Quit without moving anything |
+
+Previous streaming behaviour is preserved:
+- `raagdosa go --interactive` — skip triage, original folder-by-folder streaming
+- `raagdosa go --force` — skip triage entirely, process all folders without confirmation
+
+### New — `--auto-above` flag and `auto_approve_threshold` config key
+
+Override the auto-approve threshold for a single run:
+
+```bash
+raagdosa go --auto-above 0.95   # only auto-approve folders with conf ≥ 0.95
+```
+
+Persistent setting in `config.yaml`:
+
+```yaml
+review_rules:
+  min_confidence_for_clean: 0.85   # routing threshold (unchanged)
+  auto_approve_threshold: 0.85     # triage: folders above this go to AUTO tier
+```
+
+The auto-approve threshold is clamped to `≥ min_confidence_for_clean` — you can't
+auto-approve folders that would route to Review.
+
+### New — `sessions` command
+
+List recent sessions with move counts and example folder names:
+
+```bash
+raagdosa sessions           # last 20 sessions
+raagdosa sessions --last 5  # last 5 sessions
+```
+
+```
+Recent sessions (20 of 47 total):
+
+  2026-03-12_14-30-00_a3f1
+    712 moves  ·  690 clean  ·  22 review  ·  2026-03-12T14:30:00
+    e.g. Massive Attack - Mezzanine, Portishead - Dummy, DJ Shadow - Endtroducing.....
+```
+
+### New — Undo improvements
+
+`--session last` and shorthand `-1`, `-2` (Nth-most-recent session):
+
+```bash
+raagdosa undo --session last   # undo most recent session
+raagdosa undo --session -2     # undo second-to-last session
+```
+
+Interactive picker — run `raagdosa undo` with no arguments to choose individual moves
+from the last session:
+
+```
+Last session: 2026-03-12_14-30-00_a3f1
+  #    Folder                                                    Dest
+  ─────────────────────────────────────────────────────────────────────────
+  1    Massive Attack - Mezzanine (1998)                         clean
+  2    Portishead - Dummy (1994)                                 clean
+  3    Unknown Artist - 2024-03-01                               review
+
+Enter number(s) to undo (e.g. 3  or  1,3,5  or  all), or Enter to cancel:
+  >
+```
+
+`history --session last` also resolves to the most recent session.
+
+### New — `--sort` flag for interactive / folders commands
+
+Control the order folders are presented in interactive review:
+
+```bash
+raagdosa go --interactive --sort date-modified   # most recently modified first
+raagdosa go --interactive --sort date-created    # newest folders first
+raagdosa go --interactive --sort name            # alphabetical (default)
+raagdosa folders --sort date-modified
+```
+
+### Fixed — EP detection from folder/album name
+
+`detect_ep()` now checks the folder name for EP keywords (`EP`, `E.P.`) in addition to
+track count. A folder with 8 tracks named "Artist - Debut EP" is now correctly classified as
+an EP, rather than being treated as a full album.
+
+Previously: only track count was checked (2–6 tracks → EP).
+Now: track count OR folder name contains EP keyword → EP.
+
+### Fixed — Volume/Vol no longer stripped as disc indicator
+
+`strip_disc_indicator()` previously stripped "Volume 2" / "Vol. 3" from album names, treating
+them the same as "Disc 2" / "CD 2". This caused "Now That's What I Call Music Volume 2" to
+deduplicate against "Volume 1". Fixed: only `disc` / `cd` / `disk` markers are stripped.
+`volume` / `vol` are preserved as part of the album name.
+
+### Fixed — Identical title detection (copy-paste tag contamination)
+
+`compute_meaningful_title_ratio()` now penalises folders where all tracks share the same title
+string. A folder where every track is tagged "Track 01" (a common iTunes/rip error) now scores
+≤ 0.30 on title quality, pushing confidence below threshold and routing to Review.
+
+Previously: 12/12 tracks with identical titles scored 1.0 on title quality.
+Now: max 0.30 when all tracks share the same title (and track count > 2).
+
+### Improved — Folder alignment v2 (`folder_alignment_bonus`)
+
+The folder alignment confidence factor now uses token-coverage comparison instead of string
+edit distance. Key changes:
+
+- **Year-anchored cutoff**: everything after the first 4-digit year in the source folder name
+  is discarded before comparison. Scene release suffixes (`-WEB-2023-FTD`, `-MFDOS`) no longer
+  drag the score down.
+- **Noise token stripping**: format markers (`flac`, `mp3`, `320`, `web`, `vinyl`), quality tags
+  (`remaster`, `deluxe`, `expanded`), and scene markers are stripped before comparison.
+- **Token coverage**: score = fraction of proposed tokens present in source folder.
+- Weight bumped 0.05 → 0.08 (alignment is more reliable now, deserves more weight).
+
+Configurable via `reference.folder_alignment_noise_tokens` in `config.yaml`.
+
+### Improved — Smart Title Case applied to all-lowercase artist tags
+
+Artist names that are entirely lowercase in the tag (e.g. `"flying lotus"`, `"four tet"`)
+now get Smart Title Case applied during normalisation — the same logic used for lowercase
+folder names. DJ/EP/VA/UK/US acronyms preserved.
+
+Previously: artist tags were only alias-mapped or "The"-prefix adjusted.
+Now: all-lowercase tags → Smart Title Case → then alias and normalisation rules.
+
+### Config changes
+
+| Key | Change |
+|-----|--------|
+| `review_rules.auto_approve_threshold` | New. Triage AUTO/HOLD split threshold (default: same as `min_confidence_for_clean`) |
+| `title_cleanup.strip_trailing_phrases` | Added `ftd` (scene release group noise suffix) |
+| `reference.folder_alignment_noise_tokens` | New. Token list for folder alignment v2 noise stripping |
+
+### Version source
+
+`APP_VERSION` in `raagdosa.py` is now read from the installed package metadata via
+`importlib.metadata.version("raagdosa")`. The single source of truth for the version is
+`pyproject.toml`. Fallback to hardcoded `"8.0.0"` if not installed as a package.
 
 ---
 

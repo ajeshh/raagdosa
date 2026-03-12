@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RaagDosa v5.5
+RaagDosa
 Deterministic library cleanup for DJ music folders — CLI-first, safe-by-default, undoable.
 
 Commands:
@@ -13,7 +13,7 @@ Commands:
 """
 from __future__ import annotations
 
-import argparse, csv, dataclasses, datetime as dt, fnmatch, hashlib, html
+import argparse, csv, dataclasses, datetime as dt, difflib, fnmatch, hashlib, html
 import json, os, platform, re, shutil, signal, sys, unicodedata, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
@@ -38,7 +38,11 @@ except Exception:
     _PILImage = None
     _HAS_PIL = False
 
-APP_VERSION = "7.0.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    APP_VERSION = _pkg_version("raagdosa")
+except Exception:
+    APP_VERSION = "8.0.0"
 
 # ─────────────────────────────────────────────────────────────────
 # Hardware performance tiers
@@ -492,6 +496,13 @@ def normalize_artist_name(name:str,cfg:Dict[str,Any])->str:
     if words and all(w.isupper() for w in words if len(w)>2):
         small={"a","an","the","and","but","or","for","of","in","at","to","by","vs"}
         s=" ".join(w.capitalize() if i==0 or w.lower() not in small else w.lower() for i,w in enumerate(words))
+        words=s.split()
+
+    # all-lowercase → Smart Title Case (same logic used for folder names)
+    alpha_words=[w for w in words if any(c.isalpha() for c in w)]
+    if alpha_words and all(w.islower() for w in alpha_words):
+        s=_smart_title_case_v43(s, cfg)
+        words=s.split()
 
     # Alias map (case-insensitive exact match wins immediately)
     # Check artist_normalization.aliases first, then reference.artist_aliases
@@ -660,12 +671,16 @@ def strip_display_noise(name:str)->str:
 # ─────────────────────────────────────────────
 # Disc indicator stripping from album names
 # ─────────────────────────────────────────────
-_DISC_INDICATOR=re.compile(r'\s*[-–—:,]\s*(?:disc|cd|disk|volume|vol\.?)\s*\d+\s*$',re.I)
-_DISC_INDICATOR2=re.compile(r'\s*\((?:disc|cd|disk|volume|vol\.?)\s*\d+\)\s*$',re.I)
-_DISC_INDICATOR3=re.compile(r'\s*\[(?:disc|cd|disk|volume|vol\.?)\s*\d+\]\s*$',re.I)
+# Note: Volume/Vol is intentionally NOT stripped — it's part of the album name
+# (e.g. "Now That's What I Call Music Volume 2"). Only disc/cd/disk indicators
+# are stripped for unified matching of multi-disc albums.
+_DISC_INDICATOR=re.compile(r'\s*[-–—:,]\s*(?:disc|cd|disk)\s*\d+\s*$',re.I)
+_DISC_INDICATOR2=re.compile(r'\s*\((?:disc|cd|disk)\s*\d+\)\s*$',re.I)
+_DISC_INDICATOR3=re.compile(r'\s*\[(?:disc|cd|disk)\s*\d+\]\s*$',re.I)
 
 def strip_disc_indicator(album_name:str)->str:
-    """Remove trailing disc/cd/vol indicators from an album name for unified matching."""
+    """Remove trailing disc/cd indicators from an album name for unified matching.
+    Volume/Vol are preserved — they are part of the album identity, not disc markers."""
     s=album_name
     for pat in (_DISC_INDICATOR,_DISC_INDICATOR2,_DISC_INDICATOR3):
         s=pat.sub('',s).strip()
@@ -739,12 +754,17 @@ def parse_vinyl_track(s:str)->Optional[Tuple[str,int,int]]:
 # ─────────────────────────────────────────────
 # EP detection
 # ─────────────────────────────────────────────
-def detect_ep(audio_files:List[Path],cfg:Dict[str,Any])->bool:
-    """True if file count falls in the EP range (default 3–6 tracks)."""
+_EP_NAME_RE=re.compile(r'(?:^|[\s\[\(])E\.?P\.?(?:$|[\s\]\)])',re.I)
+
+def detect_ep(audio_files:List[Path],cfg:Dict[str,Any],folder_name:str="")->bool:
+    """True if track count is in the EP range OR folder/album name contains an EP keyword."""
     ep=cfg.get("ep_detection",{})
     if not ep.get("enabled",True): return False
     mn=int(ep.get("min_tracks",2)); mx=int(ep.get("max_tracks",6))
-    return mn<=len(audio_files)<=mx
+    if mn<=len(audio_files)<=mx: return True
+    # Also detect from folder/album name — catches EPs with non-standard track counts
+    if folder_name and _EP_NAME_RE.search(folder_name): return True
+    return False
 
 # ─────────────────────────────────────────────
 # Mix / chart folder classifier
@@ -766,8 +786,8 @@ def classify_folder_content(
     """
     mc=cfg.get("mix_detection",{}); enabled=mc.get("enabled",True)
 
-    # EP first
-    if detect_ep(audio_files,cfg): return "ep"
+    # EP first — check track count and folder name
+    if detect_ep(audio_files,cfg,folder_name): return "ep"
 
     if not enabled: return "album"
 
@@ -822,14 +842,20 @@ def detect_duplicate_track_numbers(track_nums:List[int])->List[int]:
     return [n for n,cnt in c.items() if cnt>1]
 
 def compute_meaningful_title_ratio(titles:List[str])->float:
-    """Fraction of titles that look like real titles vs garbage/missing."""
+    """Song title confidence: fraction of titles that look like real titles vs garbage/missing.
+    Also penalises if all titles are identical (likely a tagging error) or too short."""
     if not titles: return 0.5
     meaningful=0
     for t in titles:
         if not t or len(t.strip())<2: continue
         g=detect_garbage_name(t)
         if not g and not detect_mojibake(t): meaningful+=1
-    return meaningful/len(titles)
+    ratio=meaningful/len(titles)
+    # Penalise if all titles are identical (copy-paste tags)
+    unique_titles=set(t.strip().lower() for t in titles if t and t.strip())
+    if len(unique_titles)==1 and len(titles)>2:
+        ratio=min(ratio,0.30)  # all tracks same title = likely bad tags
+    return ratio
 
 def compute_filename_tag_consistency(
     audio_files:List[Path],
@@ -897,15 +923,82 @@ def compute_albumartist_consistency(all_tags:List[Dict[str,Optional[str]]])->flo
     _,dom_share,_=compute_dominant(c)
     return dom_share
 
-def compute_folder_alignment_bonus(folder_name:str,proposed_name:str)->float:
+def _tokenise_for_alignment(name:str,noise_tokens:Optional[Set[str]]=None)->List[str]:
     """
-    0.0–1.0 bonus based on how closely folder_name already matches proposed_name.
-    Perfect match = 1.0, partial = proportional.
+    Tokenise a folder/proposed name for alignment comparison.
+    1. Lowercase + split on non-alphanumeric separators.
+    2. Apply year-anchored cutoff: discard everything after the first 4-digit year
+       (removes scene group suffixes like FTD, MFDOS cleanly without a group list).
+    3. Strip known noise tokens (format/quality/scene markers).
+    """
+    import re as _re
+    tokens=_re.split(r'[^a-z0-9]+',name.lower())
+    tokens=[t for t in tokens if t]
+    # Year-anchored cutoff
+    cutoff=len(tokens)
+    for i,t in enumerate(tokens):
+        if _re.fullmatch(r'(?:19|20)\d{2}',t):
+            cutoff=i+1; break
+    tokens=tokens[:cutoff]
+    # Default noise set (augmented by config reference.folder_alignment_noise_tokens)
+    default_noise={
+        "web","webflac","webrip","flac","mp3","aac","ogg","opus","wav","aiff",
+        "cd","cdda","vinyl","dvd","lp","ep","320","256","192","128","v0","v2","vbr",
+        "proper","repack","retail","promo","advance","limited","reissue","remaster",
+        "remastered","deluxe","expanded","anniversary","nfo","sfv","readnfo",
+        "dirfix","nfofix","kbps","khz","lossless","hq",
+    }
+    effective_noise=(noise_tokens or set()) | default_noise
+    return [t for t in tokens if t not in effective_noise and len(t)>1]
+
+def compute_folder_alignment_bonus(folder_name:str,proposed_name:str,cfg:Optional[Dict[str,Any]]=None)->float:
+    """
+    v2: Token-coverage alignment.
+    Measures what fraction of the proposed name's tokens appear in the original
+    folder name, after stripping scene noise and applying year-anchored cutoff.
+
+    Artist-prefix adjustment: if proposed has the form "Artist - Album" and the
+    artist tokens are absent from the folder (we found the artist from tags), that is
+    a good thing — use album-only coverage to avoid penalising clean renames.
+
+    0.0 = no meaningful token overlap (completely different content)
+    1.0 = all proposed tokens found in folder (perfect or fully covered)
     """
     fn=normalize_unicode(folder_name.strip().lower())
     pn=normalize_unicode(proposed_name.strip().lower())
     if fn==pn: return 1.0
-    return string_similarity(fn,pn)
+
+    # Load config noise tokens if available
+    noise_cfg:Set[str]=set()
+    if cfg is not None:
+        extra=[t.lower() for t in cfg.get("reference",{}).get("folder_alignment_noise_tokens",[]) if isinstance(t,str)]
+        noise_cfg=set(extra)
+
+    folder_toks=set(_tokenise_for_alignment(folder_name,noise_cfg))
+    proposed_toks=_tokenise_for_alignment(proposed_name,noise_cfg)
+
+    if not proposed_toks:
+        return 0.5  # neutral — no meaningful tokens in proposed
+
+    def _coverage(p_toks:List[str])->float:
+        if not p_toks: return 0.5
+        hits=sum(1 for t in p_toks if t in folder_toks)
+        return hits/len(p_toks)
+
+    coverage=_coverage(proposed_toks)
+
+    # Artist-prefix adjustment: if "Artist - Rest" format, also try Rest-only coverage
+    if " - " in proposed_name:
+        _,rest=proposed_name.split(" - ",1)
+        rest_toks=_tokenise_for_alignment(rest,noise_cfg)
+        rest_cov=_coverage(rest_toks)
+        coverage=max(coverage,rest_cov)
+
+    # Neutral floor for opaque originals (all tokens were noise or too short)
+    if not folder_toks:
+        return 0.5
+
+    return coverage
 
 def compute_confidence_factors(
     audio_files:List[Path],
@@ -917,6 +1010,7 @@ def compute_confidence_factors(
     folder_name:str,
     proposed_name:str,
     all_tags:List[Dict[str,Optional[str]]],
+    cfg:Optional[Dict[str,Any]]=None,
 )->Dict[str,float]:
     """
     Compute named confidence factors that replace/complement the legacy single float.
@@ -960,16 +1054,18 @@ def compute_confidence_factors(
     # albumartist_consistency
     factors["aa_consistency"]=compute_albumartist_consistency(all_tags)
 
-    # folder_alignment: bonus if folder already matches proposed
-    factors["folder_alignment"]=compute_folder_alignment_bonus(folder_name,proposed_name)
+    # folder_alignment: v2 token-coverage alignment (see compute_folder_alignment_bonus)
+    factors["folder_alignment"]=compute_folder_alignment_bonus(folder_name,proposed_name,cfg if cfg is not None else {})
 
     return factors
 
 def confidence_from_factors(factors:Dict[str,float],used_heuristic:bool)->float:
     """Compute a single 0–1 confidence score from the factor dict."""
+    # v7.1: folder_alignment bumped 0.05→0.08 now that v2 token-coverage is reliable.
+    # filename_consistency reduced 0.10→0.07 (both measure name/tag agreement).
     weights={"dominance":0.40,"tag_coverage":0.15,"title_quality":0.12,
-             "filename_consistency":0.10,"completeness":0.12,
-             "aa_consistency":0.06,"folder_alignment":0.05}
+             "filename_consistency":0.07,"completeness":0.12,
+             "aa_consistency":0.06,"folder_alignment":0.08}
     score=sum(factors.get(k,0.5)*w for k,w in weights.items())
     if used_heuristic: score*=0.60
     return min(1.0,max(0.0,score))
@@ -1296,6 +1392,19 @@ def _same_device(a:Path,b:Path)->bool:
     except Exception:
         return False
 
+def _restore_creation_date(src_stat,target:Path)->None:
+    """Restore the original creation date (birthtime) on macOS using SetFile."""
+    if not hasattr(src_stat,"st_birthtime"): return
+    try:
+        import subprocess
+        birthtime=dt.datetime.fromtimestamp(src_stat.st_birthtime)
+        # SetFile -d expects "MM/DD/YYYY HH:MM:SS"
+        date_str=birthtime.strftime("%m/%d/%Y %H:%M:%S")
+        subprocess.run(["SetFile","-d",date_str,str(target)],
+                      capture_output=True,timeout=5)
+    except Exception:
+        pass  # best-effort
+
 def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->Tuple[str,float]:
     """
     Move src folder to dst.
@@ -1308,25 +1417,45 @@ def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->Tuple[str,float
       copytree → count+size verify → optional checksum → rmtree.
       Only triggered when source and destination are on different drives.
 
+    Preserves original creation dates and modification times on both paths.
+
     Returns (method, elapsed_seconds).
     """
     t0=dt.datetime.now().timestamp()
 
+    # Capture original timestamps before any move
+    folder_stat=src.stat()
+    file_stats:Dict[str,os.stat_result]={}
+    try:
+        for f in src.rglob("*"):
+            file_stats[str(f.relative_to(src))]=f.stat()
+    except Exception:
+        pass
+
     if _same_device(src,dst):
         # ── Fast path: atomic rename ──────────────────────────────────────
-        # Ensure destination parent exists
         ensure_dir(dst.parent)
         try:
             src.rename(dst)
         except OSError:
-            # rename() can still fail cross-mount even with same st_dev on some
-            # network/virtual filesystems — fall through to copy path
             pass
         else:
+            # Restore folder timestamps (rename usually preserves, but be safe)
+            try:
+                os.utime(str(dst),(folder_stat.st_atime,folder_stat.st_mtime))
+            except Exception: pass
+            _restore_creation_date(folder_stat,dst)
+            # Restore file timestamps
+            for rel,fstat in file_stats.items():
+                fpath=dst/rel
+                if fpath.exists():
+                    try: os.utime(str(fpath),(fstat.st_atime,fstat.st_mtime))
+                    except Exception: pass
+                    _restore_creation_date(fstat,fpath)
             return "rename", dt.datetime.now().timestamp()-t0
 
     # ── Slow path: copy → verify → delete ────────────────────────────────
-    shutil.copytree(str(src),str(dst))
+    shutil.copytree(str(src),str(dst),copy_function=shutil.copy2)
     sf=sorted([f for f in src.rglob("*") if f.is_file()])
     df=sorted([f for f in dst.rglob("*") if f.is_file()])
     if len(sf)!=len(df):
@@ -1342,6 +1471,17 @@ def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->Tuple[str,float
                 shutil.rmtree(str(dst),ignore_errors=True)
                 raise RuntimeError(f"Checksum mismatch: {s.name}")
     shutil.rmtree(str(src))
+    # Restore creation dates on copied folder and files
+    try:
+        os.utime(str(dst),(folder_stat.st_atime,folder_stat.st_mtime))
+    except Exception: pass
+    _restore_creation_date(folder_stat,dst)
+    for rel,fstat in file_stats.items():
+        fpath=dst/rel
+        if fpath.exists():
+            try: os.utime(str(fpath),(fstat.st_atime,fstat.st_mtime))
+            except Exception: pass
+            _restore_creation_date(fstat,fpath)
     return "copy", dt.datetime.now().timestamp()-t0
 
 # ─────────────────────────────────────────────
@@ -2329,7 +2469,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     albums_norm:Counter=Counter(); albumartists_norm:Counter=Counter(); track_artists_norm:Counter=Counter(); years:Counter=Counter()
     primary_artists_norm:Counter=Counter()  # v5.5.1: artist before feat/ft — for VA detection
     genres:Counter=Counter(); labels:Counter=Counter(); bpms:List[float]=[]; keys_raw:Counter=Counter()
-    albums_raw:Dict[str,Counter]={}; albumartists_raw:Dict[str,Counter]={}
+    albums_raw:Dict[str,Counter]={}; albumartists_raw:Dict[str,Counter]={}; track_artists_raw:Dict[str,Counter]={}
     tracks_with_year=0; tagged=0; unreadable=0
     extensions:Counter=Counter(p.suffix.lower() for p in audio_files)
     all_tags:List[Dict[str,Optional[str]]]=[]
@@ -2359,7 +2499,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         if alb_n: albums_norm[alb_n]+=1; albums_raw.setdefault(alb_n,Counter())[alb_r_clean or alb_r]+=1
         if aa_n:  albumartists_norm[aa_n]+=1; albumartists_raw.setdefault(aa_n,Counter())[aa_r]+=1
         if art_n:
-            track_artists_norm[art_n]+=1
+            track_artists_norm[art_n]+=1; track_artists_raw.setdefault(art_n,Counter())[art_r]+=1
             # v5.5.1: extract primary artist (before feat/ft/featuring/&/vs) for VA detection
             _prim = re.split(r'\s+(?:feat\.?|ft\.?|featuring|&|and|vs\.?|x)\s+', art_n, maxsplit=1, flags=re.I)[0].strip()
             if _prim: primary_artists_norm[_prim]+=1
@@ -2380,13 +2520,20 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     dom_art_n,art_share,_=compute_dominant(track_artists_norm)
     dom_alb=recover_display(dom_alb_n,albums_raw); dom_aa=recover_display(dom_aa_n,albumartists_raw)
 
+    # Always parse folder name heuristic — needed for compound artist recovery (&/and joins)
+    _h_parsed=parse_folder_name_heuristic(folder.name,cfg)
+    _h_album=_h_parsed.get("album"); _h_artist=_h_parsed.get("artist"); _h_year=_h_parsed.get("year")
+
     used_heuristic=False
-    if not dom_alb and tagged==0:
-        parsed=parse_folder_name_heuristic(folder.name)
-        dom_alb=parsed.get("album"); dom_aa=parsed.get("artist")
-        alb_share=0.50 if dom_alb else 0.0; aa_share=0.50 if dom_aa else 0.0
+    if not dom_alb:
+        if _h_album:
+            dom_alb=_h_album; alb_share=0.50
+        # Only take artist from folder name when we have no tags at all
+        if tagged==0:
+            dom_aa=dom_aa or _h_artist
+            aa_share=aa_share or (0.50 if _h_artist else 0.0)
         used_heuristic=True
-        if not tracks_with_year and parsed.get("year"): years[parsed["year"]]=1; tracks_with_year=1
+        if not tracks_with_year and _h_year: years[_h_year]=1; tracks_with_year=1
 
     # ── override: force name / artist ───────────────────────────────────
     if override:
@@ -2556,13 +2703,31 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     is_ep =(folder_type=="ep")
     if is_va and folder_type not in ("mix",): folder_type="va"
 
+    _feat_pat=re.compile(r'\s+(?:feat\.?|ft\.?|featuring)\s+.+$',re.I)
     if is_va:
         artist_for_folder:Optional[str]=va_label
     elif dom_aa:
-        artist_for_folder=normalize_artist_name(dom_aa,cfg)
+        # Strip feat. collaborator from albumartist — main artist owns the folder,
+        # feat. credit stays in the album name if it appears there.
+        _prim_aa=_feat_pat.sub("",dom_aa).strip() or dom_aa
+        artist_for_folder=normalize_artist_name(_prim_aa,cfg)
     elif cfg.get("decision",{}).get("allow_artist_fallback",True):
-        raw_art=recover_display(dom_art_n,{}) or dom_art_n
-        artist_for_folder=normalize_artist_name(raw_art or "",cfg) or None
+        raw_art=recover_display(dom_art_n,track_artists_raw) or dom_art_n
+        _prim_art=_feat_pat.sub("",raw_art or "").strip() or (raw_art or "")
+        artist_for_folder=normalize_artist_name(_prim_art,cfg) or None
+        # Compound artist recovery: if folder name has "A and B" / "A & B" and tag artist
+        # is one of the parts (tags split credits per track), prefer the compound name.
+        if artist_for_folder and _h_artist:
+            _split_pat=re.compile(r'\s+(?:and|&)\s+',re.I)
+            _h_parts=_split_pat.split(_h_artist)
+            if len(_h_parts)>=2:
+                _art_low=normalize_unicode(artist_for_folder.lower().strip())
+                _matches=[normalize_unicode(p.lower().strip())==_art_low or _art_low in normalize_unicode(p.lower()) for p in _h_parts]
+                if any(_matches):
+                    # One of the compound parts matches the tag artist → use full compound name
+                    # Normalise "and" → "&" for cleaner folder names
+                    _compound=_split_pat.sub(" & ",_h_artist)
+                    artist_for_folder=normalize_artist_name(_compound,cfg) or artist_for_folder
     else:
         artist_for_folder=None
 
@@ -2584,27 +2749,39 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
 
     year_val,year_meta=pick_year(years,tracks_with_year,max(total,1) if used_heuristic else total,cfg)
 
+    # v7.0: If year came only from heuristic (no tag agreement) and was low confidence,
+    # drop it — better to have no year than a wrong year in the folder name.
+    if year_val and used_heuristic and year_meta.get("agreement",1.0)<0.70:
+        year_val=None; year_meta={"included":False,"reason":"heuristic_low_agreement"}
+
     fmt=cfg.get("format",{})
     # Strip trailing EP/E.P./LP suffixes from album name before adding [EP] label
     # to prevent doubling like "Ashen EP [EP]"
     _ep_stripped_alb = dom_alb
     if is_ep and fmt.get("label_eps",True):
-        _ep_stripped_alb = re.sub(r'\s+E\.?P\.?\s*$', '', dom_alb, flags=re.I).strip()
+        # Strip both bare "EP"/"E.P." and bracketed "[EP]"/"(EP)" from album name end
+        _ep_stripped_alb = re.sub(r'\s*[\[\(]\s*E\.?P\.?\s*[\]\)]\s*$|\s+E\.?P\.?\s*$', '', dom_alb, flags=re.I).strip()
     ep_suffix=" [EP]" if is_ep and fmt.get("label_eps",True) else ""
-    # Deduplicate year: if the album name already contains the year, skip appending it
+    # v7.0: Strip year from album name entirely, then place it at the end via pattern.
+    # This prevents years appearing in the wrong position inside the album name
+    # (e.g. "2023 Album Name" → "Artist - 2023 Album Name" instead of "Artist - Album Name (2023)").
     _alb_for_fmt = _ep_stripped_alb + ep_suffix
-    _year_already_in_album = year_val and re.search(r'\b' + str(year_val) + r'\b', _alb_for_fmt)
-    pat_key = "pattern_with_year" if (year_val and not _year_already_in_album) else "pattern_no_year"
+    if year_val:
+        # Remove year in any position: "(2023)", "[2023]", bare "2023", leading "2023 - "
+        _yr_str = str(year_val)
+        _alb_for_fmt = re.sub(r'\s*[\(\[]\s*' + _yr_str + r'\s*[\)\]]\s*', ' ', _alb_for_fmt).strip()
+        _alb_for_fmt = re.sub(r'(?:^|\s+)' + _yr_str + r'(?:\s+|$)', ' ', _alb_for_fmt).strip()
+        _alb_for_fmt = re.sub(r'^\s*' + _yr_str + r'\s*[-–—]\s*', '', _alb_for_fmt).strip()
+        _alb_for_fmt = _alb_for_fmt.strip(' -–—')
+        if not _alb_for_fmt:
+            _alb_for_fmt = _ep_stripped_alb + ep_suffix  # safety: don't blank out the name
+    pat_key = "pattern_with_year" if year_val else "pattern_no_year"
     pat=fmt.get(pat_key,"{albumartist} - {album}")
     proposed=pat.format(albumartist=artist_for_folder,album=_alb_for_fmt,year=year_val or "")
     proposed=sanitize_name(proposed,repl=fmt.get("replace_illegal_chars_with"," - "))
     proposed=sanitize_windows_reserved(proposed)
 
-    sfx=cfg.get("format_suffix",{})
-    if sfx.get("enabled",True) and sfx.get("only_if_all_same_extension",True) and len(extensions)==1:
-        ext1=next(iter(extensions.keys()))
-        if ext1 and ext1!=lower(sfx.get("ignore_extension",".mp3")) and sfx.get("style","brackets_upper")=="brackets_upper":
-            proposed=f"{proposed} [{ext1.lstrip('.').upper()}]"
+    proposed=_apply_format_suffix(proposed,cfg,dict(extensions))
 
     is_flac_only=set(extensions.keys())=={".flac"}
     # Genre/label: plurality vote (raw display form — normalization happens in resolve_library_path)
@@ -2623,10 +2800,22 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
                                      profile=profile,genre=dom_genre,
                                      bpm=avg_bpm,key=dom_key,label=dom_label)
 
+    # v7.0: Multi-disc grouping — if source folder name contains a disc indicator
+    # (CD1, CD2, Disc 1, etc.), nest it as a subfolder under the album folder.
+    # This groups CD1 + CD2 under one parent: Artist/Album/CD1/, Artist/Album/CD2/
+    _disc_folder_pat=re.compile(r'(?:disc|cd|disk)\s*(\d+)',re.I)
+    _disc_m=_disc_folder_pat.search(folder.name)
+    if _disc_m:
+        disc_label=f"CD{_disc_m.group(1)}"
+        target_dir=target_dir/disc_label
+        decision_extra_disc=disc_label
+    else:
+        decision_extra_disc=None
+
     # ── named confidence factors ─────────────────────────────────────────
     conf_factors=compute_confidence_factors(
         audio_files,tagged,alb_share,aa_share,art_share,
-        used_heuristic,folder.name,proposed,all_tags)
+        used_heuristic,folder.name,proposed,all_tags,cfg)
 
     # v6.2: VA-prefix scene-named folders get penalised on folder_alignment
     # because scene naming ("VA-Title-CAT-WEB-2023-GRP") never matches the
@@ -2651,6 +2840,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         "unreadable_ratio":(unreadable/total) if total else 0.0,
         "used_heuristic":used_heuristic,"is_flac_only":is_flac_only,
         "garbage_reasons":garbage,"confidence_factors":conf_factors,
+        "disc_subfolder":decision_extra_disc,
     }
     stats=FolderStats(tracks_total=total,tracks_tagged=tagged,tracks_unreadable=unreadable,extensions=dict(extensions),format_duplicates=fmt_dupes)
     return FolderProposal(folder_path=str(folder),folder_name=folder.name,proposed_folder_name=proposed,
@@ -2671,7 +2861,7 @@ _REASON_DESCRIPTIONS:Dict[str,str]={
 _FACTOR_DESCRIPTIONS:Dict[str,str]={
     "tag_coverage":"Tag readability",
     "dominance":"Album/artist vote consensus",
-    "title_quality":"Meaningful track titles",
+    "title_quality":"Song title confidence",
     "filename_consistency":"Filename ↔ tag alignment",
     "completeness":"Track numbering completeness",
     "aa_consistency":"Album-artist consistency",
@@ -2732,6 +2922,71 @@ REVIEW_REASON_PRESETS=[
     "wrong-genre",        # Genre classification wrong
     "needs-research",     # Need to check Discogs/MusicBrainz
 ]
+
+# v6.2: generic/vague folder names that are not album names — force review
+_GENERIC_FOLDER_NAMES = {
+    "a","music","complete","down tempo","downtempo","warm up","warm-up",
+    "underground house","haifa club","estray","rare tracks","new","misc",
+    "unsorted","temp","incoming","downloads","stuff","tracks","songs",
+    "playlist","mix","mixes","cd1","cd2","cd3","disc 1","disc 2",
+    "electronica-downtempo","world electro - ethno disco - global groove",
+    "jazz house piano bar","master pieces of electro","remixes and other tracks",
+}
+
+def _apply_format_suffix(name:str,cfg:Dict[str,Any],extensions:Optional[Dict[str,int]])->str:
+    """Append format tag (e.g. [FLAC]) to folder name based on config."""
+    sfx=cfg.get("format_suffix",{})
+    if not sfx.get("enabled",True) or not extensions:
+        return name
+    if sfx.get("only_if_all_same_extension",True) and len(extensions)==1:
+        ext1=next(iter(extensions.keys()))
+        if ext1 and ext1!=lower(sfx.get("ignore_extension",".mp3")) and sfx.get("style","brackets_upper")=="brackets_upper":
+            name=f"{name} [{ext1.lstrip('.').upper()}]"
+    return name
+
+def _route_proposal(p:FolderProposal,cfg:Dict[str,Any],
+                    seen_names:Counter,existing_clean:Set[str],
+                    manifest_entries:Set[str],
+                    review_albums:Path,dup_root:Path,mixes_root:Path,
+                    all_proposals:Optional[List]=None)->FolderProposal:
+    """Route a single proposal to clean/review/duplicate. Mutates p in place."""
+    rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
+    sc=cfg.get("scan",{}); max_unread=float(sc.get("max_unreadable_track_ratio",0.25))
+    reasons:List[str]=[]; dest="clean"
+    if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
+        dest="review"; reasons.append("low_confidence")
+    _fn_norm = p.folder_name.strip().strip("_- ").lower()
+    if _fn_norm in _GENERIC_FOLDER_NAMES:
+        if dest == "clean": dest = "review"
+        reasons.append("generic_folder_name")
+        p.confidence = min(p.confidence, min_conf - 0.05)
+    seen_names[p.proposed_folder_name]+=1
+    if rr.get("route_duplicates",True) and seen_names[p.proposed_folder_name]>1:
+        dest="duplicate"
+        if all_proposals:
+            colliders=[q.folder_name for q in all_proposals if q.proposed_folder_name==p.proposed_folder_name and q is not p]
+            reasons.append(f"duplicate_in_run:{colliders[0][:40] if colliders else '?'}")
+        else:
+            reasons.append("duplicate_in_run")
+    norm_prop=normalize_unicode(p.proposed_folder_name)
+    if rr.get("route_cross_run_duplicates",True) and (norm_prop in existing_clean or norm_prop in manifest_entries):
+        dest="duplicate"; reasons.append("already_in_clean")
+    if p.decision.get("unreadable_ratio",0.0)>max_unread:
+        dest="review"; reasons.append("unreadable_ratio_high")
+    if p.decision.get("used_heuristic",False):
+        if dest=="clean": dest="review"
+        reasons.append("heuristic_fallback")
+    if p.stats.format_duplicates: reasons.append(f"format_dupes({len(p.stats.format_duplicates)})")
+    if p.decision.get("is_ep"): reasons.append("ep")
+    if p.decision.get("is_mix") and dest=="clean":
+        reasons.append("mix_folder"); ensure_dir(mixes_root)
+        p.target_path=str(mixes_root/p.proposed_folder_name)
+    p.destination=dest; p.decision["route_reasons"]=reasons
+    if reasons:
+        p.decision["review_summary"]=_build_review_summary(reasons,p.decision.get("confidence_factors",{}),p.confidence)
+    if dest=="review":    p.target_path=str(review_albums/p.proposed_folder_name)
+    elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
+    return p
 
 def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->Tuple[str,Path,List[FolderProposal]]:
     profiles=cfg.get("profiles",{})
@@ -2853,9 +3108,6 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
         out(f"  Tag cache: {_tag_cache.size} entries",level=VERBOSE)
 
     # Routing
-    rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
-    max_unread=float(sc.get("max_unreadable_track_ratio",0.25))
-    within_run=Counter(p.proposed_folder_name for p in proposals)
     existing_clean:Set[str]=set()
     if clean_albums.exists():
         try:
@@ -2863,58 +3115,13 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
                 if item.is_dir(): existing_clean.add(normalize_unicode(item.name))
         except Exception: pass
     manifest_entries:Set[str]=set(read_manifest(cfg).get("entries",{}).keys())
-
-    # Build mixes root
     lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
     mixes_root=clean_albums.parent/mixes_folder
-
-    # v6.2: generic/vague folder names that are not album names — force review
-    _generic_folder_names = {
-        "a","music","complete","down tempo","downtempo","warm up","warm-up",
-        "underground house","haifa club","estray","rare tracks","new","misc",
-        "unsorted","temp","incoming","downloads","stuff","tracks","songs",
-        "playlist","mix","mixes","cd1","cd2","cd3","disc 1","disc 2",
-        "electronica-downtempo","world electro - ethno disco - global groove",
-        "jazz house piano bar","master pieces of electro","remixes and other tracks",
-    }
+    seen_names:Counter=Counter()
 
     for p in proposals:
-        reasons:List[str]=[]; dest="clean"
-        if rr.get("route_questionable_to_review",True) and p.confidence<min_conf:
-            dest="review"; reasons.append("low_confidence")
-        # v6.2: generic folder name → force review with penalty
-        _fn_norm_route = p.folder_name.strip().strip("_- ").lower()
-        if _fn_norm_route in _generic_folder_names:
-            if dest == "clean": dest = "review"
-            reasons.append("generic_folder_name")
-            p.confidence = min(p.confidence, min_conf - 0.05)
-        if rr.get("route_duplicates",True) and within_run[p.proposed_folder_name]>1:
-            dest="duplicate"
-            # Find the other colliding folder name for detail
-            colliders=[q.folder_name for q in proposals if q.proposed_folder_name==p.proposed_folder_name and q is not p]
-            reasons.append(f"duplicate_in_run:{colliders[0][:40] if colliders else '?'}")
-        norm_prop=normalize_unicode(p.proposed_folder_name)
-        if rr.get("route_cross_run_duplicates",True) and (norm_prop in existing_clean or norm_prop in manifest_entries):
-            dest="duplicate"; reasons.append("already_in_clean")
-        if p.decision.get("unreadable_ratio",0.0)>max_unread:
-            dest="review"; reasons.append("unreadable_ratio_high")
-        if p.decision.get("used_heuristic",False):
-            if dest=="clean": dest="review"
-            reasons.append("heuristic_fallback")
-        if p.stats.format_duplicates: reasons.append(f"format_dupes({len(p.stats.format_duplicates)})")
-        # EP stays in clean unless confidence too low
-        if p.decision.get("is_ep"): reasons.append("ep")
-        # Mix: route to mixes folder (clean side)
-        if p.decision.get("is_mix") and dest=="clean":
-            reasons.append("mix_folder")
-            ensure_dir(mixes_root)
-            p.target_path=str(mixes_root/p.proposed_folder_name)
-        p.destination=dest; p.decision["route_reasons"]=reasons
-        # v7.0: generate human-readable review summary
-        if reasons:
-            p.decision["review_summary"]=_build_review_summary(reasons,p.decision.get("confidence_factors",{}),p.confidence)
-        if dest=="review":    p.target_path=str(review_albums/p.proposed_folder_name)
-        elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
+        _route_proposal(p,cfg,seen_names,existing_clean,manifest_entries,
+                        review_albums,dup_root,mixes_root,all_proposals=proposals)
 
     payload={"app":cfg.get("app",{}),"session_id":session_id,"timestamp":now_iso(),"profile":profile_name,
              "source_root":str(source_root),"since":since.isoformat() if since else None,
@@ -3187,50 +3394,79 @@ def _display_folder_card(idx:int,total:int,p:FolderProposal)->None:
     dest_upper=p.destination.upper()
     dest_color=C.GREEN if p.destination=="clean" else (C.YELLOW if p.destination=="review" else C.RED)
 
-    # Header
-    print(f"\n{'═'*66}")
-    print(f"  {C.BOLD}[{idx:>3} / {total}]{C.RESET}{'':>30}{dest_color}ROUTE: {dest_upper}{C.RESET}")
-    print(f"{'─'*66}")
-    # Before/after
-    if src_name!=dst_name:
-        print(f"  {C.DIM}FROM:{C.RESET}  {src_name}")
-        print(f"  {C.GREEN}  TO:{C.RESET}  {dst_name}")
-    else:
-        print(f"  {C.DIM}FROM:{C.RESET}  {src_name}")
-        print(f"  {C.DIM}  TO:{C.RESET}  {C.DIM}(same){C.RESET}")
-    print()
-    # Metadata line
-    artist=d.get("albumartist_display","--"); album=d.get("dominant_album_display","--")
-    year=d.get("year","--"); genre=d.get("genre","--")
-    va="Yes" if d.get("is_va") else "No"
-    va_color=C.CYAN if d.get("is_va") else C.DIM
-    mix_tag=f"  {C.MAGENTA}[MIX]{C.RESET}" if d.get("is_mix") else ""
-    ep_tag=f"  {C.CYAN}[EP]{C.RESET}" if d.get("is_ep") else ""
-    ext_str=", ".join(f"{k.upper()} {v}" for k,v in (p.stats.extensions or {}).items()) or "--"
-    print(f"  Artist: {C.BOLD}{artist}{C.RESET}{'':>4}VA: {va_color}{va}{C.RESET}{mix_tag}{ep_tag}")
-    print(f"  Album:  {album}{'':>4}Year: {year}")
-    print(f"  Tracks: {p.stats.tracks_total} files  ·  {ext_str}")
-    if genre!="--": print(f"  Genre:  {genre}")
-    print()
-    # Confidence bar
-    print(f"  CONFIDENCE  {_conf_bar(p.confidence)}")
-    # Factor breakdown
-    display_factors=["tag_coverage","dominance","title_quality","filename_consistency",
-                     "completeness","aa_consistency","folder_alignment"]
-    for f in display_factors:
-        if f in factors and isinstance(factors[f],float):
-            print(_factor_bar(f,factors[f]))
-    # Route reasons
+    # ── Header ────────────────────────────────────────────────
+    print(f"\n{'━'*70}  [{idx}/{total}]")
+
+    # ── Confidence + route (top line, instant gut read) ───────
+    print(f"  {_conf_bar(p.confidence)}   {dest_color}{dest_upper}{C.RESET}")
+
+    # ── Warning flags (only if problems exist) ────────────────
     reasons=d.get("route_reasons",[])
     if reasons:
-        print(f"\n  {C.DIM}Reasons: {', '.join(reasons)}{C.RESET}")
+        flags=" · ".join(reasons)
+        flag_color=C.RED if p.confidence<0.60 else C.YELLOW
+        print(f"  {flag_color}▸ {flags}{C.RESET}")
+
+    # ── FROM / TO (the decision point) ────────────────────────
+    print()
+    print(f"  {C.DIM}FROM  {src_name}{C.RESET}")
+    if src_name!=dst_name:
+        print(f"    {C.BOLD}→ {dst_name}{C.RESET}")
+    else:
+        print(f"    {C.DIM}→ (unchanged){C.RESET}")
+
+    # ── Metadata (compact, glanceable) ────────────────────────
+    artist=d.get("albumartist_display","--")
+    album=d.get("dominant_album_display","")
+    year=d.get("year","")
+    va_flag=f"  {C.CYAN}VA{C.RESET}" if d.get("is_va") else ""
+    mix_flag=f"  {C.MAGENTA}MIX{C.RESET}" if d.get("is_mix") else ""
+    ep_flag=f"  {C.CYAN}EP{C.RESET}" if d.get("is_ep") else ""
+    ext_str=", ".join(f"{k.upper()} {v}" for k,v in (p.stats.extensions or {}).items()) or "--"
+    year_str=f"  {C.DIM}({year}){C.RESET}" if year else ""
+    tagged=d.get("tagged_count",p.stats.tracks_total); total_t=p.stats.tracks_total
+    tag_ratio=f"{tagged}/{total_t}" if tagged!=total_t else str(total_t)
+    genre=d.get("genre","")
+    genre_str=f"  {C.DIM}{genre}{C.RESET}" if genre else ""
+    album_str=f"  {C.DIM}-  {album}{C.RESET}" if album else ""
+    print(f"\n  {C.BOLD}{artist}{C.RESET}{album_str}{ep_flag}{va_flag}{mix_flag}{year_str}")
+    print(f"  {C.DIM}{tag_ratio} tracks  ·  {ext_str}{genre_str}{C.RESET}")
+
+    # ── Factor bars (compact) ─────────────────────────────────
+    display_factors=["tag_coverage","dominance","title_quality","filename_consistency",
+                     "completeness","aa_consistency","folder_alignment"]
+    shown=[f for f in display_factors if f in factors and isinstance(factors[f],float)]
+    if shown:
+        print()
+        for f in shown:
+            print(_factor_bar(f,factors[f]))
+
+    # ── Review summary ────────────────────────────────────────
     summary=d.get("review_summary","")
     if summary:
-        print(f"  {C.DIM}{summary}{C.RESET}")
-    print(f"{'─'*66}")
+        print(f"\n  {C.DIM}{summary}{C.RESET}")
 
-def _display_tracks(p:FolderProposal)->None:
-    """Show track listing for current folder."""
+    print(f"{'━'*70}")
+
+def _diff_old_highlight(old:str, new:str)->str:
+    """Return old string with removed/changed portions highlighted in red, rest dimmed.
+    Used to make the 'was:' line scannable at a glance."""
+    sm=difflib.SequenceMatcher(None, old, new, autojunk=False)
+    out=C.DIM
+    for op,i1,i2,_j1,_j2 in sm.get_opcodes():
+        chunk=old[i1:i2]
+        if op=="equal":
+            out+=chunk
+        elif op in ("replace","delete"):
+            # Un-dim and color the removed portion so it pops against the dim baseline
+            out+=C.RESET+C.RED+chunk+C.RESET+C.DIM
+    out+=C.RESET
+    return out
+
+def _display_tracks(p:FolderProposal,cfg:Optional[Dict[str,Any]]=None)->Optional[str]:
+    """Show track listing with rename preview for current folder.
+    For folders with >30 tracks, shows pages of 20 with n/p navigation.
+    Returns 'approve' if user presses b to batch-approve from within the view."""
     folder=Path(p.folder_path)
     if not folder.exists():
         print(f"  {C.RED}Folder not found on disk.{C.RESET}")
@@ -3240,39 +3476,148 @@ def _display_tracks(p:FolderProposal)->None:
     if not files:
         print(f"  {C.DIM}No audio files found.{C.RESET}")
         return
-    print(f"\n  TRACKS ({len(files)} files)")
-    print(f"  {'─'*60}")
-    shown=min(len(files),30)
-    for i,f in enumerate(files[:shown]):
-        print(f"   {i+1:>2}  {f.name}")
-    if len(files)>shown:
-        print(f"   {C.DIM}... and {len(files)-shown} more{C.RESET}")
-    print(f"  {'─'*60}")
+
+    # If cfg is available, compute rename previews
+    rename_map:Dict[str,str]={}
+    classification=""
+    if cfg is not None:
+        try:
+            classification=classify_folder_for_tracks(p.decision,cfg)
+            disc_multi=folder_is_multidisc(files,cfg)
+            for f in files:
+                tags=read_audio_tags(f,cfg)
+                new_name,conf,reason,meta=build_track_filename(classification,tags,f,cfg,p.decision,disc_multi)
+                if new_name and normalize_unicode(new_name)!=normalize_unicode(f.name):
+                    rename_map[f.name]=new_name
+        except Exception:
+            pass  # fall back to simple listing
+
+    type_label=f"  {C.DIM}[{classification}]{C.RESET}" if classification else ""
+    changes=len(rename_map)
+    unchanged=len(files)-changes
+
+    def _print_track(i:int, f:Path)->None:
+        new_name=rename_map.get(f.name)
+        if new_name:
+            # New name is the main event — left-aligned, normal weight
+            print(f"   {i+1:>2}  {new_name}")
+            # Old name below: dim with removed portions highlighted red
+            old_hl=_diff_old_highlight(f.name, new_name)
+            print(f"       {C.DIM}was:{C.RESET} {old_hl}")
+        else:
+            print(f"   {C.DIM}{i+1:>2}  {f.name}{C.RESET}")
+
+    BATCH=20
+    if len(files)>30:
+        # Large folder — paginate in batches of 20; b to batch-approve
+        total_pages=(len(files)+BATCH-1)//BATCH
+        page_idx=0
+        while True:
+            start=page_idx*BATCH; end=min(start+BATCH,len(files))
+            print(f"\n  TRACKS ({len(files)} files){type_label}  ·  {C.GREEN}{changes} rename(s){C.RESET}  {C.DIM}{unchanged} unchanged  [Batch {page_idx+1}/{total_pages}]{C.RESET}")
+            print(f"  {'─'*60}")
+            for i,f in enumerate(files[start:end],start=start):
+                _print_track(i,f)
+            print(f"  {'─'*60}")
+            print(f"  n:next-batch  p:prev-batch  {C.GREEN}b:approve-folder{C.RESET}  Enter:back")
+            try:
+                resp=input(f"  > ").strip().lower()
+            except (KeyboardInterrupt,EOFError):
+                break
+            if resp=="n":
+                page_idx=min(page_idx+1,total_pages-1)
+            elif resp=="p":
+                page_idx=max(page_idx-1,0)
+            elif resp=="b":
+                return "approve"
+            else:
+                break
+    else:
+        print(f"\n  TRACKS ({len(files)} files){type_label}  ·  {C.GREEN}{changes} rename(s){C.RESET}  {C.DIM}{unchanged} unchanged{C.RESET}")
+        print(f"  {'─'*60}")
+        page=30
+        shown=min(len(files),page)
+        for i,f in enumerate(files[:shown]):
+            _print_track(i,f)
+        if len(files)>shown:
+            remaining=len(files)-shown
+            try:
+                resp=input(f"   {C.DIM}... and {remaining} more  [Enter to see all, any key to skip]{C.RESET} ").strip()
+                if not resp:
+                    for i,f in enumerate(files[shown:],start=shown):
+                        _print_track(i,f)
+            except (KeyboardInterrupt,EOFError):
+                print()
+        print(f"  {'─'*60}")
+    return None
+
+def _edit_track_title(f:Path,cfg:Dict[str,Any])->Optional[str]:
+    """Edit the title tag of a single audio file interactively.
+    Returns the new title if saved, None if cancelled."""
+    if MutagenFile is None:
+        print(f"  {C.RED}mutagen not available — cannot edit tags.{C.RESET}")
+        return None
+    tags=read_audio_tags(f,cfg)
+    current=tags.get("title") or ""
+    print(f"\n  {'─'*50}")
+    print(f"  File:  {f.name}")
+    print(f"  Title: {C.BOLD}{current or '(none)'}{C.RESET}")
+    try:
+        new_title=input(f"  New title (Enter to cancel): ").strip()
+    except (KeyboardInterrupt,EOFError):
+        print(); return None
+    if not new_title:
+        print(f"  {C.DIM}Cancelled.{C.RESET}"); return None
+    try:
+        mf=MutagenFile(str(f),easy=True)
+        if mf is None:
+            print(f"  {C.RED}Cannot open file for writing.{C.RESET}"); return None
+        if mf.tags is None:
+            mf.add_tags()
+        mf.tags["title"]=[new_title]
+        mf.save()
+        # Update tag cache so rename preview reflects the change immediately
+        cache=_tag_cache
+        if cache is not None:
+            updated=dict(tags); updated["title"]=new_title
+            cache.set(f,updated)
+        print(f"  {C.GREEN}✓ Title saved: {new_title}{C.RESET}")
+        return new_title
+    except Exception as ex:
+        print(f"  {C.RED}Write failed: {ex}{C.RESET}"); return None
 
 def _interactive_action_help()->None:
     """Print the action key reference."""
     print(f"\n  {'─'*50}")
-    print(f"  INTERACTIVE REVIEW — ACTIONS")
+    print(f"  INTERACTIVE REVIEW — KEYS")
     print(f"  {'─'*50}")
-    print(f"  y  or  Enter    Approve (accept proposed routing)")
-    print(f"  s               Skip (leave in source, no move)")
-    print(f"  r               Send to Review (requires a note)")
-    print(f"  a               Set artist name (override detection)")
+    print(f"  {C.BOLD}── Decide ──{C.RESET}")
+    print(f"  z  or  Enter    Move to Clean/")
+    print(f"  x               Reject → Review/ (with reason)")
+    print(f"  c               Skip (leave in source)")
+    print(f"  f               Flag (review again at end)")
+    print(f"  {C.BOLD}── Fix ──{C.RESET}")
+    print(f"  e<N>            Edit track N title  (e.g. e3, e12)")
+    print(f"  a               Set artist name")
     print(f"  v               Toggle VA status")
-    print(f"  t               Show track listing")
-    print(f"  q               Stop processing (keeps moves done so far)")
-    print(f"  ?               Show this help")
+    print(f"  {C.BOLD}── Info ──{C.RESET}")
+    print(f"  space / b       Track rename preview  (b within view to approve folder)")
+    print(f"  u               Undo a move made this session")
+    print(f"  ?               This help")
+    print(f"  {'─'*50}")
+    print(f"  q               Quit")
     print(f"  {'─'*50}")
 
 def _prompt_review_note()->str:
-    """Prompt for a review note. Required — loops until provided."""
-    print(f"\n  {C.DIM}Preset reasons:{C.RESET}")
+    """Prompt for a review reason. Shows presets, allows custom text or blank."""
+    print(f"\n  {C.DIM}Reason?{C.RESET}")
     for i,r in enumerate(REVIEW_REASON_PRESETS,1):
         print(f"    {i}. {r}")
     print(f"    {len(REVIEW_REASON_PRESETS)+1}. Custom note")
+    print(f"    {C.DIM}Enter = no reason{C.RESET}")
     while True:
-        choice=input(f"  Reason (1-{len(REVIEW_REASON_PRESETS)+1} or text): ").strip()
-        if not choice: continue
+        choice=input(f"  Reason (1-{len(REVIEW_REASON_PRESETS)+1}, text, or Enter): ").strip()
+        if not choice: return ""  # allow blank — no reason
         try:
             idx=int(choice)
             if 1<=idx<=len(REVIEW_REASON_PRESETS):
@@ -3338,16 +3683,20 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
 
         _display_folder_card(idx,total,p)
 
+        # Build track file list for e<N> edit shortcut
+        _tf_exts={".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma"}
+        track_files=sorted([f for f in src.iterdir() if f.suffix.lower() in _tf_exts],key=lambda f:f.name) if src.exists() else []
+
         # Action loop — stays on this folder until an action advances
         while True:
-            action_labels=f"  [y] Approve  [s] Skip  [r] → Review  [a] Set Artist  [v] Toggle VA  [t] Tracks  [q] Stop  [?] Help"
+            action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  e<N>:edit-track  a:artist  v:va  q:quit  ?:help"
             print(action_labels)
             try:
-                choice=input(f"  Action [y]: ").strip().lower()
+                choice=input(f"  > ").strip().lower()
             except (EOFError,KeyboardInterrupt):
                 choice="q"
 
-            if choice in ("","y","yes"):
+            if choice in ("","z","y","yes"):
                 # Approve — proceed with the proposed move
                 dst2=collision_resolve(dst,policy,sfmt)
                 if dst2 is None:
@@ -3380,7 +3729,7 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                     except Exception: pass
                 break
 
-            elif choice=="s":
+            elif choice in ("c","k","s"):
                 # Skip — leave in source
                 reason_text=input(f"  Reason (Enter to skip): ").strip()
                 skip_entry={"timestamp":now_iso(),"session_id":session_id,"type":"folder",
@@ -3394,7 +3743,7 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                 out(f"  {C.DIM}→ Skipped{C.RESET}")
                 break
 
-            elif choice=="r":
+            elif choice in ("x","d","r"):
                 # Send to Review with required note
                 note=_prompt_review_note()
                 # Re-route to review
@@ -3458,7 +3807,8 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                                                False,False,p.decision.get("is_mix",False),cfg,profile_obj,
                                                genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
                                                key=p.decision.get("key"),label=p.decision.get("label"))
-                p.proposed_folder_name=new_target.name; p.target_path=str(new_target); p.destination="clean"
+                p.proposed_folder_name=_apply_format_suffix(new_target.name,cfg,p.stats.extensions if p.stats else None)
+                p.target_path=str(new_target); p.destination="clean"
                 overrides+=1
                 print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
                 print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}  (was: {current})   VA: No")
@@ -3488,10 +3838,11 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                                                    False,False,p.decision.get("is_mix",False),cfg,profile_obj,
                                                    genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
                                                    key=p.decision.get("key"),label=p.decision.get("label"))
-                    p.proposed_folder_name=new_target.name; p.target_path=str(new_target); p.destination="clean"
+                    p.proposed_folder_name=_apply_format_suffix(new_target.name,cfg,p.stats.extensions if p.stats else None)
+                    p.target_path=str(new_target); p.destination="clean"
                     print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
                     print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}   VA: No  (was: VA)")
-                    print(f"    TO:   {new_target.name}")
+                    print(f"    TO:   {p.proposed_folder_name}")
                 else:
                     # Single artist → VA
                     old_artist=p.decision.get("albumartist_display","--")
@@ -3509,13 +3860,57 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                                                    True,False,p.decision.get("is_mix",False),cfg,profile_obj,
                                                    genre=p.decision.get("genre"),bpm=p.decision.get("bpm"),
                                                    key=p.decision.get("key"),label=p.decision.get("label"))
-                    p.proposed_folder_name=new_target.name; p.target_path=str(new_target)
+                    p.proposed_folder_name=_apply_format_suffix(new_target.name,cfg,p.stats.extensions if p.stats else None)
+                    p.target_path=str(new_target)
                     print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
                     print(f"  Artist: Various Artists  (was: {old_artist})   VA: Yes")
                     print(f"    TO:   {new_target.name}")
 
-            elif choice=="t":
-                _display_tracks(p)
+            elif choice=="e":
+                print(f"  {C.DIM}Usage: e<N> to edit track title by number  (e.g. e3, e12){C.RESET}")
+
+            elif choice.startswith("e") and len(choice)>1 and choice[1:].strip().isdigit():
+                track_num=int(choice[1:].strip())
+                if 1<=track_num<=len(track_files):
+                    _edit_track_title(track_files[track_num-1],cfg)
+                    print(f"  {C.DIM}Press space/b to refresh track view.{C.RESET}")
+                else:
+                    print(f"  {C.DIM}Track {track_num} not found (folder has {len(track_files)} tracks).{C.RESET}")
+
+            elif choice in ("t"," ","b"):
+                trk_result=_display_tracks(p,cfg)
+                if trk_result=="approve":
+                    # User approved from batch track view — execute move inline
+                    dst2=collision_resolve(dst,policy,sfmt)
+                    if dst2 is None:
+                        warn(f"Collision skip: {dst.name}")
+                        append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"collision_skip","src":str(src)})
+                        break
+                    if dry_run:
+                        out(f"  {C.DIM}[dry-run]{C.RESET} {src.name}  →  {dst2.name}  {status_tag(p.destination)}")
+                        append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dry_run","src":str(src),"dst":str(dst2)})
+                        break
+                    ensure_dir(dst2.parent)
+                    try:
+                        move_method,move_elapsed=safe_move_folder(src,dst2,use_checksum=use_cs)
+                    except RuntimeError as e:
+                        err(f"  Move failed: {e}")
+                        append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":f"move_failed:{e}","src":str(src)})
+                        break
+                    action_id=uuid.uuid4().hex[:10]
+                    entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+                           "original_path":str(src),"original_parent":str(src.parent),"original_folder_name":src.name,
+                           "target_path":str(dst2),"target_parent":str(dst2.parent),"target_folder_name":dst2.name,
+                           "destination":p.destination,"confidence":p.confidence,"decision":p.decision,
+                           "move_method":move_method,"interactive_action":"approved"}
+                    append_jsonl(hist_path,entry); applied.append(entry)
+                    if p.destination=="clean": manifest_add(cfg,dst2.name,{"original_path":str(src),"confidence":p.confidence,"session_id":session_id})
+                    elif p.destination=="review": _write_review_sidecar(dst2,p,session_id)
+                    out(f"  {C.GREEN}✓ Batch-approved{C.RESET} → {dst2.name}")
+                    if source_root:
+                        try: cleanup_empty_parents(src,source_root)
+                        except Exception: pass
+                    break
 
             elif choice=="q":
                 print(f"\n{'═'*66}")
@@ -3702,9 +4097,14 @@ def cleanup_title(title:str,cfg:Dict[str,Any])->str:
         m2=re.search(r"(\s*[-–—]\s*([^-–—]+)\s*)$",o)
         if m2 and any(ph in m2.group(2).lower() for ph in phrases) and not prot(m2.group(2)):
             o=o[:m2.start()].strip(); changed=True; continue
-    o=re.sub(r"\s+\d{1,3}$","",o).strip()
     if n.get("collapse_whitespace",True): o=re.sub(r"\s+"," ",o).strip()
     if n.get("trim_dots_spaces",True): o=o.rstrip(". ").strip()
+    # Strip any lone trailing dash left behind by phrase stripping
+    o=re.sub(r"\s*[-–—]+\s*$","",o).strip()
+    # Apply smart title case to all-lowercase titles (mirrors artist normalization behaviour)
+    _alpha=[w for w in o.split() if any(c.isalpha() for c in w)]
+    if _alpha and all(w.islower() for w in _alpha):
+        o=_smart_title_case_v43(o,cfg)
     return o
 
 def parse_artist_title_from_fn(stem: str, folder_name: str = "", cfg: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str]]:
@@ -3746,7 +4146,20 @@ def parse_artist_title_from_fn(stem: str, folder_name: str = "", cfg: Optional[D
     s = re.sub(r"^[\[\(][^\]\)]+[\]\)]\s*", "", s)
     s2 = re.sub(r"^\(?\d{1,3}\)?\s*[-–—\.]\s*", "", s)
     s2 = re.sub(r"^\d{1,3}\s+", "", s2)
-    parts = [p.strip() for p in re.split(r"\s*[-–—]\s*", s2) if p.strip()]
+    # Prefer splitting on spaced dashes ( - ) to avoid splitting compound names like Heavy-K.
+    # Fall back to any dash if spaced-dash split yields fewer than 2 parts.
+    parts = [p.strip() for p in re.split(r"\s+[-–—]\s+", s2) if p.strip()]
+    if len(parts) < 2:
+        parts = [p.strip() for p in re.split(r"\s*[-–—]\s*", s2) if p.strip()]
+    # Strip trailing label/distributor noise codes: short all-lowercase alphabetic tokens
+    # like "ftd", "cdm", "web" appended to scene/batch releases.
+    # Only fires when there are 3+ parts (artist + title + code) so the title is preserved.
+    # Guard: known musical terms (mix, vip, dub, rmx, etc.) are never stripped.
+    _MUSIC_TERMS = {"mix","rmx","vip","dub","edit","live","demo","ost","dj","va","lp"}
+    if len(parts) >= 3:
+        _last = parts[-1]
+        if re.match(r'^[a-z]{2,5}$', _last) and _last not in _MUSIC_TERMS:
+            parts = parts[:-1]
     if len(parts) >= 2:
         return parts[0], " - ".join(parts[1:])
     return None, None
@@ -3758,13 +4171,30 @@ def extract_mix_suffix(title:str,cfg:Dict[str,Any])->Tuple[str,str]:
     if m and any(k in m.group(2).lower() for k in kw): return title[:m.start()].strip(),f" {m.group(1)}"
     m2=re.search(r"\s*[-–—]\s*([^-–—]+)\s*$",title)
     if m2 and any(k in m2.group(1).lower() for k in kw):
-        clean=title[:m2.start()].strip(); sty=mc.get("style","parenthetical")
-        return (clean,f" - {m2.group(1).strip()}") if sty=="dash" else (clean,f" ({m2.group(1).strip()})")
+        candidate=m2.group(1).strip()
+        # Guard: skip if candidate looks like a list of artists (has comma) or is very long —
+        # prevents "- Artist1, Artist2 (Original Mix)" being swallowed as a mix suffix
+        if "," not in candidate and len(candidate)<=60:
+            clean=title[:m2.start()].strip(); sty=mc.get("style","parenthetical")
+            return (clean,f" - {candidate}") if sty=="dash" else (clean,f" ({candidate})")
     return title,""
 
 def classify_folder_for_tracks(decision:Dict[str,Any],cfg:Dict[str,Any])->str:
     if float(decision.get("dominant_album_share",0.0))<float(cfg.get("decision",{}).get("album_dominance_threshold",0.75)): return "mixed"
-    return "various" if bool(decision.get("is_va",False)) else "album"
+    if bool(decision.get("is_va",False)): return "various"
+    # Non-VA but track artists are diverse (remix albums, edits compilations) — use "various"
+    # so individual track artists are preserved in filenames.
+    # Exception: if the dominant track artist starts with the albumartist, this is a feat. album
+    # (e.g., "Artist feat. Guest" variants) — keep "album" so we don't repeat the main artist name.
+    dom_art_share=float(decision.get("dominant_artist_share",1.0))
+    if dom_art_share<0.50:
+        dom_aa=(decision.get("dominant_albumartist") or "").strip().lower()
+        dom_art=(decision.get("dominant_artist") or "").strip().lower()
+        # Feat. album: most tracks are "Main Artist" or "Main Artist feat. X" — albumartist is the prefix
+        if dom_aa and dom_art and dom_art.startswith(dom_aa):
+            return "album"
+        return "various"
+    return "album"
 
 def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Path,cfg:Dict[str,Any],decision:Dict[str,Any],disc_multi:bool)->Tuple[Optional[str],float,str,Dict[str,Any]]:
     trc=cfg.get("track_rename",{}); pat=trc.get("patterns",{}); ext=src.suffix.lower()
@@ -3778,14 +4208,29 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
     _tag_title_clean = tag_title and len(tag_title) >= 2 and not detect_garbage_name(tag_title) and not detect_mojibake(tag_title)
     _tag_artist_clean = tag_artist and len(tag_artist) >= 2 and not detect_garbage_name(tag_artist) and not detect_mojibake(tag_artist)
 
-    # Only parse filename when tag data is missing or garbage
-    fn_artist, fn_title = (None, None)
-    if not _tag_title_clean or not _tag_artist_clean:
-        fn_artist, fn_title = parse_artist_title_from_fn(src.stem, folder_name=folder_name, cfg=cfg)
+    # Always parse filename — needed for feat. supplement even when tag title is clean
+    fn_artist, fn_title = parse_artist_title_from_fn(src.stem, folder_name=folder_name, cfg=cfg)
 
     # Title: prefer clean tag, fall back to filename
     if _tag_title_clean:
         title = tag_title; meta["title_src"] = "tag"
+        # Supplement with feat. info from filename if tag title lacks it.
+        # e.g. tag="Too Shy To Dance", fn_title="Too Shy To Dance (feat. Astrid Van Peeterssen)"
+        if not re.search(r'(?<![a-zA-Z])(?:feat\.?|ft\.?|featuring)(?![a-zA-Z])', title, re.I):
+            # Try fn_title first, then fn_artist — feat. info may live in either place.
+            # Filename: "NN Artist feat. Guest - Title" → feat. in fn_artist, not fn_title.
+            _feat_search_strs=[fn_title,fn_artist] if fn_title else ([fn_artist] if fn_artist else [])
+            _feat_pat_re=re.compile(r'(?:^|[,\s\(\[])(?:feat\.?|ft\.?|featuring)(?![a-zA-Z])\s+([^\)\],\-]+)',re.I)
+            _collab=None
+            for _fs in _feat_search_strs:
+                if not _fs: continue
+                _feat_m=_feat_pat_re.search(_fs)
+                if _feat_m:
+                    _collab=_feat_m.group(1).strip().rstrip(')], ').strip()
+                    if _collab: break
+            if _collab:
+                title=f"{title} (feat. {_collab})"
+                meta["title_src"]="tag+feat_from_fn"
     elif fn_title:
         title = fn_title; meta["title_src"] = "filename"
     else:
@@ -3806,19 +4251,71 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
         artist = tag_artist  # last resort
         meta["artist_src"] = "tag_fallback" if artist else "none"
     if artist and cfg.get("artists",{}).get("feature_handling",{}).get("normalize_tokens",True):
-        artist=re.sub(r"\bfeaturing\b|\bft\.?\b|\bfeat\.?\b","feat.",artist,flags=re.IGNORECASE)
+        # Use lookahead (?=\s|,|$) to avoid matching "feat" without the period and doubling it
+        artist=re.sub(r"\b(featuring|feat\.?|ft\.?)(?=\s|,|$)","feat.",artist,flags=re.IGNORECASE)
         artist=re.sub(r"\s+"," ",artist).strip()
+    # For various/compilation classification: detect tag confusion where the tagger has
+    # put a subtitle/track-name into the artist field. If fn_artist (from a 3-part filename)
+    # is available, the fn_title starts with or equals the tag_artist, and they differ,
+    # the filename is more authoritative than the tag.
+    if classification=="various" and fn_artist and fn_title and _tag_artist_clean:
+        _ta_n = normalize_unicode(tag_artist.lower().strip())
+        _fn_t_n = normalize_unicode(fn_title.lower().strip())
+        _fn_t_first = _fn_t_n.split(" - ")[0].strip()
+        if _fn_t_first == _ta_n and normalize_unicode(fn_artist.lower().strip()) != _ta_n:
+            # Tag artist looks like part of the filename title — use filename artist
+            artist = fn_artist
+            meta["artist_src"] = "filename_confusion_override"
     # Try vinyl track notation first (A1, B2 etc.)
     vinyl=parse_vinyl_track(track_raw.split("/")[0].strip()) if track_raw else None
     if vinyl:
         track_n=vinyl[2]; meta["vinyl_side"]=vinyl[0]; meta["track_src"]="vinyl_notation"
     else:
         track_n=parse_int_prefix(track_raw) if track_raw else None
-    if track_n is None and trc.get("track_numbers",{}).get("fallback_to_filename_order",False):
+    if track_n is None:
+        # Always try to extract track number from filename (leading digits)
         om=re.match(r"^(\d{1,3})",src.stem.strip())
         if om: track_n=int(om.group(1)); meta["track_src"]="filename_order"
     if track_n is None and classification in ("album","various") and trc.get("track_numbers",{}).get("required_for_album",True):
         return None,0.0,"missing_track_number",{}
+
+    # Guard: if the title starts with the same number as the track (and track was inferred
+    # from the filename, not a proper tracknumber tag), the title tag has the BPM/track prefix
+    # baked in — strip it to avoid "100 - 100 - Em - ..." duplication.
+    if track_n and meta.get("track_src")=="filename_order" and title_c:
+        _bpm_m=re.match(r'^(\d{1,3})\s*[-–—]\s*(.+)$',title_c)
+        if _bpm_m and int(_bpm_m.group(1))==int(track_n):
+            title_c=_bpm_m.group(2).strip() or title_c
+
+    # Guard: for album folders, strip leading "ArtistName - " from title if it matches the
+    # albumartist (some taggers embed the artist in the title field).
+    if classification=="album" and decision and title_c:
+        _aa=(decision.get("albumartist_display") or "").strip()
+        if _aa:
+            import unicodedata as _ud
+            # NFKD maps accented chars to base+combining, then ASCII encode strips combining marks.
+            # This correctly maps "Guazú" → "Guazu" (not dropping the char entirely like NFC→ASCII).
+            _fold=lambda s:_ud.normalize('NFKD',normalize_unicode(s)).encode("ascii","ignore").decode("ascii").lower()
+            _aa_f=_fold(_aa)
+            # Guard: same word count (not char count) — handles accented chars and ligatures
+            if len(_aa_f.split())==len(_aa.split()) and _aa_f:
+                _sep_m=re.match(re.escape(_aa_f)+r'\s*[-–—]\s*',_fold(title_c))
+                if _sep_m and _sep_m.end()<len(_fold(title_c)):
+                    title_c=title_c[_sep_m.end():].strip() or title_c
+
+    # Strip trailing [LabelName] bracket from track titles.
+    # Square brackets in DJ download filenames are almost always label/distributor codes —
+    # not part of the song title. Strip any trailing [TEXT] unless TEXT contains a music term
+    # (mix, edit, version, feat, etc.) that should be preserved.
+    if title_c:
+        _tc_bracket_m=re.search(r'\s*\[([^\]]+)\]\s*$',title_c)
+        if _tc_bracket_m:
+            _bracket_content=_tc_bracket_m.group(1).strip()
+            _keep_terms=set(cfg.get("title_cleanup",{}).get("keep_parenthetical_if_contains",[]))
+            _is_music=any(k in _bracket_content.lower() for k in _keep_terms) if _keep_terms else False
+            if not _is_music and _bracket_content:
+                title_c=title_c[:_tc_bracket_m.start()].strip() or title_c
+
     disc_prefix=""
     if trc.get("disc",{}).get("enabled",True):
         disc_n=parse_int_prefix(disc_raw) if disc_raw else None
@@ -3865,7 +4362,9 @@ def rename_tracks_in_clean_folder(cfg:Dict[str,Any],folder:Path,folder_decision:
             out(f"    ↷ SKIP {f.name}  ({reason})",level=VERBOSE); skip_count+=1
             append_jsonl(tskip,{"timestamp":now_iso(),"session_id":session_id,"type":"track","reason":reason,"file":str(f),"meta":meta}); continue
         dst=f.with_name(new_name)
-        if normalize_unicode(dst.name)==normalize_unicode(f.name): continue
+        if normalize_unicode(dst.name)==normalize_unicode(f.name):
+            out(f"    ✓ {f.name}  {C.DIM}(already clean){C.RESET}",level=VERBOSE)
+            continue
         if dst.exists():
             n=1
             while True:
@@ -5326,28 +5825,741 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     manifest_set_last_run(cfg)
 
 
-def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,review_threshold:Optional[float]=None)->None:
-    if interactive:
-        # v7.0: Interactive mode uses scan → interactive_review instead of streaming pipeline
-        register_stop_handler()
-        sid,session_dir,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
-        profiles=cfg.get("profiles",{}); profile_obj=profiles.get(profile,{})
-        source_root=Path(profile_obj.get("source_root","")).expanduser()
-        applied=interactive_review(cfg,proposals,session_id=sid,dry_run=dry_run,
-                                   threshold=review_threshold,source_root=source_root)
-        out(f"Applied: {len(applied)} folders"); manifest_set_last_run(cfg)
-    else:
-        _run_core(cfg_path,cfg,profile,interactive,dry_run,since,perf_tier=perf_tier,genre_roots=genre_roots,itunes_mode=itunes_mode)
+def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False,
+                           since_str:Optional[str]=None,genre_roots:Optional[List[str]]=None,
+                           itunes_mode:bool=False,threshold:Optional[float]=None,
+                           sort_by:str="name")->None:
+    """
+    v7.0: Streaming interactive mode — scan one folder at a time, display the review
+    card, wait for user action, then move to the next folder. No parallel scanning.
+    This avoids the multitask/worker clash with interactive prompts.
+    """
+    register_stop_handler()
+    profiles=cfg.get("profiles",{})
+    if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
+    profile_obj=profiles[profile_name]; source_root=Path(profile_obj["source_root"]).expanduser()
+    if not source_root.exists(): raise FileNotFoundError(f"source_root missing: {source_root}")
 
-def cmd_folders_only(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->None:
-    register_stop_handler(); sid,_,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
-    if interactive:
-        profiles=cfg.get("profiles",{}); profile_obj=profiles.get(profile,{})
-        source_root=Path(profile_obj.get("source_root","")).expanduser()
-        applied=interactive_review(cfg,proposals,session_id=sid,dry_run=dry_run,source_root=source_root)
+    setup_logging_paths(cfg, profile_obj, source_root)
+    _init_skip_sets(cfg)
+    effective_genre_roots = _resolve_genre_roots(cfg, genre_roots)
+    roots=ensure_roots(profile_obj,source_root)
+    clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
+    wrapper_root_str=str(derive_wrapper_root(profile_obj,source_root).resolve())+os.sep
+    clean_root_str =str(derive_clean_root(profile_obj,source_root).resolve())+os.sep
+    review_root_str=str(derive_review_root(profile_obj,source_root).resolve())+os.sep
+
+    sc=cfg.get("scan",{}); exts=[e.lower() for e in sc.get("audio_extensions",[".mp3",".flac",".m4a"])]
+    min_tracks=int(sc.get("min_tracks",3)); follow_sym=bool(sc.get("follow_symlinks",False))
+    leaf_only=bool(sc.get("leaf_folders_only",True))
+    ignore_patterns:List[str]=list(cfg.get("ignore",{}).get("ignore_folder_names",[]) or [])
+    skip_folder_names = set(_SKIP_FOLDER_NAMES)
+    skip_exts = set(_SKIP_AUDIO_EXTENSIONS)
+
+    since=_parse_since(since_str,cfg)
+    _get_tag_cache(cfg)
+
+    # Session
+    session_id=make_session_id(profile_name, str(source_root))
+    session_dir=Path(cfg["logging"]["session_dir"])/session_id; ensure_dir(session_dir)
+
+    # Pre-load existing Clean names for dedup
+    existing_clean:Set[str]=set()
+    if clean_albums.exists():
+        try:
+            for item in clean_albums.rglob("*"):
+                if item.is_dir(): existing_clean.add(normalize_unicode(item.name))
+        except Exception: pass
+    manifest_entries:Set[str]=set(read_manifest(cfg).get("entries",{}).keys())
+    lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
+    mixes_root=clean_albums.parent/mixes_folder
+    seen_names:Counter=Counter()
+
+    # Collect candidates (fast walk, no tag reading)
+    candidates:List[Path]=[]
+    for root,dirs,files in os.walk(source_root,followlinks=follow_sym):
+        rp=Path(root); rp_str=str(rp.resolve())+os.sep
+        if rp_str.startswith(wrapper_root_str): dirs[:]=[];continue
+        if rp_str.startswith(clean_root_str) or rp_str.startswith(review_root_str): dirs[:]=[];continue
+        dirs[:] = [d for d in dirs if d not in skip_folder_names]
+        if effective_genre_roots and rp.name in effective_genre_roots and rp != source_root: continue
+        if leaf_only and dirs: continue
+        audio_count = sum(1 for f in files
+                          if Path(f).suffix.lower() in exts
+                          and Path(f).suffix.lower() not in skip_exts
+                          and not f.startswith("._"))
+        if audio_count >= min_tracks: candidates.append(rp)
+    if since:
+        candidates=[f for f in candidates if dt.datetime.fromtimestamp(folder_mtime(f))>=since]
+    candidates=[rp for rp in candidates if not folder_matches_ignore(rp.name,ignore_patterns)]
+
+    # Sort candidates based on user preference
+    if sort_by=="date-created":
+        candidates.sort(key=lambda p:p.stat().st_birthtime if hasattr(p.stat(),"st_birthtime") else p.stat().st_ctime)
+        sort_label="date created"
+    elif sort_by=="date-modified":
+        candidates.sort(key=lambda p:p.stat().st_mtime)
+        sort_label="date modified"
     else:
+        # Default: name — symbols first, then numbers, then letters (natural sort)
+        candidates.sort(key=lambda p:p.name.lower())
+        sort_label="name"
+
+    total=len(candidates)
+    if total==0:
+        out(f"\n  {C.DIM}No candidate folders found.{C.RESET}"); return
+
+    # Session header
+    print(f"\n{'═'*66}")
+    print(f"  {C.BOLD}RAAGDOSA v{APP_VERSION}  ·  Interactive Review  ·  Session {session_id[:12]}{C.RESET}")
+    print(f"{'─'*66}")
+    print(f"  Candidates: {total} folder(s)  ·  Scanning one at a time  ·  Sort: {sort_label}")
+    if threshold: print(f"  Threshold: only review folders below {threshold:.2f}")
+    if dry_run: print(f"  {C.YELLOW}DRY RUN — nothing will be moved{C.RESET}")
+    print(f"  Press ? for help at any prompt.")
+    print(f"{'═'*66}")
+
+    # Reuse the interactive_review action loop internals
+    mc=cfg.get("move",{}); policy=mc.get("on_collision","suffix"); sfmt=mc.get("suffix_format"," ({n})")
+    use_cs=bool(mc.get("use_checksum",False))
+    hist_path=Path(cfg["logging"]["history_log"]); skip_path=Path(cfg["logging"]["skipped_log"])
+    session_notes_path=session_dir/"review_notes.jsonl"
+
+    # ── Tracking (moves happen immediately, these track what was done) ──
+    applied:List[Dict[str,Any]]=[]   # successful move entries
+    skipped_count=0
+    moved_clean=0; moved_review=0
+    held:List[Tuple[int,Path]]=[]    # user said [f] — review again later
+    auto_approved=0; stopped=False
+
+    def _execute_move(p_:FolderProposal,action:str="approved",reason:str="")->bool:
+        """Execute a single folder move immediately. Returns True on success."""
+        nonlocal moved_clean, moved_review
+        if dry_run:
+            dest_label=f"Review/{p_.proposed_folder_name}" if p_.destination=="review" else p_.proposed_folder_name
+            out(f"  {C.DIM}[dry-run]{C.RESET} → {dest_label}  {status_tag(p_.destination)}")
+            return True
+        src_=Path(p_.folder_path); dst_=Path(p_.target_path)
+        if not src_.exists(): return False
+        dst2=collision_resolve(dst_,policy,sfmt)
+        if dst2 is None:
+            warn(f"Collision skip: {dst_.name}")
+            append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"collision_skip","src":str(src_)})
+            return False
+        ensure_dir(dst2.parent)
+        try:
+            move_method,_=safe_move_folder(src_,dst2,use_checksum=use_cs)
+        except RuntimeError as e:
+            err(f"  Move failed: {src_.name}: {e}"); return False
+        action_id=uuid.uuid4().hex[:10]
+        entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+               "original_path":str(src_),"original_parent":str(src_.parent),"original_folder_name":src_.name,
+               "target_path":str(dst2),"target_parent":str(dst2.parent),"target_folder_name":dst2.name,
+               "destination":p_.destination,"confidence":p_.confidence,"decision":p_.decision,
+               "move_method":move_method,"interactive_action":action}
+        if reason: entry["user_note"]=reason
+        append_jsonl(hist_path,entry); applied.append(entry)
+        if p_.destination=="clean":
+            manifest_add(cfg,dst2.name,{"original_path":str(src_),"confidence":p_.confidence,"session_id":session_id})
+            existing_clean.add(normalize_unicode(dst2.name))
+            moved_clean+=1
+        elif p_.destination=="review":
+            _write_review_sidecar(dst2,p_,session_id)
+            moved_review+=1
+        if reason:
+            ensure_dir(session_notes_path.parent)
+            append_jsonl(session_notes_path,{"folder":src_.name,"action":action,"note":reason,"timestamp":now_iso(),"confidence":p_.confidence})
+        try: cleanup_empty_parents(src_,source_root)
+        except Exception: pass
+        return True
+
+    def _re_derive_target(p_:FolderProposal)->None:
+        """Re-derive target path from current decision state."""
+        ca=derive_clean_albums_root(profile_obj,source_root)
+        art=p_.decision.get("albumartist_display","Unknown")
+        new_t=resolve_library_path(ca,art,p_.decision.get("dominant_album_display",""),
+                                   p_.decision.get("year"),p_.decision.get("is_flac_only",False),
+                                   p_.decision.get("is_va",False),False,p_.decision.get("is_mix",False),
+                                   cfg,profile_obj,genre=p_.decision.get("genre"),
+                                   bpm=p_.decision.get("bpm"),key=p_.decision.get("key"),
+                                   label=p_.decision.get("label"))
+        # Re-apply format suffix (e.g. [FLAC]) — resolve_library_path doesn't add it
+        folder_name=_apply_format_suffix(new_t.name,cfg,p_.stats.extensions if p_.stats else None)
+        # Re-apply disc subfolder if present
+        disc_sub=p_.decision.get("disc_subfolder")
+        if disc_sub:
+            new_t=new_t/disc_sub
+        p_.proposed_folder_name=folder_name; p_.target_path=str(new_t); p_.destination="clean"
+
+    def _run_review_pass(items:List[Tuple[int,Path]],pass_label:str="Review"):
+        """Run the interactive review loop over a list of (idx, candidate_path) tuples."""
+        nonlocal auto_approved, stopped, skipped_count
+        for idx,rp in items:
+            if should_stop() or stopped:
+                out(f"\n{C.YELLOW}Stopped.{C.RESET}"); stopped=True; break
+
+            # ── Scan this one folder ──────────────────────────────
+            audio_files=list_audio_files(rp,exts,follow_sym)
+            if len(audio_files)<min_tracks: continue
+            p=build_folder_proposal(rp,audio_files,source_root,profile_obj,cfg)
+            if p is None: continue
+
+            # ── Route it ──────────────────────────────────────────
+            _route_proposal(p,cfg,seen_names,existing_clean,manifest_entries,
+                            review_albums,dup_root,mixes_root)
+
+            # ── Threshold filter: auto-accept high-confidence folders ──
+            if threshold is not None and p.confidence>=threshold:
+                _execute_move(p,"auto_approved")
+                auto_approved+=1; continue
+
+            # ── Display card + track preview by default ─────────
+            _display_folder_card(idx,total,p)
+            _display_tracks(p,cfg)
+
+            # Running tally
+            tally=f"{C.DIM}{moved_clean} moved · {moved_review} review · {skipped_count} skipped{C.RESET}"
+
+            while True:
+                if p.confidence<0.50:
+                    print(f"  {C.DIM}z:move  x:reject  c:skip  space:tracks  ?:more  ({tally}){C.RESET}")
+                else:
+                    print(f"  z:move  x:reject  c:skip  space:tracks  ?:more  ({tally})")
+                try:
+                    choice=input(f"  > ").strip().lower()
+                except (EOFError,KeyboardInterrupt):
+                    choice="q"
+
+                if choice in ("","z","y"):
+                    # Confidence gate — warn but always allow explicit user override
+                    if p.confidence<0.50:
+                        confirm=input(f"  {C.RED}Very low confidence ({p.confidence:.2f}).{C.RESET} Force move anyway? [y/N]: ").strip().lower()
+                        if confirm not in ("y","yes","z"): continue
+                    elif p.confidence<0.70:
+                        confirm=input(f"  {C.YELLOW}Low confidence ({p.confidence:.2f}).{C.RESET} Move anyway? [y/n]: ").strip().lower()
+                        if confirm not in ("y","yes","z"): continue
+                    if _execute_move(p):
+                        out(f"  {C.GREEN}✓ Moved{C.RESET} → {p.proposed_folder_name}")
+                    break
+
+                elif choice in ("x","d","r"):
+                    # Reject — move to Review/ immediately with optional reason
+                    reason=_prompt_review_note()
+                    p.destination="review"
+                    p.decision["route_reasons"]=p.decision.get("route_reasons",[])+["user_rejected"]
+                    p.decision["user_review_note"]=reason
+                    review_target=review_albums/p.proposed_folder_name
+                    p.target_path=str(review_target)
+                    if _execute_move(p,"rejected",reason):
+                        reason_str=f"  ({reason})" if reason else ""
+                        out(f"  {C.YELLOW}→ Review/{C.RESET}{reason_str}")
+                    break
+
+                elif choice in ("c","k","s"):
+                    skipped_count+=1
+                    append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+                                            "reason":"user_skipped","src":str(Path(p.folder_path)),"interactive_action":"skipped"})
+                    out(f"  {C.DIM}→ Skipped{C.RESET}"); break
+
+                elif choice=="e":
+                    current_album=p.decision.get("dominant_album_display","")
+                    print(f"  {C.DIM}Current:{C.RESET} {current_album}")
+                    new_album=input(f"  New album title: ").strip()
+                    if not new_album: continue
+                    p.decision["dominant_album_display"]=new_album
+                    p.decision["override_type"]=p.decision.get("override_type","")+"edit_title"
+                    _re_derive_target(p)
+                    print(f"  {C.CYAN}─ UPDATED ─{C.RESET}")
+                    print(f"  Album: {C.BOLD}{new_album}{C.RESET}")
+                    print(f"    {C.BOLD}→ {p.proposed_folder_name}{C.RESET}")
+
+                elif choice=="a":
+                    current=p.decision.get("albumartist_display","--")
+                    print(f"  {C.DIM}Current:{C.RESET} {current}")
+                    new_artist=input(f"  New artist name: ").strip()
+                    if not new_artist: continue
+                    p.decision["albumartist_display"]=new_artist
+                    p.decision["is_va"]=False
+                    p.decision["override_type"]="set_artist"
+                    p.decision["override_original"]=current
+                    _re_derive_target(p)
+                    print(f"  {C.CYAN}─ UPDATED ─{C.RESET}")
+                    print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}  (was: {current})")
+                    print(f"    {C.BOLD}→ {p.proposed_folder_name}{C.RESET}")
+
+                elif choice=="v":
+                    was_va=p.decision.get("is_va",False)
+                    if was_va:
+                        new_artist=input(f"  Artist name: ").strip()
+                        if not new_artist: continue
+                        p.decision["is_va"]=False; p.decision["albumartist_display"]=new_artist
+                        p.decision["override_type"]="unmark_va"
+                    else:
+                        p.decision["is_va"]=True
+                        p.decision["albumartist_display"]="Various Artists"
+                        p.decision["override_type"]="mark_va"
+                    _re_derive_target(p)
+                    va_label="VA" if p.decision["is_va"] else p.decision["albumartist_display"]
+                    print(f"  {C.CYAN}→ {va_label}{C.RESET}  TO: {p.proposed_folder_name}")
+
+                elif choice=="f":
+                    held.append((idx,rp))
+                    out(f"  {C.YELLOW}→ Flagged{C.RESET}"); break
+
+                elif choice=="u":
+                    # In-session undo picker
+                    if not applied:
+                        print(f"  {C.DIM}Nothing moved yet this session.{C.RESET}"); continue
+                    print(f"\n  {C.BOLD}Moves this session:{C.RESET}")
+                    print(f"  {'#':<4} {'Folder':<55} {'Dest'}")
+                    print(f"  {'─'*66}")
+                    for ui,uh in enumerate(applied,1):
+                        uname=Path(uh.get("original_path","")).name or uh.get("action_id","")
+                        udest=uh.get("destination","?")
+                        ucol=C.GREEN if udest=="clean" else C.YELLOW
+                        print(f"  {ui:<4} {uname:<55} {ucol}{udest}{C.RESET}")
+                    print(f"\n  Enter number(s) to undo (e.g. 3  or  1,3), or Enter to cancel:")
+                    try:
+                        uraw=input(f"  > ").strip().lower()
+                    except (EOFError,KeyboardInterrupt):
+                        uraw=""
+                    if not uraw: continue
+                    uidxs=[]
+                    for tok in re.split(r"[,\s]+",uraw):
+                        try: uidxs.append(int(tok)-1)
+                        except ValueError: pass
+                    for ui in sorted(set(uidxs),reverse=True):
+                        if not 0<=ui<len(applied): continue
+                        uh=applied[ui]
+                        usrc=Path(uh["target_path"]); udst=Path(uh["original_path"])
+                        if not usrc.exists():
+                            print(f"  {C.RED}SKIP (missing):{C.RESET} {usrc.name}"); continue
+                        try:
+                            shutil.move(str(usrc),str(udst))
+                            applied.pop(ui)
+                            print(f"  {C.CYAN}UNDONE:{C.RESET} {usrc.name}")
+                        except Exception as ue:
+                            print(f"  {C.RED}FAILED:{C.RESET} {ue}")
+
+                elif choice==" ":
+                    _display_tracks(p,cfg)
+
+                elif choice=="q":
+                    stopped=True
+                    out(f"\n{C.YELLOW}Stopped.{C.RESET}"); break
+
+                elif choice=="?":
+                    _interactive_action_help()
+
+                else:
+                    print(f"  {C.DIM}Unknown key. Press ? for help.{C.RESET}")
+
+    # ══════════════════════════════════════════════════════════════
+    # PASS 1: Main review
+    # ══════════════════════════════════════════════════════════════
+    main_items=[(idx,rp) for idx,rp in enumerate(candidates,1)]
+    _run_review_pass(main_items, "Main review")
+
+    # ══════════════════════════════════════════════════════════════
+    # Held queue — opt-in, not automatic
+    # ══════════════════════════════════════════════════════════════
+    if held and not stopped:
+        print(f"\n{'─'*66}")
+        print(f"  {len(held)} folder(s) held. Review now? [y/n]")
+        try:
+            review_held=input(f"  ").strip().lower()
+        except (EOFError,KeyboardInterrupt):
+            review_held="n"
+        if review_held in ("y","yes"):
+            _run_review_pass(held, "Held review")
+
+    # ══════════════════════════════════════════════════════════════
+    # End-of-session summary
+    # ══════════════════════════════════════════════════════════════
+    if _tag_cache is not None: _tag_cache.save()
+
+    print(f"\n{'━'*66}")
+    parts=[]
+    if moved_clean or auto_approved:
+        clean_total=moved_clean+auto_approved
+        parts.append(f"{C.GREEN}{clean_total} → Clean{C.RESET}")
+        if auto_approved: parts[-1]+=f" {C.DIM}({auto_approved} auto){C.RESET}"
+    if moved_review: parts.append(f"{C.YELLOW}{moved_review} → Review{C.RESET}")
+    if skipped_count: parts.append(f"{C.DIM}{skipped_count} skipped{C.RESET}")
+    n_held=len([h for h in held if isinstance(h,tuple)])
+    if n_held: parts.append(f"{C.YELLOW}{n_held} held{C.RESET}")
+    if parts:
+        print(f"  {C.BOLD}DONE{C.RESET}  ·  {'  ·  '.join(parts)}")
+    else:
+        print(f"  {C.DIM}Nothing processed.{C.RESET}")
+    if applied:
+        print(f"  Undo:  raagdosa undo --session {session_id}")
+    print(f"{'━'*66}")
+    manifest_set_last_run(cfg)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Triage workflow (v7.1)
+# ─────────────────────────────────────────────────────────────────
+
+def _triage_proposals(proposals:List[FolderProposal],auto_threshold:float)->Dict[str,List[FolderProposal]]:
+    """
+    Split proposals into HIGH / MID / PROB tiers.
+
+    HIGH:  conf >= auto_threshold AND destination == 'clean' AND no review-forcing flags
+    PROB:  destination == 'review' OR has FORCE_HOLD flags
+    MID:   everything else (dest=clean, conf < auto_threshold, no force-hold)
+
+    Keys 'auto' and 'hold' are kept as aliases for backward compat.
+    """
+    FORCE_HOLD={"duplicate_in_run","already_in_clean","heuristic_fallback","unreadable_ratio_high"}
+    high:List[FolderProposal]=[]; mid:List[FolderProposal]=[]; prob:List[FolderProposal]=[]
+    for p in proposals:
+        reasons=set(p.decision.get("route_reasons",[]))
+        is_force_hold=bool(reasons & FORCE_HOLD)
+        if p.confidence>=auto_threshold and p.destination=="clean" and not is_force_hold:
+            high.append(p)
+        elif p.destination=="review" or is_force_hold:
+            prob.append(p)
+        else:
+            mid.append(p)
+    high.sort(key=lambda p:p.confidence,reverse=True)
+    mid.sort(key=lambda p:p.confidence,reverse=True)
+    prob.sort(key=lambda p:p.confidence)  # worst first
+    return {"high":high,"mid":mid,"prob":prob,"auto":high,"hold":mid+prob}
+
+
+def _show_tier_detail(tier_name:str,proposals:List[FolderProposal])->None:
+    """Show all proposals in a tier, paginated at 20."""
+    if not proposals:
+        print(f"\n  {C.DIM}No folders in {tier_name} tier.{C.RESET}"); return
+    PAGE=20; total=len(proposals); offset=0
+    color={"HIGH":C.GREEN,"MID":C.YELLOW,"PROB":C.RED}.get(tier_name,C.DIM)
+    while True:
+        chunk=proposals[offset:offset+PAGE]
+        print(f"\n  {color}── {tier_name} tier — {total} folders ──{C.RESET}  (showing {offset+1}–{offset+len(chunk)})")
+        for p in chunk:
+            reasons=p.decision.get("route_reasons",[])
+            reason_str=("  ~"+",".join(reasons[:2])) if reasons else ""
+            dest=f"[{p.destination}]"
+            name=p.proposed_folder_name[:54]
+            print(f"  {color}{p.confidence:.2f}{C.RESET}  {name}  {C.DIM}{dest}{reason_str}{C.RESET}")
+        remaining=total-(offset+len(chunk))
+        if remaining<=0: print(f"\n  {C.DIM}(end of list){C.RESET}"); break
+        try:
+            key=input(f"  {C.DIM}n=next {remaining} · Enter=done > {C.RESET}").strip().lower()
+        except (EOFError,KeyboardInterrupt): break
+        if key=="n": offset+=PAGE
+        else: break
+
+
+def _show_triage_dashboard(triage:Dict[str,List[FolderProposal]],session_id:str,profile:str,auto_threshold:float,dry_run:bool)->None:
+    """Print the 3-tier triage summary dashboard."""
+    high=triage["high"]; mid=triage["mid"]; prob=triage["prob"]
+    total=len(high)+len(mid)+len(prob)
+
+    BAR=32
+    def _bar(n:int,tot:int)->str:
+        if not tot: return "░"*BAR
+        filled=int(n/tot*BAR)
+        return "█"*filled+"░"*(BAR-filled)
+    def _pct(n:int)->int: return int(n/total*100) if total else 0
+
+    print(f"\n{'═'*66}")
+    print(f"  {C.BOLD}RAAGDOSA v{APP_VERSION}  ·  Triage  ·  Session {session_id[:12]}{C.RESET}")
+    print(f"{'─'*66}")
+    print(f"  Profile: {profile}   Scanned: {total} folders   Auto-approve ≥ {auto_threshold:.2f}")
+    if dry_run: print(f"  {C.YELLOW}DRY RUN — nothing will be moved{C.RESET}")
+    print(f"{'─'*66}")
+    print(f"  {C.GREEN}HIGH{C.RESET}   {len(high):>3}  {_bar(len(high),total)}  {_pct(len(high)):>3}%  conf ≥ {auto_threshold:.2f} → Clean   {C.DIM}[h]{C.RESET}")
+    print(f"  {C.YELLOW}MID{C.RESET}    {len(mid):>3}  {_bar(len(mid),total)}  {_pct(len(mid)):>3}%  conf < {auto_threshold:.2f} → Review  {C.DIM}[m]{C.RESET}")
+    print(f"  {C.RED}PROB{C.RESET}   {len(prob):>3}  {_bar(len(prob),total)}  {_pct(len(prob)):>3}%  flagged → Review           {C.DIM}[p]{C.RESET}")
+    print(f"{'─'*66}")
+
+    # HIGH sample
+    if high:
+        n=min(6,len(high))
+        print(f"\n  {C.GREEN}HIGH — top {n} of {len(high)}{C.RESET}  (sorted by confidence)")
+        for p in high[:n]:
+            print(f"  {C.GREEN}{p.confidence:.2f}{C.RESET}  {p.proposed_folder_name[:54]}")
+        if len(high)>n: print(f"  {C.DIM}… {len(high)-n} more  (h to list all){C.RESET}")
+
+    # MID sample
+    if mid:
+        n=min(4,len(mid))
+        print(f"\n  {C.YELLOW}MID — top {n} of {len(mid)}{C.RESET}  (sorted by confidence)")
+        for p in mid[:n]:
+            print(f"  {C.YELLOW}{p.confidence:.2f}{C.RESET}  {p.proposed_folder_name[:54]}")
+        if len(mid)>n: print(f"  {C.DIM}… {len(mid)-n} more  (m to list all){C.RESET}")
+
+    # PROB sample
+    if prob:
+        n=min(4,len(prob))
+        print(f"\n  {C.RED}PROB — first {n} of {len(prob)}{C.RESET}  (worst first)")
+        for p in prob[:n]:
+            reasons=p.decision.get("route_reasons",[])
+            reason_str=("  ~"+",".join(reasons[:2])) if reasons else ""
+            print(f"  {C.RED}{p.confidence:.2f}{C.RESET}  {p.folder_name[:46]}{C.DIM}{reason_str}{C.RESET}")
+        if len(prob)>n: print(f"  {C.DIM}… {len(prob)-n} more  (p to list all){C.RESET}")
+
+    print(f"\n{'─'*66}")
+    if high:
+        print(f"  a:bulk-approve({len(high)})   r:review-all-{total}   q:quit   h/m/p:list-tier   ?:help")
+    else:
+        print(f"  {C.DIM}(no auto-approvable folders){C.RESET}   r:review-all-{total}   q:quit   h/m/p:list-tier   ?:help")
+    print(f"{'═'*66}")
+
+
+def _prompt_triage_action(triage:Dict[str,List[FolderProposal]])->str:
+    """Read the triage action from the user. Returns 'auto', 'review', or 'quit'."""
+    high=triage["high"]; total=len(triage["high"])+len(triage["mid"])+len(triage["prob"])
+    while True:
+        try:
+            raw=input(f"  > ").strip().lower()
+        except (EOFError,KeyboardInterrupt):
+            return "quit"
+        if raw=="a" and high:
+            return "auto"
+        elif raw=="r":
+            return "review"
+        elif raw in ("q","quit"):
+            return "quit"
+        elif raw=="h":
+            _show_tier_detail("HIGH",triage["high"])
+        elif raw=="m":
+            _show_tier_detail("MID",triage["mid"])
+        elif raw=="p":
+            _show_tier_detail("PROB",triage["prob"])
+        elif raw=="?":
+            print(f"  a  — bulk-approve the {len(high)} HIGH-confidence folders → Clean")
+            print(f"  r  — review all {total} folders 1-by-1")
+            print(f"  h  — list all HIGH tier folders (conf ≥ threshold, → Clean)")
+            print(f"  m  — list all MID tier folders (conf < threshold, → Review)")
+            print(f"  p  — list all PROB tier folders (flagged / low confidence)")
+            print(f"  q  — quit without moving anything")
+        else:
+            print(f"  {C.DIM}Unknown. Press ? for help.{C.RESET}")
+
+
+def _bulk_approve_auto(
+    triage:Dict[str,List[FolderProposal]],
+    cfg:Dict[str,Any],
+    session_id:str,
+    source_root:Optional[Path],
+    dry_run:bool,
+)->List[Dict[str,Any]]:
+    """
+    Show the bulk-approve confirmation gate and execute AUTO tier moves.
+    Requires the user to type YES. Returns list of applied move entries.
+    """
+    auto=triage["auto"]
+    mc=cfg.get("move",{}); policy=mc.get("on_collision","suffix"); sfmt=mc.get("suffix_format"," ({n})"); use_cs=bool(mc.get("use_checksum",False))
+    hist_path=Path(cfg["logging"]["history_log"])
+
+    print(f"\n{'═'*66}")
+    print(f"  {C.BOLD}BULK APPROVE — confirm{C.RESET}")
+    print(f"{'─'*66}")
+    print(f"  {len(auto)} folders  →  Clean/")
+    print(f"  Move mode: {'dry-run' if dry_run else 'enabled'}")
+    print(f"  Undo:  raagdosa undo --session {session_id}")
+    print(f"{'─'*66}")
+    print(f"  Type {C.BOLD}YES{C.RESET} to confirm, or Enter to cancel: ",end="",flush=True)
+    try:
+        confirm=input("").strip()
+    except (EOFError,KeyboardInterrupt):
+        confirm=""
+
+    if confirm!="YES":
+        out(f"  {C.DIM}Cancelled. Returning all AUTO folders to manual review.{C.RESET}")
+        triage["hold"]=auto+triage["hold"]
+        triage["auto"]=[]
+        return []
+
+    print(f"{'─'*66}")
+    applied:List[Dict[str,Any]]=[]
+    skip_path=Path(cfg["logging"]["skipped_log"])
+
+    for p in auto:
+        src=Path(p.folder_path); dst=Path(p.target_path)
+        if not src.exists():
+            print(f"  {C.DIM}SKIP (gone):{C.RESET} {p.folder_name}"); continue
+        dst2=collision_resolve(dst,policy,sfmt)
+        if dst2 is None:
+            warn(f"  Collision skip: {dst.name}")
+            append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"collision_skip","src":str(src)})
+            continue
+        if dry_run:
+            out(f"  {C.DIM}[dry-run]{C.RESET} {src.name[:52]}  →  {dst2.name[:30]}")
+            append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dry_run","src":str(src),"dst":str(dst2)})
+            continue
+        ensure_dir(dst2.parent)
+        try:
+            move_method,_=safe_move_folder(src,dst2,use_checksum=use_cs)
+        except RuntimeError as e:
+            err(f"  FAILED: {e}  ({src.name})"); continue
+        action_id=uuid.uuid4().hex[:10]
+        entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
+               "original_path":str(src),"original_parent":str(src.parent),"original_folder_name":src.name,
+               "target_path":str(dst2),"target_parent":str(dst2.parent),"target_folder_name":dst2.name,
+               "destination":p.destination,"confidence":p.confidence,"decision":p.decision,
+               "move_method":move_method,"interactive_action":"bulk_approved"}
+        append_jsonl(hist_path,entry); applied.append(entry)
+        manifest_add(cfg,dst2.name,{"original_path":str(src),"confidence":p.confidence,"session_id":session_id})
+        print(f"  {C.GREEN}✓{C.RESET} {dst2.name[:60]}")
+        if source_root:
+            try: cleanup_empty_parents(src,source_root)
+            except Exception: pass
+
+    print(f"{'═'*66}")
+    return applied
+
+
+def _run_triage(
+    cfg:Dict[str,Any],
+    profile:str,
+    session_id:str,
+    proposals:List[FolderProposal],
+    source_root:Path,
+    dry_run:bool,
+    auto_threshold:Optional[float]=None,
+)->List[Dict[str,Any]]:
+    """
+    v7.1 triage workflow:
+      1. Split proposals into AUTO / HOLD
+      2. Show triage dashboard
+      3. Bulk-approve AUTO tier (requires YES confirmation)
+      4. Hand HOLD tier to interactive_review()
+    Returns all applied move entries.
+    """
+    rr=cfg.get("review_rules",{})
+    thresh=auto_threshold or float(rr.get("auto_approve_threshold",rr.get("min_confidence_for_clean",0.85)))
+    thresh=max(thresh,float(rr.get("min_confidence_for_clean",0.85)))  # never below clean floor
+
+    triage=_triage_proposals(proposals,thresh)
+    _show_triage_dashboard(triage,session_id,profile,thresh,dry_run)
+
+    action=_prompt_triage_action(triage)
+    applied:List[Dict[str,Any]]=[]
+
+    if action=="quit":
+        out(f"\n  {C.DIM}Quit. Nothing moved. Session {session_id[:12]} preserved.{C.RESET}")
+        out(f"  Resume: raagdosa resume {session_id}")
+        return []
+
+    if action=="auto" and triage["auto"]:
+        applied+=_bulk_approve_auto(triage,cfg,session_id,source_root,dry_run)
+        # Track renames for auto-approved clean moves
+        trc=cfg.get("track_rename",{})
+        if trc.get("enabled",True) and trc.get("scope","clean_only") in ("clean_only","both"):
+            for a in applied:
+                if a.get("destination")=="clean" and not dry_run:
+                    try:
+                        rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),
+                                                      a.get("decision",{}),
+                                                      interactive=False,dry_run=False,session_id=session_id)
+                    except Exception: pass
+
+    # Interactive review for HOLD tier (or all folders if action=="review")
+    review_queue=proposals if action=="review" else triage["hold"]
+    if review_queue:
+        print(f"\n{'═'*66}")
+        tier_label="ALL" if action=="review" else f"HOLD ({len(review_queue)})"
+        print(f"  {C.BOLD}Interactive Review — {tier_label}{C.RESET}  ·  Sorted by confidence (lowest first)")
+        print(f"{'═'*66}")
+        hold_applied=interactive_review(cfg,review_queue,session_id,dry_run=dry_run,source_root=source_root)
+        applied+=hold_applied
+        # Track renames for individually approved clean moves
+        trc=cfg.get("track_rename",{})
+        if trc.get("enabled",True) and trc.get("scope","clean_only") in ("clean_only","both"):
+            for a in hold_applied:
+                if a.get("destination")=="clean" and not dry_run:
+                    try:
+                        rename_tracks_in_clean_folder(cfg,Path(a["target_path"]),
+                                                      a.get("decision",{}),
+                                                      interactive=False,dry_run=False,session_id=session_id)
+                    except Exception: pass
+    return applied
+
+
+def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,review_threshold:Optional[float]=None,sort_by:str="name",force:bool=False,auto_above:Optional[float]=None)->None:
+    """
+    v7.1 default path: scan all → triage dashboard → bulk-approve → interactive review.
+    --force: bypass triage, use original streaming pipeline (nuclear option).
+    --interactive / -i: bypass triage, review all folders 1-by-1 in streaming mode.
+    --auto-above FLOAT: override auto_approve_threshold for this run.
+    """
+    if force:
+        # --force: original _run_core streaming behaviour, no triage
+        out(f"\n{C.YELLOW}--force: bypassing triage. Processing all folders without confirmation.{C.RESET}")
+        _run_core(cfg_path,cfg,profile,interactive=False,dry_run=dry_run,since_str=since,
+                  perf_tier=perf_tier,genre_roots=genre_roots,itunes_mode=itunes_mode)
+        return
+
+    if interactive:
+        # --interactive: original streaming 1-by-1 mode, no triage
+        _interactive_streaming(cfg,profile,dry_run=dry_run,since_str=since,
+                               genre_roots=genre_roots,itunes_mode=itunes_mode,
+                               threshold=review_threshold,sort_by=sort_by)
+        return
+
+    # ── v7.1 Triage workflow ──────────────────────────────────────────────
+    for lk in ["history_log","track_history_log"]:
+        lp=Path(cfg.get("logging",{}).get(lk,""))
+        if lp.name: rotate_log_if_needed(lp,float(cfg.get("logging",{}).get("rotate_log_max_mb",10.0)))
+    register_stop_handler()
+
+    # Resolve profile
+    profiles=cfg.get("profiles",{}); profile_obj=profiles.get(profile,{})
+    source_root=Path(profile_obj.get("source_root","")).expanduser()
+    if not source_root.exists():
+        err(f"source_root not found: {source_root}"); sys.exit(3)
+
+    setup_logging_paths(cfg,profile_obj,source_root)
+    _init_skip_sets(cfg)
+
+    session_id=make_session_id()
+    session_dir=Path(cfg["logging"]["session_dir"])/session_id; ensure_dir(session_dir)
+
+    out(f"\n{C.BOLD}Session:{C.RESET}   {session_id}")
+    out(f"{C.BOLD}Scanning:{C.RESET}  {source_root}")
+    if dry_run: out(f"  {C.YELLOW}DRY RUN — nothing will be moved{C.RESET}")
+
+    _get_tag_cache(cfg)
+
+    # Full scan — builds all proposals before any moves
+    since_dt=_parse_since(since,cfg)
+    _,_,proposals=scan_folders(cfg,profile,since=since_dt,genre_roots=genre_roots,itunes_mode=itunes_mode)
+
+    if not proposals:
+        out(f"  {C.DIM}No candidates found.{C.RESET}"); manifest_set_last_run(cfg); return
+
+    applied=_run_triage(cfg,profile,session_id,proposals,source_root,dry_run,auto_threshold=auto_above)
+
+    if _tag_cache is not None: _tag_cache.save()
+    manifest_set_last_run(cfg)
+
+    if applied:
+        print(f"\n{'━'*66}")
+        clean_n=sum(1 for a in applied if a.get("destination")=="clean")
+        rev_n  =sum(1 for a in applied if a.get("destination")=="review")
+        parts=[]
+        if clean_n: parts.append(f"{C.GREEN}{clean_n} → Clean{C.RESET}")
+        if rev_n:   parts.append(f"{C.YELLOW}{rev_n} → Review{C.RESET}")
+        skip_n=len(proposals)-len(applied)
+        if skip_n:  parts.append(f"{C.DIM}{skip_n} skipped{C.RESET}")
+        print(f"  {C.BOLD}DONE{C.RESET}  ·  {'  ·  '.join(parts)}")
+        print(f"  Undo:  raagdosa undo --session {session_id}")
+        print(f"{'━'*66}\n")
+
+def cmd_folders_only(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,sort_by:str="name")->None:
+    if interactive:
+        # Use streaming interactive — same one-at-a-time approach
+        _interactive_streaming(cfg,profile,dry_run=dry_run,since_str=since,
+                               genre_roots=genre_roots,itunes_mode=itunes_mode,sort_by=sort_by)
+    else:
+        register_stop_handler(); sid,_,proposals=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
         applied=apply_folder_moves(cfg,proposals,interactive=False,auto_above=None,dry_run=dry_run,session_id=sid)
-    out(f"Folders applied: {len(applied)}"); manifest_set_last_run(cfg)
+        out(f"Folders applied: {len(applied)}"); manifest_set_last_run(cfg)
 
 def cmd_tracks_only(cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool)->None:
     profiles=cfg.get("profiles",{})
@@ -5403,10 +6615,50 @@ def _resolve_log_paths_from_active_profile(cfg:Dict[str,Any])->None:
     except Exception:
         pass  # fall back to config values as-is
 
+def _resolve_last_session(hist:List[Dict[str,Any]])->Optional[str]:
+    """Return the most recent session_id in a history list."""
+    for h in reversed(hist):
+        sid=h.get("session_id","")
+        if sid: return sid
+    return None
+
+def cmd_sessions(cfg:Dict[str,Any],last:int=20)->None:
+    """List recent sessions with move counts and timestamps."""
+    _resolve_log_paths_from_active_profile(cfg)
+    hist_path=Path(cfg["logging"]["history_log"])
+    hist=iter_jsonl(hist_path)
+    if not hist: out("No session history found."); return
+    # Build ordered session summary
+    seen:Dict[str,Dict]={}
+    order:List[str]=[]
+    for h in hist:
+        sid=h.get("session_id",""); ts=h.get("timestamp","")
+        dest=h.get("destination","")
+        orig=h.get("original_folder_name","")
+        if sid not in seen:
+            seen[sid]={"first_ts":ts,"last_ts":ts,"total":0,"clean":0,"review":0,"examples":[]}
+            order.append(sid)
+        s=seen[sid]; s["last_ts"]=ts; s["total"]+=1
+        if dest=="clean": s["clean"]+=1
+        elif dest=="review": s["review"]+=1
+        if len(s["examples"])<3 and orig: s["examples"].append(orig)
+    recent=order[-last:]
+    out(f"\n{C.BOLD}Recent sessions ({len(recent)} of {len(order)} total):{C.RESET}\n")
+    for sid in reversed(recent):
+        s=seen[sid]
+        out(f"  {C.BOLD}{sid}{C.RESET}")
+        out(f"    {s['total']} moves  ·  {C.GREEN}{s['clean']} clean{C.RESET}  ·  {C.YELLOW}{s['review']} review{C.RESET}  ·  {s['first_ts'][:16]}")
+        if s["examples"]:
+            out(f"    e.g. {', '.join(s['examples'][:3])}")
+        out("")
+    out(f"  To undo a session:  raagdosa undo --session <session_id>")
+    out(f"  To undo last:       raagdosa undo --session last")
+
 def cmd_history(cfg:Dict[str,Any],last:int,session:Optional[str],match:Optional[str],tracks:bool)->None:
     _resolve_log_paths_from_active_profile(cfg)
     hist_path=Path(cfg["logging"]["track_history_log"] if tracks else cfg["logging"]["history_log"])
     hist=iter_jsonl(hist_path)
+    if session=="last": session=_resolve_last_session(hist)
     if session: hist=[h for h in hist if h.get("session_id")==session]
     if match:   hist=[h for h in hist if match in h.get("original_path","")+" "+h.get("target_path","")]
     hist=hist[-last:] if last and len(hist)>last else hist
@@ -5437,6 +6689,17 @@ def cmd_undo(cfg:Dict[str,Any],action_id:Optional[str],session_id:Optional[str],
     hist=iter_jsonl(hist_path)
     if not hist: err("No history."); return
     selected:List[Dict[str,Any]]=[]
+    # Handle -1/-2/... shorthand: resolve to the Nth-most-recent session
+    if session_id and re.match(r'^-\d+$',session_id):
+        n=abs(int(session_id))  # -1 → 1, -2 → 2
+        all_sids=list(dict.fromkeys(h.get("session_id") for h in hist if h.get("session_id")))
+        if n<=len(all_sids):
+            session_id=all_sids[-n]  # -1 = last, -2 = second-to-last
+            out(f"  Undo target: session {session_id}")
+        else:
+            err(f"Only {len(all_sids)} session(s) in history."); return
+        hist=iter_jsonl(hist_path)  # re-read after exhausting iterator
+    if session_id=="last": session_id=_resolve_last_session(hist)
     if action_id:    selected=[h for h in hist if h.get("action_id")==action_id]
     elif session_id: selected=[h for h in hist if h.get("session_id")==session_id]
     elif from_path:  selected=[h for h in hist if from_path in h.get("original_path","")]
@@ -5449,7 +6712,36 @@ def cmd_undo(cfg:Dict[str,Any],action_id:Optional[str],session_id:Optional[str],
             selected=[h for h in hist if
                       folder==Path(h.get("original_path","")).name or
                       folder in h.get("original_path","")]
-    else: err("Specify --id, --session, --from-path, or --folder"); sys.exit(1)
+    else:
+        # Interactive picker — show last session's moves and let user pick
+        last_sid=_resolve_last_session(hist)
+        if not last_sid: err("No history found."); return
+        session_hist=sorted([h for h in hist if h.get("session_id")==last_sid],
+                            key=lambda x:x.get("timestamp",""))
+        if not session_hist: err("No moves in last session."); return
+        out(f"\n{C.BOLD}Last session: {last_sid}{C.RESET}")
+        out(f"  {'#':<4} {'Folder':<55} {'Dest'}")
+        out(f"  {'─'*70}")
+        for i,h in enumerate(session_hist,1):
+            name=Path(h.get("original_path","")).name or h.get("action_id","")
+            dest=h.get("destination","?")
+            dest_col=C.GREEN if dest=="clean" else C.YELLOW
+            out(f"  {i:<4} {name:<55} {dest_col}{dest}{C.RESET}")
+        out(f"\n  Enter number(s) to undo (e.g. 3  or  1,3,5  or  all), or Enter to cancel:")
+        try:
+            raw=input("  > ").strip().lower()
+        except (EOFError,KeyboardInterrupt):
+            raw=""
+        if not raw: out("Cancelled."); return
+        if raw=="all":
+            selected=session_hist
+        else:
+            idxs=[]
+            for tok in re.split(r"[,\s]+",raw):
+                try: idxs.append(int(tok)-1)
+                except ValueError: pass
+            selected=[session_hist[i] for i in idxs if 0<=i<len(session_hist)]
+        if not selected: out("Nothing selected."); return
     if not selected: err("No matches."); return
     selected=sorted(selected,key=lambda x:x.get("timestamp",""),reverse=True); undone=0
     for h in selected:
@@ -6151,6 +7443,7 @@ Examples:
   raagdosa catchall /path/to/_Dump             # group loose files by artist
   raagdosa genre add "Bass"                    # declare a persistent genre root
   raagdosa genre list                          # show all genre roots
+  raagdosa sessions                            # review past sessions
   raagdosa undo --session last                 # undo a whole session
   raagdosa orphans                             # find loose audio files
   raagdosa artists --list                      # list all artists in Clean
@@ -6187,8 +7480,12 @@ Examples:
         c.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
         c.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
         c.add_argument("--threshold",type=float,metavar="SCORE",help="Interactive: only review folders below this confidence score")
+        c.add_argument("--sort",choices=["name","date-created","date-modified"],default="name",help="Interactive: folder sort order (default: name)")
+        c.add_argument("--force",action="store_true",help="Nuclear option: bypass triage, process all folders without confirmation (original streaming behaviour)")
+        c.add_argument("--auto-above",type=float,metavar="SCORE",dest="auto_above",help="Override auto-approve threshold for triage (default: review_rules.auto_approve_threshold)")
     fo=sub.add_parser("folders",help="Folder pass only"); fo.add_argument("--profile"); fo.add_argument("--interactive",action="store_true"); fo.add_argument("--dry-run",action="store_true"); fo.add_argument("--since")
     fo.add_argument("--genre-roots",metavar="ROOTS"); fo.add_argument("--itunes",action="store_true")
+    fo.add_argument("--sort",choices=["name","date-created","date-modified"],default="name",help="Interactive: folder sort order")
     tr=sub.add_parser("tracks",help="Track rename pass"); tr.add_argument("--profile"); tr.add_argument("--interactive",action="store_true"); tr.add_argument("--dry-run",action="store_true")
     sub.add_parser("status",help="Library overview").add_argument("--profile")
     rs=sub.add_parser("resume",help="Resume interrupted session"); rs.add_argument("session_id"); rs.add_argument("--interactive",action="store_true"); rs.add_argument("--dry-run",action="store_true")
@@ -6199,7 +7496,8 @@ Examples:
     sub.add_parser("doctor",help="Check config, deps, disk, DJ databases")
     hi=sub.add_parser("history",help="Show history"); hi.add_argument("--last",type=int,default=50); hi.add_argument("--session"); hi.add_argument("--match"); hi.add_argument("--tracks",action="store_true")
     un=sub.add_parser("undo",help="Undo moves or renames"); un.add_argument("--id"); un.add_argument("--session"); un.add_argument("--from-path"); un.add_argument("--tracks",action="store_true"); un.add_argument("--folder")
-    
+    se=sub.add_parser("sessions",help="List recent sessions with move counts"); se.add_argument("--last",type=int,default=20)
+
     # dump-tree command (legacy)
     dt_p = sub.add_parser("dump-tree", help="Export raw folder/file tree to a text file")
     dt_p.add_argument("--profile")
@@ -6304,10 +7602,10 @@ def main()->None:
         cmd_apply(cfg,pp,interactive=bool(args.interactive),auto_above=args.auto_above,dry_run=bool(args.dry_run))
     elif cmd in("run","go"):
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
-        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),review_threshold=getattr(args,"threshold",None))
+        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),review_threshold=getattr(args,"threshold",None),sort_by=getattr(args,"sort","name"),force=bool(getattr(args,"force",False)),auto_above=getattr(args,"auto_above",None))
     elif cmd=="folders":
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
-        cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
+        cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),sort_by=getattr(args,"sort","name"))
     elif cmd=="tracks":   cmd_tracks_only(cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run))
     elif cmd=="status":   cmd_status(cfg,gp())
     elif cmd=="resume":   cmd_resume(cfg,args.session_id,interactive=bool(args.interactive),dry_run=bool(args.dry_run))
@@ -6318,6 +7616,7 @@ def main()->None:
     elif cmd=="doctor":   cmd_doctor(cfg_path,cfg)
     elif cmd=="history":  cmd_history(cfg,last=args.last,session=args.session,match=args.match,tracks=bool(args.tracks))
     elif cmd=="undo":     cmd_undo(cfg,action_id=args.id,session_id=args.session,from_path=args.from_path,tracks=bool(args.tracks),folder=args.folder)
+    elif cmd=="sessions": cmd_sessions(cfg,last=getattr(args,"last",20))
     elif cmd=="dump-tree":
         cmd_dump_tree(
             cfg,

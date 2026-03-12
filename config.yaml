@@ -81,6 +81,9 @@ library:
 # ──────────────────────────────────────────────────────────────────────────────
 review_rules:
   min_confidence_for_clean: 0.85
+  # Triage mode: folders at or above this threshold with a clean route are
+  # offered for bulk-approval in the triage dashboard. Must be >= min_confidence_for_clean.
+  auto_approve_threshold: 0.85
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SCAN
@@ -401,6 +404,8 @@ title_cleanup:
     - produced by
     - free dl
     - direct download
+    # Label/distributor noise codes appended to scene/batch releases — add as needed:
+    - ftd
 
   keep_parenthetical_if_contains:
     - live
@@ -980,6 +985,49 @@ reference:
   # Examples:
   #   - "Beatport"
   #   - "Traxsource"
+
+  # Tokens stripped from folder names before folder_alignment_v2 comparison.
+  # Add your own release-group tags or label codes here.
+  folder_alignment_noise_tokens:
+    - web
+    - webflac
+    - webrip
+    - flac
+    - mp3
+    - aac
+    - ogg
+    - wav
+    - aiff
+    - cd
+    - cdda
+    - vinyl
+    - dvd
+    - "320"
+    - "256"
+    - "192"
+    - "128"
+    - v0
+    - v2
+    - vbr
+    - proper
+    - repack
+    - retail
+    - promo
+    - advance
+    - limited
+    - reissue
+    - remaster
+    - remastered
+    - deluxe
+    - expanded
+    - anniversary
+    - nfo
+    - sfv
+    - readnfo
+    - dirfix
+    - nfofix
+    - lossless
+    - hq
 
   # Learned noise patterns — added by `raagdosa learn --extract`.
   # Format: {pattern: "regex string", replace: "", description: "why"}

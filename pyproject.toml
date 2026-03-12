@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raagdosa"
-version = "5.0"
+version = "8.0.0"
 description = "Deterministic music library cleanup for DJs and collectors — CLI-first, safe-by-default, undoable."
 readme = "README.md"
 license = { file = "LICENSE" }
