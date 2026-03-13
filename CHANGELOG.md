@@ -10,9 +10,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Release summary
 
 v8 is the **"Triage Before You Commit"** release. Instead of moving folders the moment they pass
-confidence threshold, RaagDosa now scans everything first, presents a dashboard showing how the run
-splits (auto-approvable vs needs review), lets you bulk-approve the high-confidence tier with a single
-YES, then hands the rest to interactive folder-by-folder review.
+confidence threshold, RaagDosa now scans everything first, presents a three-tier dashboard showing
+how the run splits, lets you bulk-approve the high-confidence tier with a single YES, then hands
+the rest to interactive folder-by-folder review.
 
 This release also tightens several detection rules that caused confidence mis-scoring in real
 library data: EP detection from folder names (catches EPs with non-standard track counts), identical
@@ -20,31 +20,48 @@ title detection (copy-paste tag contamination), Volume/Vol no longer stripped as
 folder alignment v2 (noise token stripping + year-anchored cutoff), and Smart Title Case applied
 to all-lowercase artist tags.
 
+Track renaming gets significant fixes: Soundcloud ID stripping, multi-disc compound filename
+detection (101 → disc 1 track 01), tag track number sanity checking, feat. collaborator
+preservation from filenames, and label bracket stripping for no-track-number VA folders.
+
 Version is now read from `pyproject.toml` via `importlib.metadata` — no more duplicate version
 constants in source files.
 
 ---
 
-### New — Triage dashboard (default `go` workflow)
+### New — Three-tier triage dashboard (default `go` workflow)
 
 The `go` / `run` command now scans all folders first, then presents a triage dashboard before
-moving anything:
+moving anything. Folders are split into **three tiers**:
 
 ```
 ══════════════════════════════════════════════════════════════════════
   RAAGDOSA v8.0.0  ·  Triage  ·  Session 2026-03-12_a3f1
 ──────────────────────────────────────────────────────────────────────
-  AUTO tier   (conf ≥ 0.85)   712 folders  →  will go to Clean/
-  HOLD tier   (conf < 0.85)    98 folders  →  manual review needed
+  Profile: incoming   Scanned: 810 folders   Auto-approve ≥ 0.85
 ──────────────────────────────────────────────────────────────────────
-  [a] Bulk-approve AUTO + review HOLD   [r] Review all   [q] Quit
+  HIGH   712  ████████████████████████████░░░░  88%  conf ≥ 0.85 → Clean   [h]
+  MID     65  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░   8%  conf < 0.85 → Review  [m]
+  PROB    33  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   4%  flagged → Review       [p]
+──────────────────────────────────────────────────────────────────────
+  a:bulk-approve(712)   r:review-all-810   q:quit   h/m/p:list-tier   ?:help
 ══════════════════════════════════════════════════════════════════════
 ```
 
+| Tier | Criteria | Default action |
+|------|----------|----------------|
+| **HIGH** | conf ≥ threshold, destination=Clean, no force-hold flags | Bulk-approvable with `a` |
+| **MID** | dest=Clean but conf < threshold, no blocking flags | Manual review needed |
+| **PROB** | dest=Review, duplicate, unreadable ratio, heuristic fallback | Manual review needed |
+
+Each tier shows a sample of its top/worst entries with confidence scores. Use `h`, `m`, or `p`
+to list **all** folders in that tier (paginated, 20 at a time) before deciding.
+
 | Action | Behaviour |
 |--------|-----------|
-| `a` | Bulk-approve AUTO tier (requires typing `YES`), then interactive review for HOLD |
+| `a` | Bulk-approve HIGH tier (requires typing `YES`), then interactive review for MID+PROB |
 | `r` | Skip bulk-approve, review ALL folders 1-by-1 |
+| `h` / `m` / `p` | List all folders in that tier with confidence, destination, reasons |
 | `q` | Quit without moving anything |
 
 Previous streaming behaviour is preserved:
