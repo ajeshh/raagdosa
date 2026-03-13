@@ -25,7 +25,7 @@ You have a downloads folder. Or three. Files named `dj_shadow--endtroducing-WEB-
 Session:  2026-03-09_14-22_incoming
 Scanning: ~/Music/Incoming  (247 folders)
 
-[████████████████████] 100%  38/s
+[████████████████████] 100%  38/s  threshold=0.85
 
   ✦ clean  Massive Attack - Mezzanine (1998)            conf=0.97
   ✦ clean  Portishead - Dummy (1994)                    conf=0.95
@@ -39,6 +39,8 @@ Undo:     raagdosa undo --session last
 ```
 
 Every run is logged and fully undoable. Your source folder is never modified.
+
+> **Beta.** This tool moves files. Run `--dry-run` first. Point it at a test folder before your real library.
 
 ---
 
@@ -56,7 +58,7 @@ RaagDosa is a CLI tool that runs locally, on your machine, on your files.
 pip install raagdosa
 ```
 
-**Requires:** Python 3.9+ · macOS, Linux, or Windows
+**Requires:** Python 3.9+ · macOS, Linux, or Windows (including NTFS drives)
 
 Or run from source:
 
@@ -98,7 +100,7 @@ SCAN → READ TAGS → VOTE → SCORE → ROUTE → MOVE
 
 It reads every audio tag in every file — artist, album, year, genre, BPM, key, label — and runs a plurality vote across all tracks in the folder to find consensus metadata. A 7-factor confidence score (0.0–1.0) determines the route: above threshold goes to `Clean/`, below goes to `Review/`.
 
-`Review/` is a holding area, not a bin. Everything in it is intact, logged, and can be re-run once you've fixed the tags.
+`Review/` is a holding area, not a bin. Fix the tags in your tag editor, re-run, and those folders promote to `Clean/` on the next pass. Nothing in `Review/` is ever deleted or modified.
 
 When the tool is confident, it moves. When it isn't, it asks. The triage dashboard shows you the split before a single file moves:
 
@@ -214,5 +216,9 @@ Every file move is logged to `logs/history.jsonl`. Undo is always available by s
 <div align="center">
 
 Made with strong opinions about folder structure.
+
+<br>
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?style=flat-square&logo=buy-me-a-coffee&logoColor=white)](https://buymeacoffee.com/adaajio)
 
 </div>

@@ -3432,6 +3432,22 @@ def _display_folder_card(idx:int,total:int,p:FolderProposal)->None:
     print(f"\n  {C.BOLD}{artist}{C.RESET}{album_str}{ep_flag}{va_flag}{mix_flag}{year_str}")
     print(f"  {C.DIM}{tag_ratio} tracks  ·  {ext_str}{genre_str}{C.RESET}")
 
+    # ── Album vs VA barometer ─────────────────────────────────
+    dom_art_share=float(d.get("dominant_artist_share",1.0))
+    is_va=bool(d.get("is_va",False))
+    _BAR=16
+    def _va_bar(share:float)->str:
+        # share = dominant artist share (high = album, low = VA)
+        album_fill=int(share*_BAR); va_fill=_BAR-album_fill
+        album_col=C.GREEN if share>=0.75 else (C.YELLOW if share>=0.40 else C.RED)
+        va_col=C.RED if share>=0.75 else (C.YELLOW if share>=0.40 else C.GREEN)
+        album_bar=f"{album_col}{'█'*album_fill}{C.RESET}{C.DIM}{'░'*va_fill}{C.RESET}"
+        va_bar=f"{C.DIM}{'░'*album_fill}{C.RESET}{va_col}{'█'*va_fill}{C.RESET}"
+        return (f"  {C.BOLD}ALBUM{C.RESET} {album_bar} {share:.0%}  ·  "
+                f"{C.BOLD}VA{C.RESET} {va_bar} {1-share:.0%}  "
+                f"{C.DIM}(current: {'VA' if is_va else 'Album'}  ·  v to toggle){C.RESET}")
+    print(f"\n{_va_bar(dom_art_share)}")
+
     # ── Factor bars (compact) ─────────────────────────────────
     display_factors=["tag_coverage","dominance","title_quality","filename_consistency",
                      "completeness","aa_consistency","folder_alignment"]
@@ -3597,8 +3613,8 @@ def _interactive_action_help()->None:
     print(f"  c               Skip (leave in source)")
     print(f"  f               Flag (review again at end)")
     print(f"  {C.BOLD}── Fix ──{C.RESET}")
-    print(f"  t               Edit album title  (renames the folder)")
-    print(f"  e<N>            Edit track N title tag  (e.g. e3, e12)")
+    print(f"  e               Edit album title  (renames the folder)")
+    print(f"  e<N>            Edit track N title tag  (e.g. e3, e12)  — separate from album")
     print(f"  a               Set artist name")
     print(f"  v               Toggle VA status")
     print(f"  {C.BOLD}── Info ──{C.RESET}")
@@ -3690,7 +3706,7 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
 
         # Action loop — stays on this folder until an action advances
         while True:
-            action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  t:album-title  e<N>:track-title  a:artist  v:va  q:quit  ?:help"
+            action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  e:album-title  e<N>:track-title  a:artist  v:va  q:quit  ?:help"
             print(action_labels)
             try:
                 choice=input(f"  > ").strip().lower()
@@ -3842,8 +3858,9 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                     p.proposed_folder_name=_apply_format_suffix(new_target.name,cfg,p.stats.extensions if p.stats else None)
                     p.target_path=str(new_target); p.destination="clean"
                     print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
-                    print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}   VA: No  (was: VA)")
+                    print(f"  Artist: {C.BOLD}{new_artist}{C.RESET}   VA→Album  (tracks will rename as: NN - Title)")
                     print(f"    TO:   {p.proposed_folder_name}")
+                    print(f"  {C.DIM}Press space/b to preview updated track renames.{C.RESET}")
                 else:
                     # Single artist → VA
                     old_artist=p.decision.get("albumartist_display","--")
@@ -3864,11 +3881,12 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                     p.proposed_folder_name=_apply_format_suffix(new_target.name,cfg,p.stats.extensions if p.stats else None)
                     p.target_path=str(new_target)
                     print(f"\n  {C.CYAN}─ UPDATED ─{C.RESET}")
-                    print(f"  Artist: Various Artists  (was: {old_artist})   VA: Yes")
+                    print(f"  Album→VA  (was: {old_artist})  tracks will rename as: NN - Artist - Title")
                     print(f"    TO:   {new_target.name}")
+                    print(f"  {C.DIM}Press space/b to preview updated track renames.{C.RESET}")
 
-            elif choice=="t":
-                # Edit the album/folder title (separate from track title editing)
+            elif choice=="e":
+                # Edit the album/folder title (e = album edit, e<N> = track title edit)
                 current_album=p.decision.get("dominant_album_display","")
                 print(f"  {C.DIM}Current album:{C.RESET} {current_album}")
                 new_album=input(f"  New album title (Enter to cancel): ").strip()
@@ -3892,10 +3910,8 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                 print(f"    TO:   {new_target.name}")
                 print(f"  ROUTE: {C.GREEN}CLEAN{C.RESET}")
 
-            elif choice=="e":
-                print(f"  {C.DIM}Usage: e<N> to edit track title by number  (e.g. e3, e12){C.RESET}")
-
             elif choice.startswith("e") and len(choice)>1 and choice[1:].strip().isdigit():
+                # e<N> — edit individual track title tag (separate from album title)
                 track_num=int(choice[1:].strip())
                 if 1<=track_num<=len(track_files):
                     _edit_track_title(track_files[track_num-1],cfg)
@@ -3903,7 +3919,7 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                 else:
                     print(f"  {C.DIM}Track {track_num} not found (folder has {len(track_files)} tracks).{C.RESET}")
 
-            elif choice in ("t"," ","b"):
+            elif choice in (" ","b"):
                 trk_result=_display_tracks(p,cfg)
                 if trk_result=="approve":
                     # User approved from batch track view — execute move inline
@@ -4193,6 +4209,11 @@ def parse_artist_title_from_fn(stem: str, folder_name: str = "", cfg: Optional[D
             parts = parts[:-1]
     if len(parts) >= 2:
         return parts[0], " - ".join(parts[1:])
+    # Single-part stem (no artist–title separator): return as title only.
+    # This lets the feat. supplement step in build_track_filename pick up
+    # collaborator info from the filename even when the tag title lacks it.
+    if parts:
+        return None, parts[0]
     return None, None
 
 def extract_mix_suffix(title:str,cfg:Dict[str,Any])->Tuple[str,str]:
@@ -6089,14 +6110,18 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
             _display_folder_card(idx,total,p)
             _display_tracks(p,cfg)
 
+            # Build track file list for e<N> track-title editing
+            _tf_exts={".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma"}
+            _stream_track_files=sorted([f for f in rp.iterdir() if f.suffix.lower() in _tf_exts],key=lambda f:f.name) if rp.exists() else []
+
             # Running tally
             tally=f"{C.DIM}{moved_clean} moved · {moved_review} review · {skipped_count} skipped{C.RESET}"
 
             while True:
                 if p.confidence<0.50:
-                    print(f"  {C.DIM}z:move  x:reject  c:skip  space:tracks  ?:more  ({tally}){C.RESET}")
+                    print(f"  {C.DIM}z:move  x:reject  c:skip  space:tracks  e:album-title  e<N>:track-title  ?:more  ({tally}){C.RESET}")
                 else:
-                    print(f"  z:move  x:reject  c:skip  space:tracks  ?:more  ({tally})")
+                    print(f"  z:move  x:reject  c:skip  space:tracks  e:album-title  e<N>:track-title  ?:more  ({tally})")
                 try:
                     choice=input(f"  > ").strip().lower()
                 except (EOFError,KeyboardInterrupt):
@@ -6134,9 +6159,10 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
                     out(f"  {C.DIM}→ Skipped{C.RESET}"); break
 
                 elif choice=="e":
+                    # e = album title edit (e<N> = track title edit — separate operations)
                     current_album=p.decision.get("dominant_album_display","")
                     print(f"  {C.DIM}Current:{C.RESET} {current_album}")
-                    new_album=input(f"  New album title: ").strip()
+                    new_album=input(f"  New album title (Enter to cancel): ").strip()
                     if not new_album: continue
                     p.decision["dominant_album_display"]=new_album
                     p.decision["override_type"]=p.decision.get("override_type","")+"edit_title"
@@ -6144,6 +6170,15 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
                     print(f"  {C.CYAN}─ UPDATED ─{C.RESET}")
                     print(f"  Album: {C.BOLD}{new_album}{C.RESET}")
                     print(f"    {C.BOLD}→ {p.proposed_folder_name}{C.RESET}")
+
+                elif choice.startswith("e") and len(choice)>1 and choice[1:].strip().isdigit():
+                    # e<N> = edit individual track title tag (separate from album title)
+                    track_num=int(choice[1:].strip())
+                    if 1<=track_num<=len(_stream_track_files):
+                        _edit_track_title(_stream_track_files[track_num-1],cfg)
+                        print(f"  {C.DIM}Press space to refresh track view.{C.RESET}")
+                    else:
+                        print(f"  {C.DIM}Track {track_num} not found (folder has {len(_stream_track_files)} tracks).{C.RESET}")
 
                 elif choice=="a":
                     current=p.decision.get("albumartist_display","--")
