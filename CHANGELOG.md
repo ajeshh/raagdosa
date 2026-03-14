@@ -5,6 +5,130 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [8.5.0] — 2026-03-14
+
+### Release summary
+
+v8.5 is the **"smarter about messy real-world folders"** release. File timestamps are now preserved
+during moves — your "date added" sort order survives intact. Generic folder names, partial tags, EP
+naming quirks, compound artists, and multi-disc releases are all handled more intelligently. The
+interactive review mode gains new editing keys and an "Open in Finder" action for manual fixes
+mid-review. Sessions can now be named for easier recall.
+
+---
+
+### New — Timestamp preservation during moves
+
+File creation dates and modification times are now preserved when folders are moved — both on the
+fast rename path and the cross-device copy path. On macOS, original creation dates (birthtime) are
+restored via `SetFile` (requires Xcode Command Line Tools). Cross-device copies use `shutil.copy2`
+for full metadata preservation.
+
+Previously, moved files lost their original dates, breaking "sort by date added" workflows in DJ
+software and file managers.
+
+### New — Generic folder name detection
+
+Folders with uninformative names — "music", "downloads", "new", "misc", "unsorted", "temp",
+"incoming", "stuff", "tracks", "songs", "playlist", and others — are now automatically routed to
+Review with confidence capped below threshold. These folder names provide no useful metadata for
+classification and previously could produce false Clean routes when tags happened to be strong.
+
+### New — Compound artist recovery
+
+When a folder name contains "A and B" or "A & B" but tags only credit one of the artists per track,
+the full compound name from the folder is now used. For example, a folder named "Above & Beyond" with
+tracks tagged "Above" produces "Above & Beyond" as the artist. "and" is normalised to "&" in folder
+names.
+
+### New — Multi-disc folder grouping
+
+Source folders with disc indicators (CD1, CD2, Disc 1, etc.) are now nested as subfolders under the
+album folder: `Artist/Album/CD1/`, `Artist/Album/CD2/`. This groups multi-disc releases under one
+parent instead of treating each disc as a separate album.
+
+### New — `--session-name` flag
+
+Custom human-readable session names for easier recall:
+
+```bash
+raagdosa go --session-name "Bandcamp Friday"
+# Session ID: 2026-03-14_10-30_bandcamp-friday
+```
+
+### New — `undo --last` shortcut
+
+Shorthand for `undo --session last`:
+
+```bash
+raagdosa undo --last
+```
+
+### New — Open in Finder (`o` key)
+
+In interactive review, press `o` to open the current folder in the system file manager (Finder on
+macOS). Useful for manual tag fixes or track moves mid-review, then press `R` to rescan the folder
+with updated tags.
+
+### New — Size-based progress bar
+
+The progress bar now tracks bytes transferred rather than folder count — more accurate when folders
+vary dramatically in size (e.g. a 2GB WAV album vs a 40MB MP3 EP). Scan output also shows total
+library size in human-readable format.
+
+### New — Config validation at load time
+
+Critical config values (thresholds, paths, profile structure) are now validated when the config is
+loaded. Errors are reported immediately with specific messages, rather than failing later during
+processing.
+
+### Changed — feat. collaborator stripping from albumartist
+
+"feat. X" / "ft. X" / "featuring X" collaborators are now stripped from the albumartist tag before
+determining the folder name. The main artist owns the folder; the feat. credit stays in the
+album name or track title where it appears. This prevents folders like
+`Artist feat. Collaborator/Album/` when the correct structure is `Artist/Album/`.
+
+### Changed — Year position normalisation
+
+Years are now stripped from any position within album names — leading ("2023 - Album"), bracketed
+("(2023)"), or embedded ("Album 2023 Title") — and placed consistently at the end via the naming
+pattern. This prevents folder names like "2023 Album Name" and ensures years always appear in the
+configured position.
+
+### Changed — Confidence weight rebalance
+
+`filename_consistency` weight reduced 0.10 → 0.07, `folder_alignment` weight bumped 0.05 → 0.08.
+Now that folder alignment uses the v2 token-coverage algorithm (introduced in v8.0), it is more
+reliable and earns more weight. Some folders near the threshold may route differently than before.
+
+### Changed — Better proposals for partially-tagged folders
+
+Album name is now derived from the folder name even when tracks have some tags but no album tag.
+Previously, the folder name fallback only activated when zero tracks had any tags at all. This
+produces better proposals for partially-tagged folders where artist and title tags exist but
+album tags are missing.
+
+### Fixed — EP bracket doubling
+
+Now strips both bare "EP"/"E.P." AND bracketed "[EP]"/"(EP)" from album names before adding the
+standardised [EP] label. Prevents doubling like "Ashen (EP) [EP]" or "Debut EP [EP]".
+
+### Fixed — Low-confidence year dropping
+
+Years derived from folder name heuristic with less than 70% agreement across tracks are now dropped
+entirely. Better to have no year in the folder name than a wrong year. This prevents incorrect years
+from appearing when a folder contains tracks from multiple years (e.g. personal compilations).
+
+### Config changes
+
+| Key | Change |
+|-----|--------|
+| Confidence weight: `filename_consistency` | 0.10 → 0.07 |
+| Confidence weight: `folder_alignment` | 0.05 → 0.08 |
+
+---
+
 ## [8.0.0] — 2026-03-12
 
 ### Release summary
@@ -190,11 +314,91 @@ folder names. DJ/EP/VA/UK/US acronyms preserved.
 Previously: artist tags were only alias-mapped or "The"-prefix adjusted.
 Now: all-lowercase tags → Smart Title Case → then alias and normalisation rules.
 
+### New — VA/album barometer in folder card
+
+The interactive review card now shows a visual barometer of how confident the system is about
+VA vs single-artist classification:
+
+```
+  ALBUM ████████████░░░░ 75%  ·  VA ░░░░░░░░░░░░████ 25%  (current: Album  ·  v to toggle)
+```
+
+The bar is derived from `dominant_artist_share` — the fraction of tracks belonging to the
+most common artist. Green = confident album, yellow = borderline, red = strong VA signal.
+Use `v` to toggle the classification and re-route the folder.
+
+### Fixed — Interactive review key bindings
+
+Both interactive modes (`go` default triage path and `go --interactive`) now share consistent
+key bindings:
+
+| Key | Action |
+|-----|--------|
+| `e` | Edit album title |
+| `e<N>` | Edit track title for track N (e.g. `e3` edits track 3) |
+| `v` | Toggle VA / single-artist, re-derives track rename pattern |
+| `space` / `b` | Show track rename preview |
+
+Previously `e` showed a usage hint and `e<N>` did nothing in the streaming mode.
+
+### Fixed — Track listing shown by default in interactive review
+
+When using the `r` (review all) path through the triage dashboard, each folder card is now
+followed automatically by the track rename preview. Previously you had to press `space` or `b`
+to see it. Pass `--interactive` to use the original streaming mode without automatic track display.
+
+### Changed — Auto-approve threshold raised to 90%
+
+The default `auto_approve_threshold` has been raised from `0.85` to `0.90`. This means fewer
+folders are bulk-approved without review — folders scoring 0.85–0.89 now fall into MID tier
+and get individual review instead of being silently approved. Override for a single run:
+
+```bash
+raagdosa go --auto-above 0.85   # restore previous permissive behaviour
+```
+
+### Fixed — Track rename: Soundcloud ID stripping
+
+9+ digit numeric IDs (e.g. `959134033`) embedded in filenames and track titles are now stripped.
+These appear in Soundcloud downloads where the track ID is appended to the filename.
+
+Before: `Track Name 959134033.mp3` → `01 - Track Name 959134033`
+After:  `Track Name 959134033.mp3` → `01 - Track Name`
+
+### Fixed — Track rename: multi-disc compound filename detection
+
+Filenames with 3-digit prefixes in the range 101–999 are now detected as disc-compound numbers.
+`101` = disc 1, track 01. `203` = disc 2, track 03. This matches the convention used by some
+rippers and download services.
+
+Before: `101 - Title.flac` → `101 - Title` (treated as track 101)
+After:  `101 - Title.flac` → `1-01 - Title` (disc 1, track 01)
+
+### Fixed — Track rename: tag track number sanity check
+
+When a track tag contains a number that exceeds the actual track count of the folder (e.g. a
+track tagged `32` in a 12-track album — a leftover from a compilation tag), the filename-derived
+number is used instead. This prevents nonsense track prefixes like `32 - Title`.
+
+### Fixed — Track rename: feat. collaborator preserved from filename
+
+When a track file is named `01 Llévame (feat. Barzo).m4a` but the embedded tag has only
+`Llévame` as the title (a common tagging convention), the collaborator suffix is now
+preserved in the renamed output. The filename is parsed for `(feat. X)` / `(ft. X)` patterns
+and supplemented onto the tag title when the tag is missing it.
+
+### Fixed — Track rename: label bracket fallback for VA folders with no track numbers
+
+Folders classified as Various Artists where individual tracks have no track number tags or
+filename-derivable track numbers now fall back to the "mixed" rename pattern
+(`Artist - Title.ext`) instead of being skipped entirely. Previously, label brackets like
+`[MONADA]` in a VA folder caused 11 tracks to be reported as "unchanged".
+
 ### Config changes
 
 | Key | Change |
 |-----|--------|
-| `review_rules.auto_approve_threshold` | New. Triage AUTO/HOLD split threshold (default: same as `min_confidence_for_clean`) |
+| `review_rules.auto_approve_threshold` | Default raised from 0.85 → 0.90. Triage HIGH/MID split threshold |
 | `title_cleanup.strip_trailing_phrases` | Added `ftd` (scene release group noise suffix) |
 | `reference.folder_alignment_noise_tokens` | New. Token list for folder alignment v2 noise stripping |
 

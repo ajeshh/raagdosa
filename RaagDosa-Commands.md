@@ -1,4 +1,4 @@
-# RaagDosa — Command Reference (v7.0)
+# RaagDosa — Command Reference (v8.5)
 
 > **CLI-first. Safe by default. Always undoable.**
 > RaagDosa never silently reorganises your music. Every action is sessioned, logged, and reversible.
@@ -49,16 +49,24 @@ raagdosa doctor   # verify your setup is ready to run
 ### `go` — do everything in one shot _(most common)_
 ```bash
 raagdosa go
-raagdosa go --dry-run               # preview: proposals printed, nothing moves
-raagdosa go --interactive           # v7.0: folder-by-folder review with approve/reject/override
-raagdosa go --interactive --threshold 0.7  # v7.0: only review folders below 0.7 confidence
-raagdosa go --since last_run        # only folders added since your last run
-raagdosa go --since 2026-01-15      # only folders modified after a specific date
-raagdosa go --profile bandcamp      # use a different source profile
+raagdosa go --dry-run                      # preview: proposals printed, nothing moves
+raagdosa go --interactive                  # skip triage, folder-by-folder streaming review
+raagdosa go --interactive --threshold 0.7  # only review folders below 0.7 confidence
+raagdosa go --auto-above 0.95             # v8.0: only bulk-approve folders with conf ≥ 0.95
+raagdosa go --force                        # skip triage entirely, process all without confirmation
+raagdosa go --since last_run              # only folders added since your last run
+raagdosa go --since 2026-01-15            # only folders modified after a specific date
+raagdosa go --profile bandcamp            # use a different source profile
+raagdosa go --session-name "Bandcamp Friday"  # v8.5: custom session name for easier recall
 ```
 
-In v7.0, `--interactive` activates the full review mode with per-folder cards showing confidence
-breakdown, before/after state, and action keys: approve, skip, review, set artist, toggle VA.
+In v8.0, `go` scans everything first and presents a **three-tier triage dashboard** before
+moving anything. Folders are split into HIGH (conf ≥ 0.90, auto-approvable), MID (conf below
+threshold), and PROB (flagged for review). Use `a` to bulk-approve HIGH, `r` to review all,
+`h`/`m`/`p` to list folders in each tier.
+
+`--interactive` skips triage and uses the original folder-by-folder streaming mode.
+`--force` skips triage entirely and processes all folders without confirmation.
 
 ### `run` — same as `go`, explicit alias
 ```bash
@@ -251,7 +259,9 @@ RaagDosa keeps separate undo streams for folder moves and track renames.
 
 ### Undo folder moves
 ```bash
+raagdosa undo --last                         # v8.5: undo most recent session (shortcut)
 raagdosa undo --session <session_id>         # undo a whole session
+raagdosa undo --session last                 # undo most recent session
 raagdosa undo --id <action_id>               # undo one specific move
 raagdosa undo --from-path "/original/path"   # undo by original folder path
 ```
@@ -335,13 +345,46 @@ Useful for folders with bad tags where you know the answer and don't want to bot
 
 ---
 
+## Triage dashboard actions _(v8.0 default `go` path)_
+
+After scanning, a dashboard shows the three tiers. Actions at the dashboard prompt:
+
+| Key | Behaviour |
+|-----|-----------|
+| `a` | Bulk-approve HIGH tier (requires typing `YES`), then interactive review for MID+PROB |
+| `r` | Review ALL folders 1-by-1 (skips bulk-approve) |
+| `h` / `m` / `p` | List all folders in HIGH / MID / PROB tier (paginated) |
+| `q` | Quit without moving anything |
+
+## Interactive review key bindings _(triage `r` path and `go --interactive`)_
+
+| Key | Action |
+|-----|--------|
+| Enter / `z` | Approve — move folder with proposed routing |
+| `x` | Reject — leave in source |
+| `c` | Skip — skip this folder for now |
+| `e` | Edit album title |
+| `e<N>` | Edit track title for track N (e.g. `e3` edits track 3) |
+| `a` | Set artist — override detected artist, re-route as single-artist album |
+| `v` | Toggle VA / album — flips classification, re-derives track rename pattern |
+| `o` | Open folder in Finder — for manual track moves |
+| `R` | Rescan folder — re-read tags after changes in Finder |
+| `space` / `b` | Show track rename preview |
+| `q` | Quit session |
+| `?` | Show help |
+
+---
+
 ## Common flags (work on most commands)
 
 | Flag | What it does |
 |---|---|
 | `--dry-run` | Show what would happen, move nothing |
-| `--interactive` | v7.0: Full review mode — approve/reject/override each folder |
-| `--threshold N` | v7.0: In interactive mode, only review folders below this confidence |
+| `--interactive` | Skip triage, original folder-by-folder streaming review |
+| `--threshold N` | In interactive mode, only review folders below this confidence |
+| `--auto-above N` | v8.0: Override auto-approve threshold for triage (default: 0.90) |
+| `--force` | Skip triage entirely, process all folders without confirmation |
+| `--session-name <name>` | v8.5: Custom human-readable session name (e.g. "Bandcamp Friday") |
 | `--profile <name>` | Use a named profile instead of the active one |
 | `--since last_run` | Only process folders new since last run |
 | `--since 2026-01-01` | Only process folders modified after a date |

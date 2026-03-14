@@ -1,0 +1,19 @@
+# paths.local.yaml — Machine-specific paths (gitignored)
+# Copy this file to paths.local.yaml and edit the paths below.
+#
+# This file overrides path settings in config.yaml.
+# It is gitignored so your local paths stay private.
+
+# Set your active profile name
+active_profile: default
+
+# Define profiles with source paths
+profiles:
+  default:
+    source_root: ~/Music/Incoming    # Where new music lands
+    clean_mode: subfolder            # subfolder | sibling
+
+# Logging paths (optional — defaults to ./logs/)
+# logging:
+#   root_dir: ./logs
+#   session_dir: ./logs/sessions

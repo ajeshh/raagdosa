@@ -11,7 +11,7 @@
 
 **A tag-aware folder organiser for DJs and music collectors.**
 
-[![Version](https://img.shields.io/badge/version-8.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-8.5.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
 [![Python versions](https://img.shields.io/pypi/pyversions/raagdosa?style=flat-square&color=0d1117&labelColor=21262d&logo=python&logoColor=f5f5f5)](https://pypi.org/project/raagdosa/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square&color=0d1117&labelColor=21262d)](LICENSE)
 

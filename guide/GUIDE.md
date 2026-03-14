@@ -114,6 +114,7 @@ RaagDosa runs the same six-step pipeline on every folder in your source:
 
   6. MOVE      Same filesystem  →  atomic os.rename() (~1ms per folder)
                Cross-device     →  copy → verify checksum → delete source
+               File timestamps (creation date, modification time) are preserved
 ```
 
 **The tag is the source of truth.** If 14 of 16 tracks agree the album is "Mezzanine" and the folder is named "massive attack mezzanine 320kbps", the album name comes from the tags. The folder name is used only when tags are absent or incomplete.
@@ -130,6 +131,10 @@ RaagDosa runs the same six-step pipeline on every folder in your source:
         Mezzanine (1998)/
       DJ Shadow/
         Endtroducing..... (1996)/
+      Pink Floyd/
+        The Wall (1979)/
+          CD1/
+          CD2/
     _Mixes/
     _Singles/
   Review/
@@ -226,13 +231,18 @@ In interactive review, each folder gets its own review card:
 
 | Key | Action |
 |-----|--------|
-| `y` / Enter | Approve — move folder using proposed routing |
-| `s` | Skip — leave in source, optionally note why |
-| `r` | Send to Review/ with a required note |
+| Enter / `z` | Approve — move folder using proposed routing |
+| `x` | Reject — leave in source |
+| `c` | Skip — skip this folder for now |
+| `e` | Edit album title |
+| `e<N>` | Edit track title for track N (e.g. `e3` edits track 3) |
 | `a` | Override detected artist, re-route as single-artist album |
-| `v` | Flip VA / single-artist status |
-| `t` | Show track listing with per-track tag summary |
+| `v` | Toggle VA / single-artist, re-derives track rename pattern |
+| `o` | Open folder in Finder for manual fixes |
+| `R` | Rescan folder — re-read tags after changes |
+| `space` / `b` | Show track rename preview |
 | `q` | Stop here — all moves already made are kept |
+| `?` | Show help |
 
 Press `q` at any point and stop. Everything moved so far stays in place. Re-run the same command to continue reviewing the remaining folders.
 
@@ -356,7 +366,7 @@ Every folder gets a score from 0.0 to 1.0. This score drives the routing decisio
 | `tag_coverage` | 0.15 | All key tags present across all tracks | Many tracks missing album, artist, or year |
 | `title_quality` | 0.12 | Titles look like real titles | Garbage strings, missing titles, or all identical |
 | `completeness` | 0.12 | Track numbers are sequential, no gaps or dupes | Duplicate or missing track numbers |
-| `filename_consist` | 0.10 | Filenames match tag content | Filenames have scene suffixes or don't match tags |
+| `filename_consist` | 0.07 | Filenames match tag content | Filenames have scene suffixes or don't match tags |
 | `aa_consistency` | 0.06 | Consistent albumartist tag across all tracks | Tracks have inconsistent albumartist |
 | `folder_alignment` | 0.08 | Source folder name matches proposed clean name | Folder name is noisy or very different from tags |
 
@@ -511,7 +521,14 @@ A folder with a median BPM of 127 → `House/`. A folder at 152 → `150-159/`.
 
 ## Sessions and history
 
-Every run is a session with a unique ID (`2026-03-09_14-22_a3f1`). Session data is written to `logs/sessions/<id>/`.
+Every run is a session with a unique ID (`2026-03-09_14-22_incoming`). Session data is written to `logs/sessions/<id>/`.
+
+Name sessions for easier recall:
+
+```bash
+raagdosa go --session-name "Bandcamp Friday"
+# Session ID: 2026-03-14_10-30_bandcamp-friday
+```
 
 ```bash
 raagdosa sessions              # list last 20 sessions with move counts
@@ -534,9 +551,10 @@ Every move is logged to `logs/history.jsonl`. Undo is always available.
 ### Undo a full session
 
 ```bash
-raagdosa undo --session last     # undo most recent session
+raagdosa undo --last             # undo most recent session (shortcut)
+raagdosa undo --session last     # same thing, explicit form
 raagdosa undo --session -2       # undo second-to-last session
-raagdosa undo --session 2026-03-09_14-22_a3f1   # undo by session ID
+raagdosa undo --session 2026-03-09_14-22_incoming   # undo by session ID
 ```
 
 ### Interactive picker
@@ -582,22 +600,28 @@ This shows you tag votes, confidence breakdown, proposed name, and routing decis
 
 ## DJ workflow notes
 
-**Cue points and DJ database compatibility.**
+**Moving files breaks DJ software library references.** This is not a caveat — it is the primary concern for any DJ using this tool. Rekordbox, Serato, and Traktor store cue points, beatgrids, hot cues, loops, and waveform data against absolute file paths. When paths change, those references break.
 
-Rekordbox, Serato, and Traktor store cue points by file path. If RaagDosa moves a file, those cue points break. RaagDosa warns you when it detects DJ database files in your source folder, but it is your responsibility to re-link your library after moving files.
+**The golden rule: only run RaagDosa on folders that are NOT yet imported into your DJ software.**
 
-Typical process for each app:
+### Recommended workflow
 
-- **Rekordbox** — use "Relocate Lost Files" (right-click on a missing track or collection)
-- **Serato** — Serato will show missing files; drag the Clean/ folder into the panel to re-link
-- **Traktor** — use "Consistency Check" and re-locate from the new path
+1. Download new music to an intake folder (separate from your DJ library)
+2. Run `raagdosa go --dry-run` to preview what will happen
+3. Run `raagdosa go` — review the triage dashboard, approve moves
+4. Inspect Clean/ — verify the structure looks right
+5. Import Clean/ into Rekordbox / Serato / Traktor as a new collection
+6. Re-analyse in your DJ software — fresh waveforms, accurate BPM, consistent cue points
 
-**Recommended workflow:**
+### If you break DJ software links
 
-1. Run RaagDosa against your downloads inbox (not your active Rekordbox collection)
-2. Inspect Clean/ — verify the structure looks right
-3. Import Clean/ into Rekordbox / Serato as a new collection or location
-4. Re-analyse — you get fresh waveforms, accurate BPM, consistent cue points
+- **Rekordbox** — "Relocate Lost Files" (right-click on a missing track or the collection). Rekordbox stores data in its internal database (`pioneer/rekordbox/master.db`); you lose hot cues, memory cues, beatgrid adjustments, phrase analysis, and play history. The "Relocate" function can handle bulk path changes if filenames stayed the same.
+- **Serato** — Serato stores cue points inside the file's own ID3 tags, so those survive a move. But crate references (`.crate` files and `_Serato_` folder structure) break. Drag the new Clean/ folder into the Serato panel to re-link.
+- **Traktor** — uses `collection.nml` with absolute paths. Use "Consistency Check" to relocate from the new path.
+
+### Timestamp preservation (v8.5)
+
+File creation dates and modification times are now preserved when folders move. If you sort by "date added" in Rekordbox or your file manager, the original dates survive the reorganisation. On macOS, creation dates require Xcode Command Line Tools (`SetFile`). On Linux/Windows, modification times are preserved; creation dates follow OS-level behaviour.
 
 **FLAC segregation:**
 

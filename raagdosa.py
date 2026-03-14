@@ -39,6 +39,13 @@ except Exception:
     _HAS_PIL = False
 
 try:
+    import readchar as _readchar
+    _HAS_READCHAR = True
+except Exception:
+    _readchar = None
+    _HAS_READCHAR = False
+
+try:
     from importlib.metadata import version as _pkg_version
     APP_VERSION = _pkg_version("raagdosa")
 except Exception:
@@ -123,6 +130,49 @@ def warn(msg:str)->None:
 def ok_msg(msg:str)->None:
     out(f"{C.GREEN}✓  {msg}{C.RESET}")
 
+def _open_in_finder(path:Path)->None:
+    """Open a folder in the system file manager (Finder on macOS)."""
+    import subprocess as _sp
+    if not path.exists():
+        warn(f"Path does not exist: {path}"); return
+    system=platform.system()
+    try:
+        if system=="Darwin":
+            _sp.Popen(["open",str(path)])
+        elif system=="Linux":
+            _sp.Popen(["xdg-open",str(path)])
+        elif system=="Windows":
+            _sp.Popen(["explorer",str(path)])
+        else:
+            warn(f"Unsupported platform for open: {system}"); return
+        out(f"  {C.CYAN}Opened:{C.RESET} {path.name}")
+    except Exception as e:
+        err(f"  Could not open folder: {e}")
+
+def _read_key(prompt:str="  > ")->str:
+    """Read a single keypress if readchar is available, otherwise fall back to input()."""
+    if _HAS_READCHAR and _IS_TTY:
+        print(prompt,end="",flush=True)
+        try:
+            ch=_readchar.readkey()
+        except (EOFError,KeyboardInterrupt):
+            print(); return "q"
+        # Map special keys
+        if ch in ("\r","\n"): print(); return ""
+        if ch==" ": print("tracks"); return "b"
+        print(ch)  # echo the key
+        # Preserve case for uppercase-only bindings (R=rescan)
+        if ch in ("R",): return ch
+        return ch.lower()
+    # Fallback: normal input
+    try:
+        raw=input(prompt).strip()
+        # Preserve case for uppercase-only bindings
+        if raw in ("R",): return raw
+        return raw.lower()
+    except (EOFError,KeyboardInterrupt):
+        return "q"
+
 def status_tag(dest:str)->str:
     m={"clean":f"{C.GREEN}[CLEAN ]{C.RESET}","review":f"{C.YELLOW}[REVIEW]{C.RESET}","duplicate":f"{C.RED}[DUPE  ]{C.RESET}"}
     return m.get(dest,f"[{dest.upper()[:6]:6}]")
@@ -167,6 +217,37 @@ class Progress:
             rate=self.current/elapsed if elapsed>0 else 0
             print(f"  {C.DIM}({elapsed:.1f}s, {rate:.0f} folders/s){C.RESET}")
 
+class SizeProgress:
+    """Progress bar driven by bytes transferred, not count. More accurate for mixed WAV/MP3."""
+    def __init__(self,total_bytes:int,total_count:int,label:str="Moving"):
+        self.total_bytes=max(total_bytes,1); self.total_count=total_count
+        self.bytes_done=0; self.count_done=0; self.label=label
+        self._active=_IS_TTY and _verbosity>=NORMAL
+        self._lock=Lock(); self._start=dt.datetime.now()
+    def tick(self,nbytes:int,msg:str="")->None:
+        with self._lock:
+            self.bytes_done+=nbytes; self.count_done+=1
+            if not self._active: return
+            pct=int(self.bytes_done/self.total_bytes*100)
+            bw=22; filled=int(bw*self.bytes_done/self.total_bytes)
+            bar="█"*filled+"░"*(bw-filled)
+            elapsed=(dt.datetime.now()-self._start).total_seconds()
+            rate=self.bytes_done/elapsed if elapsed>0 else 0
+            remaining=self.total_bytes-self.bytes_done
+            eta_s=remaining/rate if rate>0 else 0
+            if eta_s>3600:   eta=f"~{eta_s/3600:.0f}h"
+            elif eta_s>60:   eta=f"~{eta_s/60:.0f}m"
+            elif eta_s>0:    eta=f"~{eta_s:.0f}s"
+            else:            eta=""
+            rate_s=f"{_human_size(int(rate))}/s" if rate>=1024 else ""
+            line=(f"\r{C.CYAN}{self.label}{C.RESET} [{bar}] {self.count_done}/{self.total_count} {pct}%"
+                  f"  {C.DIM}{rate_s}  {eta}  {msg[:28]:<28}{C.RESET}")
+            print(line,end="",flush=True)
+    def done(self)->None:
+        if self._active:
+            elapsed=(dt.datetime.now()-self._start).total_seconds()
+            print(f"  {C.DIM}({elapsed:.1f}s, {_human_size(self.bytes_done)}){C.RESET}")
+
 # ─────────────────────────────────────────────
 # Graceful stop (SIGINT)
 # ─────────────────────────────────────────────
@@ -203,17 +284,20 @@ def slugify(s: str, max_len: int = 24) -> str:
     s = re.sub(r"-+", "-", s).strip("-")
     return s[:max_len] if len(s) > max_len else s
 
-def make_session_id(profile: str = "", source_folder: str = "") -> str:
+def make_session_id(profile: str = "", source_folder: str = "", session_name: str = "") -> str:
     """
-    Human-readable session ID: YYYY-MM-DD_HH-MM_<profile>_<source-folder-slug>
-    Format makes it easy to recall which profile and folder the session covers.
-    Example: 2026-03-08_14-30_incoming_slsk-complete-march
+    Human-readable session ID: YYYY-MM-DD_HH-MM_<name-or-profile>_<source-folder-slug>
+    With --session-name: 2026-03-08_14-30_bandcamp-friday
+    Without:             2026-03-08_14-30_incoming_slsk-complete-march
     Duplicate-minute collision → appends _2, _3, …  (detected by caller if needed).
     """
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M")
     parts = [ts]
-    if profile:       parts.append(slugify(profile, 20))
-    if source_folder: parts.append(slugify(Path(source_folder).name, 32))
+    if session_name:
+        parts.append(slugify(session_name, 40))
+    else:
+        if profile:       parts.append(slugify(profile, 20))
+        if source_folder: parts.append(slugify(Path(source_folder).name, 32))
     return "_".join(p for p in parts if p)
 
 def read_yaml(path:Path)->Dict[str,Any]:
@@ -305,6 +389,56 @@ def load_config_with_paths(cfg_path:Path)->Dict[str,Any]:
     elif "brain" in cfg and "reference" in cfg:
         cfg["reference"]=_deep_merge(cfg.pop("brain"),cfg["reference"])
     return cfg
+
+def _validate_config(cfg: Dict[str, Any]) -> None:
+    """Validate critical config values at load time."""
+    errors: List[str] = []
+    rr = cfg.get("review_rules", {})
+    for key in ("min_confidence_for_clean", "auto_approve_threshold"):
+        val = rr.get(key)
+        if val is not None:
+            try:
+                f = float(val)
+                if not 0.0 <= f <= 1.0:
+                    errors.append(f"review_rules.{key} must be between 0.0 and 1.0, got {val}")
+            except (TypeError, ValueError):
+                errors.append(f"review_rules.{key} must be a number, got '{val}'")
+    sc = cfg.get("scan", {})
+    min_tracks = sc.get("min_tracks")
+    if min_tracks is not None:
+        try:
+            n = int(min_tracks)
+            if n < 1:
+                errors.append(f"scan.min_tracks must be >= 1, got {min_tracks}")
+        except (TypeError, ValueError):
+            errors.append(f"scan.min_tracks must be an integer, got '{min_tracks}'")
+    profiles = cfg.get("profiles", {})
+    for pname, pdata in profiles.items():
+        if not isinstance(pdata, dict):
+            errors.append(f"profiles.{pname} must be a mapping, got {type(pdata).__name__}")
+    if errors:
+        err("Config validation failed:")
+        for e in errors:
+            out(f"  - {e}")
+        sys.exit(2)
+
+def _folder_size(path: Path) -> int:
+    """Total bytes of all files under *path*."""
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            if f.is_file():
+                total += f.stat().st_size
+    except (OSError, PermissionError):
+        pass
+    return total
+
+def _human_size(nbytes: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(nbytes) < 1024:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} PB"
 
 def ensure_dir(path:Path)->None: path.mkdir(parents=True,exist_ok=True)
 def write_json(path:Path,obj:Any)->None: path.write_text(json.dumps(obj,indent=2,ensure_ascii=False),encoding="utf-8")
@@ -1429,8 +1563,8 @@ def safe_move_folder(src:Path,dst:Path,use_checksum:bool=False)->Tuple[str,float
     try:
         for f in src.rglob("*"):
             file_stats[str(f.relative_to(src))]=f.stat()
-    except Exception:
-        pass
+    except Exception as e:
+        out(f"  {C.DIM}Could not pre-read stats: {e}{C.RESET}",level=VERBOSE)
 
     if _same_device(src,dst):
         # ── Fast path: atomic rename ──────────────────────────────────────
@@ -1655,7 +1789,8 @@ def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
                 if yv:
                     m=re.search(r"(\d{4})",str(yv))
                     if m: result["year"]=m.group(1); break
-    except Exception: pass
+    except Exception as e:
+        out(f"  {C.DIM}Tag read failed: {e}{C.RESET}",level=VERBOSE)
     if cache is not None: cache.set(path,result)
     return result
 
@@ -2266,15 +2401,6 @@ def fp_from_dict(d:Dict[str,Any])->FolderProposal:
 # ─────────────────────────────────────────────────────────────────
 # Artifact classification
 # ─────────────────────────────────────────────────────────────────
-def _png_is_large(path:Path, min_dim:int=800)->bool:
-    """Return True if PNG dimensions are >= min_dim x min_dim. Requires Pillow."""
-    if not _HAS_PIL: return False   # no Pillow → caller decides policy
-    try:
-        with _PILImage.open(str(path)) as img:
-            w,h=img.size
-            return w>=min_dim and h>=min_dim
-    except Exception:
-        return False
 
 def _cue_has_paired_audio(path:Path)->bool:
     """Return True if a .cue sheet has a matching .flac or .ape file alongside."""
@@ -2328,8 +2454,8 @@ def classify_artifacts(folder:Path, cfg:Dict[str,Any])->Dict[str,List[Path]]:
             else:
                 if quar_unknown: result["quarantine"].append(p)
                 else: result["unknown"].append(p)
-    except PermissionError:
-        pass
+    except PermissionError as e:
+        out(f"  {C.DIM}Permission denied scanning artifacts: {e}{C.RESET}",level=VERBOSE)
     return result
 
 def move_artifacts_to_quarantine(
@@ -2542,7 +2668,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
             dom_aa=str(override.get("albumartist") or override.get("artist"))
         if override.get("year"):
             try: years[str(int(override["year"]))]=total; tracks_with_year=total
-            except Exception: pass
+            except (TypeError, ValueError): pass
 
     va_label=cfg.get("various_artists",{}).get("label","VA")
     # ── VA detection ──────────────────────────────────────────────────────
@@ -2660,8 +2786,8 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
                     _sibling_match = sum(1 for s in _siblings if _art_norm_h in normalize_unicode(s.strip().lower()))
                     if _sibling_match >= 1:
                         is_va = False
-            except OSError:
-                pass
+            except OSError as e:
+                out(f"  {C.DIM}Could not scan siblings: {e}{C.RESET}",level=VERBOSE)
 
     # Safeguard I (v6.1): Remix/remixed album — track artists are remixers,
     # not evidence of VA.  If the album name or folder name contains remix
@@ -2907,7 +3033,8 @@ def _write_review_sidecar(folder_path:Path,proposal,session_id:str)->None:
         "user_notes":[],
     }
     try: write_json(sidecar,data)
-    except Exception: pass
+    except Exception as e:
+        out(f"  {C.DIM}Could not write review sidecar: {e}{C.RESET}",level=VERBOSE)
 
 # ─────────────────────────────────────────────
 # v7.0 — Structured review reasons
@@ -2988,7 +3115,7 @@ def _route_proposal(p:FolderProposal,cfg:Dict[str,Any],
     elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
     return p
 
-def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->Tuple[str,Path,List[FolderProposal]]:
+def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,session_name:str="")->Tuple[str,Path,List[FolderProposal]]:
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
@@ -3008,7 +3135,7 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     clean_root_str =str(derive_clean_root(profile,source_root).resolve())+os.sep
     review_root_str=str(derive_review_root(profile,source_root).resolve())+os.sep
 
-    session_id=make_session_id(profile_name, str(source_root))
+    session_id=make_session_id(profile_name, str(source_root), session_name=session_name)
     # Deduplicate if same-minute session already exists
     session_base=Path(cfg["logging"]["session_dir"])/session_id
     if session_base.exists():
@@ -3113,7 +3240,8 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
         try:
             for item in clean_albums.rglob("*"):
                 if item.is_dir(): existing_clean.add(normalize_unicode(item.name))
-        except Exception: pass
+        except PermissionError as e:
+            out(f"  {C.DIM}Permission denied scanning clean library: {e}{C.RESET}",level=VERBOSE)
     manifest_entries:Set[str]=set(read_manifest(cfg).get("entries",{}).keys())
     lib=cfg.get("library",{}); mixes_folder=lib.get("mixes_folder","_Mixes")
     mixes_root=clean_albums.parent/mixes_folder
@@ -3133,8 +3261,19 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     rev_n  =sum(1 for p in proposals if p.destination=="review")
     dup_n  =sum(1 for p in proposals if p.destination=="duplicate")
     since_note=f"  (since {since.strftime('%Y-%m-%d %H:%M')})" if since else ""
+    # Scan summary: total tracks, size, format breakdown
+    total_tracks=sum(p.stats.tracks_total for p in proposals)
+    total_bytes=sum(_folder_size(Path(p.folder_path)) for p in proposals if Path(p.folder_path).exists())
+    fmt_totals:Counter=Counter()
+    for p in proposals:
+        for ext,cnt in (p.stats.extensions or {}).items():
+            fmt_totals[ext.upper().lstrip(".")]+=cnt
+    fmt_str=" · ".join(f"{fmt}: {cnt}" for fmt,cnt in fmt_totals.most_common()) if fmt_totals else ""
     out(f"\n{C.BOLD}Session:{C.RESET}   {session_id}")
-    out(f"{C.BOLD}Results:{C.RESET}   {len(proposals)} proposals{since_note} | {C.GREEN}Clean: {clean_n}{C.RESET} | {C.YELLOW}Review: {rev_n}{C.RESET} | {C.RED}Dupes: {dup_n}{C.RESET}")
+    out(f"{C.BOLD}Found:{C.RESET}     {len(proposals)} folders, {total_tracks} tracks ({_human_size(total_bytes)}){since_note}")
+    if fmt_str:
+        out(f"           {C.DIM}{fmt_str}{C.RESET}")
+    out(f"{C.BOLD}Routing:{C.RESET}   {C.GREEN}Clean: {clean_n}{C.RESET} | {C.YELLOW}Review: {rev_n}{C.RESET} | {C.RED}Dupes: {dup_n}{C.RESET}")
 
     # Tag coverage summary — shows how well populated the tags are for the active template
     lib=_resolve_lib_cfg(profile,cfg)
@@ -3429,8 +3568,11 @@ def _display_folder_card(idx:int,total:int,p:FolderProposal)->None:
     genre=d.get("genre","")
     genre_str=f"  {C.DIM}{genre}{C.RESET}" if genre else ""
     album_str=f"  {C.DIM}-  {album}{C.RESET}" if album else ""
+    # Per-folder size
+    folder_bytes=_folder_size(Path(p.folder_path)) if Path(p.folder_path).exists() else 0
+    size_str=f"  ·  {_human_size(folder_bytes)}" if folder_bytes else ""
     print(f"\n  {C.BOLD}{artist}{C.RESET}{album_str}{ep_flag}{va_flag}{mix_flag}{year_str}")
-    print(f"  {C.DIM}{tag_ratio} tracks  ·  {ext_str}{genre_str}{C.RESET}")
+    print(f"  {C.DIM}{tag_ratio} tracks  ·  {ext_str}{size_str}{genre_str}{C.RESET}")
 
     # ── Album vs VA barometer ─────────────────────────────────
     dom_art_share=float(d.get("dominant_artist_share",1.0))
@@ -3617,7 +3759,9 @@ def _interactive_action_help()->None:
     print(f"  e<N>            Edit track N title tag  (e.g. e3, e12)  — separate from album")
     print(f"  a               Set artist name")
     print(f"  v               Toggle VA status")
-    print(f"  {C.BOLD}── Info ──{C.RESET}")
+    print(f"  {C.BOLD}── Inspect ──{C.RESET}")
+    print(f"  o               Open folder in Finder")
+    print(f"  R               Rescan folder (after manual changes in Finder)")
     print(f"  space / b       Track rename preview  (b within view to approve folder)")
     print(f"  u               Undo a move made this session")
     print(f"  ?               This help")
@@ -3678,13 +3822,20 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
     # Session header
     clean_n=sum(1 for p in proposals if p.destination=="clean")
     rev_n=sum(1 for p in proposals if p.destination=="review")
+    # Pre-compute per-folder sizes for progress tracking
+    _review_sizes:Dict[str,int]={}
+    for p in proposals:
+        _review_sizes[p.folder_path]=_folder_size(Path(p.folder_path)) if Path(p.folder_path).exists() else 0
+    _review_total_bytes=sum(_review_sizes.values())
+    _review_bytes_done=0
+    readchar_note=f"  {C.DIM}(single-keypress mode){C.RESET}" if _HAS_READCHAR and _IS_TTY else ""
     print(f"\n{'═'*66}")
     print(f"  {C.BOLD}RAAGDOSA v{APP_VERSION}  ·  Interactive Review  ·  Session {session_id[:12]}{C.RESET}")
     print(f"{'─'*66}")
-    print(f"  Folders: {total}  ·  {C.GREEN}Clean: {clean_n}{C.RESET}  ·  {C.YELLOW}Review: {rev_n}{C.RESET}")
+    print(f"  Folders: {total} ({_human_size(_review_total_bytes)})  ·  {C.GREEN}Clean: {clean_n}{C.RESET}  ·  {C.YELLOW}Review: {rev_n}{C.RESET}")
     print(f"  Sorted by confidence (lowest first)")
     if dry_run: print(f"  {C.YELLOW}DRY RUN — nothing will be moved{C.RESET}")
-    print(f"  Press ? for help at any prompt.")
+    print(f"  Press ? for help at any prompt.{readchar_note}")
     print(f"{'═'*66}")
 
     # Session notes file for learning
@@ -3696,24 +3847,36 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
             break
 
         src=Path(p.folder_path); dst=Path(p.target_path)
-        if not src.exists(): continue
+        if not src.exists():
+            _review_bytes_done+=_review_sizes.get(p.folder_path,0); continue
 
         _display_folder_card(idx,total,p)
+        _display_tracks(p,cfg)
 
         # Build track file list for e<N> edit shortcut
         _tf_exts={".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma"}
         track_files=sorted([f for f in src.iterdir() if f.suffix.lower() in _tf_exts],key=lambda f:f.name) if src.exists() else []
 
+        # Progress line — size-weighted percentage
+        _cur_bytes=_review_sizes.get(p.folder_path,0)
+        size_pct=int(_review_bytes_done/_review_total_bytes*100) if _review_total_bytes else 0
+        dest_color=C.GREEN if p.destination=="clean" else C.YELLOW
+        print(f"  {C.DIM}[{idx}/{total}] {size_pct}% by size{C.RESET}  ·  {p.proposed_folder_name}  ({conf_color(p.confidence)} → {dest_color}{p.destination.title()}{C.RESET})")
+
         # Action loop — stays on this folder until an action advances
         while True:
-            action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  e:album-title  e<N>:track-title  a:artist  v:va  q:quit  ?:help"
+            if _HAS_READCHAR and _IS_TTY:
+                action_labels=f"  z:move  x:reject  c:skip  b:tracks  e:edit  v:va  o:finder  R:rescan  q:quit  ?:help"
+            else:
+                action_labels=f"  z:move  x:reject  c:skip  space/b:tracks  e:album-title  e<N>:track-title  a:artist  v:va  o:finder  R:rescan  q:quit  ?:help"
             print(action_labels)
-            try:
-                choice=input(f"  > ").strip().lower()
-            except (EOFError,KeyboardInterrupt):
-                choice="q"
+            choice=_read_key("  > ")
 
-            if choice in ("","z","y","yes"):
+            if choice=="":
+                # Empty enter — require explicit choice
+                print(f"  {C.YELLOW}Press z to move, x to reject, c to skip, ? for help{C.RESET}")
+                continue
+            if choice in ("z","y","yes"):
                 # Approve — proceed with the proposed move
                 dst2=collision_resolve(dst,policy,sfmt)
                 if dst2 is None:
@@ -3954,6 +4117,47 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
                         except Exception: pass
                     break
 
+            elif choice=="o":
+                _open_in_finder(src)
+
+            elif choice in ("R",) or (not _HAS_READCHAR and choice in ("rescan",)):
+                # Rescan folder after manual changes (e.g. moved tracks in Finder)
+                if not src.exists():
+                    print(f"  {C.RED}Folder no longer exists.{C.RESET}"); break
+                print(f"  {C.CYAN}Rescanning...{C.RESET}")
+                new_audio=list_audio_files(src,exts,False)
+                min_trk=int(cfg.get("scan",{}).get("min_tracks",3))
+                if len(new_audio)<min_trk:
+                    print(f"  {C.YELLOW}Only {len(new_audio)} audio file(s) remain — below minimum ({min_trk}).{C.RESET}")
+                    print(f"  {C.DIM}Skip this folder? [y/N]{C.RESET}")
+                    skip_confirm=input(f"  > ").strip().lower()
+                    if skip_confirm in ("y","yes"):
+                        skipped+=1; break
+                    continue
+                profile_name_r=cfg.get("active_profile","incoming")
+                profile_obj_r=cfg.get("profiles",{}).get(profile_name_r,{})
+                sr_r=source_root or Path(profile_obj_r.get("source_root","")).expanduser()
+                new_p=build_folder_proposal(src,new_audio,sr_r,profile_obj_r,cfg)
+                if new_p is None:
+                    print(f"  {C.YELLOW}Folder no longer qualifies after rescan.{C.RESET}"); break
+                # Determine routing based on confidence
+                rr=cfg.get("review_rules",{}); min_conf=float(rr.get("min_confidence_for_clean",0.85))
+                if new_p.confidence<min_conf:
+                    new_p.destination="review"
+                    review_albums_r=derive_review_albums_root(profile_obj_r,sr_r)
+                    new_p.target_path=str(review_albums_r/new_p.proposed_folder_name)
+                # Replace the current proposal in-place
+                p.stats=new_p.stats; p.confidence=new_p.confidence; p.decision=new_p.decision
+                p.proposed_folder_name=new_p.proposed_folder_name; p.target_path=new_p.target_path
+                p.destination=new_p.destination
+                dst=Path(p.target_path)
+                # Rebuild track file list
+                track_files=sorted([f for f in src.iterdir() if f.suffix.lower() in _tf_exts],key=lambda f:f.name) if src.exists() else []
+                # Re-display
+                _display_folder_card(idx,total,p)
+                _display_tracks(p,cfg)
+                print(f"  {C.CYAN}─ RESCANNED ─{C.RESET}  {len(new_audio)} tracks  ·  conf {conf_color(p.confidence)}  → {p.destination.title()}")
+
             elif choice=="q":
                 print(f"\n{'═'*66}")
                 print(f"  Stop processing?")
@@ -3973,6 +4177,9 @@ def interactive_review(cfg:Dict[str,Any],proposals:List[FolderProposal],
 
             else:
                 print(f"  {C.DIM}Unknown action. Press ? for help.{C.RESET}")
+
+        # Track bytes for size-weighted progress
+        _review_bytes_done+=_cur_bytes
 
     # Session summary
     print(f"\n{'═'*66}")
@@ -4011,28 +4218,40 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
                 err(f"⛔ Disk: need ~{total_size/1024/1024:.0f} MB, only {free/1024/1024:.0f} MB free. Aborting."); sys.exit(1)
         except Exception: pass
 
-    applied:List[Dict[str,Any]]=[]; prog=Progress(len(proposals),"Applying ")
+    applied:List[Dict[str,Any]]=[]
+    # Size-aware progress bar — compute per-folder sizes up front
+    _folder_sizes:Dict[str,int]={}
+    for p in proposals:
+        sp=Path(p.folder_path)
+        _folder_sizes[p.folder_path]=get_folder_size(sp) if sp.exists() else 0
+    _total_bytes=sum(_folder_sizes.values())
+    prog=SizeProgress(_total_bytes,len(proposals),"Moving")
 
     for p in proposals:
         if should_stop(): out(f"\n{C.YELLOW}Stopped. {len(applied)}/{len(proposals)} applied.{C.RESET}"); break
-        src=Path(p.folder_path); dst=Path(p.target_path); prog.tick(src.name)
+        src=Path(p.folder_path); dst=Path(p.target_path)
+        _cur_size=_folder_sizes.get(p.folder_path,0)
         if not src.exists():
+            prog.tick(_cur_size,src.name)
             append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"missing_source","src":str(src)}); continue
         if not check_path_length(dst): warn(f"Path length >{260}: {dst}")
         locked=check_folder_locked(src,exts)
         if locked:
             warn(f"Locked files in {src.name}: {[lf.name for lf in locked[:3]]}")
             if interactive and input(f"  Skip '{src.name}'? [Y/n] ").strip().lower()!="n":
+                prog.tick(_cur_size,src.name)
                 append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"locked_files","src":str(src)}); continue
         if warn_dj:
             dj_dbs=find_dj_databases(src)
             if dj_dbs:
                 warn(f"DJ databases in {src.name}: {', '.join(dj_dbs)}")
                 if halt_dj:
+                    prog.tick(_cur_size,src.name)
                     append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dj_halt","src":str(src)}); continue
         dst2=collision_resolve(dst,policy,sfmt)
         if dst2 is None:
             warn(f"Collision skip: {dst.name}")
+            prog.tick(_cur_size,src.name)
             append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"collision_skip","src":str(src)}); continue
         elif dst2!=dst: warn(f"Collision — renamed to: {dst2.name}")
         should_prompt=(interactive or (req_confirm and p.confidence<interactive_below)) and not(auto_above is not None and p.confidence>=auto_above)
@@ -4047,16 +4266,19 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
                 print(f"  {C.DIM}    {_art_info}{'  |  ' if _art_info and _reasons else ''}{_reasons}{C.RESET}")
             if p.decision.get("used_heuristic"): warn("name from heuristic — no tags")
             if input("  Apply? [y/N] ").strip().lower()!="y":
+                prog.tick(_cur_size,src.name)
                 append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"user_skipped","src":str(src)}); continue
         if dry_run:
             same=_same_device(src,dst2)
             method_note=f"{C.DIM}[rename]{C.RESET}" if same else f"{C.DIM}[copy]{C.RESET}"
             out(f"  {C.DIM}[dry-run]{C.RESET} {method_note} {src.name}  →  {dst2.name}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}")
+            prog.tick(_cur_size,src.name)
             append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dry_run","src":str(src),"dst":str(dst2)}); continue
         ensure_dir(dst2.parent)
         try: move_method,move_elapsed=safe_move_folder(src,dst2,use_checksum=use_cs)
         except RuntimeError as e:
             err(f"⛔ Move failed ({src.name}): {e}")
+            prog.tick(_cur_size,src.name)
             append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":f"move_failed:{e}","src":str(src)}); continue
         action_id=uuid.uuid4().hex[:10]
         entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,"type":"folder",
@@ -4069,6 +4291,7 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
         elif p.destination=="review": _write_review_sidecar(dst2,p,session_id)
         method_tag=f"  {C.DIM}[{move_method} {move_elapsed*1000:.0f}ms]{C.RESET}" if _verbosity>=VERBOSE else ""
         out(f"  MOVED {status_tag(p.destination)} {C.DIM}{src.name}{C.RESET}  →  {dst2.name}  conf={conf_color(p.confidence)}{method_tag}")
+        prog.tick(_cur_size,dst2.name)
         # Clean up empty parent directories left behind in source
         if source_root:
             try: cleanup_empty_parents(src,source_root)
@@ -4232,8 +4455,10 @@ def extract_mix_suffix(title:str,cfg:Dict[str,Any])->Tuple[str,str]:
     return title,""
 
 def classify_folder_for_tracks(decision:Dict[str,Any],cfg:Dict[str,Any])->str:
-    if float(decision.get("dominant_album_share",0.0))<float(cfg.get("decision",{}).get("album_dominance_threshold",0.75)): return "mixed"
+    # Check VA first — VA compilations should be "various" even with low album dominance.
+    # Otherwise low-dominance VA folders fall through to "mixed" and lose track numbers.
     if bool(decision.get("is_va",False)): return "various"
+    if float(decision.get("dominant_album_share",0.0))<float(cfg.get("decision",{}).get("album_dominance_threshold",0.75)): return "mixed"
     # Non-VA but track artists are diverse (remix albums, edits compilations) — use "various"
     # so individual track artists are preserved in filenames.
     # Exception: if the dominant track artist starts with the albumartist, this is a feat. album
@@ -4368,21 +4593,25 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
             if _num_m and int(_num_m.group(1))==_fn_num2:
                 title_c=_num_m.group(2).strip() or title_c
 
-    # Guard: for album folders, strip leading "ArtistName - " from title if it matches the
-    # albumartist (some taggers embed the artist in the title field).
+    # Guard: strip leading "ArtistName - " from title if it matches the albumartist (album)
+    # or the per-track artist (various). Prevents duplication in output filenames when the
+    # filename-parsed title already contains the artist name that the template will prepend.
+    import unicodedata as _ud
+    _fold=lambda s:_ud.normalize('NFKD',normalize_unicode(s)).encode("ascii","ignore").decode("ascii").lower()
     if classification=="album" and decision and title_c:
         _aa=(decision.get("albumartist_display") or "").strip()
         if _aa:
-            import unicodedata as _ud
-            # NFKD maps accented chars to base+combining, then ASCII encode strips combining marks.
-            # This correctly maps "Guazú" → "Guazu" (not dropping the char entirely like NFC→ASCII).
-            _fold=lambda s:_ud.normalize('NFKD',normalize_unicode(s)).encode("ascii","ignore").decode("ascii").lower()
             _aa_f=_fold(_aa)
-            # Guard: same word count (not char count) — handles accented chars and ligatures
             if len(_aa_f.split())==len(_aa.split()) and _aa_f:
                 _sep_m=re.match(re.escape(_aa_f)+r'\s*[-–—]\s*',_fold(title_c))
                 if _sep_m and _sep_m.end()<len(_fold(title_c)):
                     title_c=title_c[_sep_m.end():].strip() or title_c
+    if classification=="various" and artist and title_c:
+        _art_f=_fold(artist)
+        if len(_art_f.split())==len(artist.split()) and _art_f:
+            _sep_m=re.match(re.escape(_art_f)+r'\s*[-–—]\s*',_fold(title_c))
+            if _sep_m and _sep_m.end()<len(_fold(title_c)):
+                title_c=title_c[_sep_m.end():].strip() or title_c
 
     # Strip trailing [LabelName] bracket from track titles.
     # Square brackets in DJ download filenames are almost always label/distributor codes —
@@ -4416,6 +4645,11 @@ def build_track_filename(classification:str,tags:Dict[str,Optional[str]],src:Pat
         fname=tmpl.format(disc_prefix=disc_prefix,track=int(track_n),artist=artist,title=title_c,mix_suffix=mix_suf,ext=ext)
         return sanitize_name(fname),0.92,"ok",meta
     if not artist: return None,0.0,"missing_artist",meta
+    # Mixed classification with a known track number: preserve track numbering in output.
+    if track_n is not None:
+        tmpl=pat.get("various","{disc_prefix}{track:02d} - {artist} - {title}{mix_suffix}{ext}")
+        fname=tmpl.format(disc_prefix=disc_prefix,track=int(track_n),artist=artist,title=title_c,mix_suffix=mix_suf,ext=ext)
+        return sanitize_name(fname),0.90,"ok",meta
     tmpl=pat.get("mixed","{artist} - {title}{mix_suffix}{ext}")
     return sanitize_name(tmpl.format(artist=artist,title=title_c,mix_suffix=mix_suf,ext=ext,disc_prefix="",track=0)),0.90,"ok",meta
 
@@ -5568,8 +5802,8 @@ def _parse_since(val:Optional[str],cfg:Dict[str,Any])->Optional[dt.datetime]:
     try: return dt.datetime.fromisoformat(val)
     except Exception: err(f"Cannot parse --since '{val}'. Use ISO date or 'last_run'."); sys.exit(1)
 
-def cmd_scan(cfg_path:Path,cfg:Dict[str,Any],profile:str,out_path:Optional[str],since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False)->str:
-    sid,sdir,_=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode)
+def cmd_scan(cfg_path:Path,cfg:Dict[str,Any],profile:str,out_path:Optional[str],since:Optional[str],genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,session_name:str="")->str:
+    sid,sdir,_=scan_folders(cfg,profile,since=_parse_since(since,cfg),genre_roots=genre_roots,itunes_mode=itunes_mode,session_name=session_name)
     if out_path: shutil.copyfile(str(sdir/"proposals.json"),out_path)
     return sid
 
@@ -5682,6 +5916,24 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     total_n=len(candidates)
     out(f"{C.DIM}Candidates: {total_n} folder(s){C.RESET}",level=VERBOSE)
 
+    # ── Pre-flight: confirmation gate + disk space check ──
+    if total_n and not dry_run:
+        total_bytes=sum(_folder_size(c) for c in candidates)
+        out(f"\n  {C.BOLD}Ready to process {total_n} folder(s) ({_human_size(total_bytes)}){C.RESET}")
+        try:
+            dest_path=clean_albums if clean_albums.exists() else clean_albums.parent
+            free_bytes=shutil.disk_usage(dest_path).free
+            if total_bytes > free_bytes * 0.9:
+                out(f"  {C.YELLOW}Low disk space! Need ~{_human_size(total_bytes)}, only {_human_size(free_bytes)} free.{C.RESET}")
+        except OSError:
+            pass
+        try:
+            answer=input(f"  Continue? [y/N] ").strip().lower()
+        except (EOFError,KeyboardInterrupt):
+            answer=""
+        if answer != "y":
+            out(f"  {C.DIM}Cancelled.{C.RESET}"); return
+
     _get_tag_cache(cfg)
 
     # ── Streaming pipeline ─────────────────────────────────────────
@@ -5689,7 +5941,7 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     # lookahead controls queue maxsize — scanner runs this many folders ahead
     scanner_queue:_queue.Queue=_queue.Queue(maxsize=max(1,lookahead))
     all_proposals:List[FolderProposal]=[]
-    total_clean=0; total_review=0; total_dup=0; total_merged=0; total_artifacts=0
+    total_clean=0; total_review=0; total_dup=0; total_merged=0; total_artifacts=0; total_failed=0
     prog=Progress(total_n,"Processing")
 
     def _scan_one(rp:Path)->Optional[FolderProposal]:
@@ -5889,6 +6141,7 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
                                                        session_id=session_id)
                 except RuntimeError as e:
                     err(f"  [{folder_idx}/{total_n}]  ⛔ FAILED  {p.folder_name}: {e}")
+                    total_failed+=1
 
         # Tally
         if   p.destination=="clean":     total_clean+=1
@@ -5909,10 +6162,14 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     _write_session_reports(session_id,profile,source_root,all_proposals,session_dir,cfg)
 
     merged_tag=f"  {C.CYAN}Merged: {total_merged}{C.RESET}" if total_merged else ""
+    fail_tag=f" | {C.RED}Failed: {total_failed}{C.RESET}" if total_failed else ""
     art_tag=f"  {C.DIM}Artifacts quarantined: {total_artifacts}{C.RESET}" if total_artifacts else ""
     out(f"\n{C.BOLD}Results:{C.RESET}   {len(all_proposals)} processed | "
         f"{C.GREEN}Clean: {total_clean}{C.RESET} | {C.YELLOW}Review: {total_review}{C.RESET} | "
-        f"{C.RED}Dupes: {total_dup}{C.RESET}{merged_tag}")
+        f"{C.RED}Dupes: {total_dup}{C.RESET}{merged_tag}{fail_tag}")
+    if total_failed:
+        out(f"  {C.YELLOW}⚠ {total_failed} folder(s) failed. Successfully moved folders can be undone:{C.RESET}")
+        out(f"  raagdosa undo --session {session_id}")
     if art_tag: out(art_tag)
     out(f"{C.DIM}Reports:   {session_dir}/report.{{txt,csv,html}}{C.RESET}")
     manifest_set_last_run(cfg)
@@ -6119,11 +6376,12 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
 
             while True:
                 if p.confidence<0.50:
-                    print(f"  {C.DIM}z:move  x:reject  c:skip  space:tracks  e:album-title  e<N>:track-title  ?:more  ({tally}){C.RESET}")
+                    print(f"  {C.DIM}z:move  x:reject  c:skip  space:tracks  e:edit  o:finder  R:rescan  ?:more  ({tally}){C.RESET}")
                 else:
-                    print(f"  z:move  x:reject  c:skip  space:tracks  e:album-title  e<N>:track-title  ?:more  ({tally})")
+                    print(f"  z:move  x:reject  c:skip  space:tracks  e:edit  o:finder  R:rescan  ?:more  ({tally})")
                 try:
-                    choice=input(f"  > ").strip().lower()
+                    _raw=input(f"  > ").strip()
+                    choice=_raw if _raw in ("R",) else _raw.lower()
                 except (EOFError,KeyboardInterrupt):
                     choice="q"
 
@@ -6250,6 +6508,36 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
 
                 elif choice==" ":
                     _display_tracks(p,cfg)
+
+                elif choice=="o":
+                    _open_in_finder(rp)
+
+                elif choice in ("R",) or (choice in ("rescan",)):
+                    # Rescan folder after manual changes in Finder
+                    if not rp.exists():
+                        print(f"  {C.RED}Folder no longer exists.{C.RESET}"); break
+                    print(f"  {C.CYAN}Rescanning...{C.RESET}")
+                    audio_files=list_audio_files(rp,exts,follow_sym)
+                    if len(audio_files)<min_tracks:
+                        print(f"  {C.YELLOW}Only {len(audio_files)} audio file(s) remain — below minimum ({min_tracks}).{C.RESET}")
+                        print(f"  {C.DIM}Skip this folder? [y/N]{C.RESET}")
+                        skip_confirm=input(f"  > ").strip().lower()
+                        if skip_confirm in ("y","yes"):
+                            skipped_count+=1; break
+                        continue
+                    new_p=build_folder_proposal(rp,audio_files,source_root,profile_obj,cfg)
+                    if new_p is None:
+                        print(f"  {C.YELLOW}Folder no longer qualifies after rescan.{C.RESET}"); break
+                    _route_proposal(new_p,cfg,seen_names,existing_clean,manifest_entries,
+                                    review_albums,dup_root,mixes_root)
+                    # Replace current proposal
+                    p=new_p
+                    # Rebuild track file list
+                    _stream_track_files=sorted([f for f in rp.iterdir() if f.suffix.lower() in _tf_exts],key=lambda f:f.name) if rp.exists() else []
+                    # Re-display
+                    _display_folder_card(idx,total,p)
+                    _display_tracks(p,cfg)
+                    print(f"  {C.CYAN}─ RESCANNED ─{C.RESET}  {len(audio_files)} tracks  ·  conf {conf_color(p.confidence)}  → {p.destination.title()}")
 
                 elif choice=="q":
                     stopped=True
@@ -6539,7 +6827,7 @@ def _run_triage(
     Returns all applied move entries.
     """
     rr=cfg.get("review_rules",{})
-    thresh=auto_threshold or float(rr.get("auto_approve_threshold",rr.get("min_confidence_for_clean",0.85)))
+    thresh=auto_threshold or float(rr.get("auto_approve_threshold",rr.get("min_confidence_for_clean",0.90)))
     thresh=max(thresh,float(rr.get("min_confidence_for_clean",0.85)))  # never below clean floor
 
     triage=_triage_proposals(proposals,thresh)
@@ -6588,7 +6876,7 @@ def _run_triage(
     return applied
 
 
-def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,review_threshold:Optional[float]=None,sort_by:str="name",force:bool=False,auto_above:Optional[float]=None)->None:
+def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool,since:Optional[str],perf_tier:Optional[str]=None,genre_roots:Optional[List[str]]=None,itunes_mode:bool=False,review_threshold:Optional[float]=None,sort_by:str="name",force:bool=False,auto_above:Optional[float]=None,session_name:str="")->None:
     """
     v7.1 default path: scan all → triage dashboard → bulk-approve → interactive review.
     --force: bypass triage, use original streaming pipeline (nuclear option).
@@ -6635,7 +6923,7 @@ def cmd_go(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:
 
     # Full scan — builds all proposals before any moves
     since_dt=_parse_since(since,cfg)
-    _,_,proposals=scan_folders(cfg,profile,since=since_dt,genre_roots=genre_roots,itunes_mode=itunes_mode)
+    _,_,proposals=scan_folders(cfg,profile,since=since_dt,genre_roots=genre_roots,itunes_mode=itunes_mode,session_name=session_name)
 
     if not proposals:
         out(f"  {C.DIM}No candidates found.{C.RESET}"); manifest_set_last_run(cfg); return
@@ -7143,44 +7431,6 @@ def cmd_genre(cfg_path: Path, cfg: Dict[str, Any], action: str, name: Optional[s
 def _is_itunes_genre_bucket(name: str) -> bool:
     return name in _ITUNES_GENRE_BUCKETS
 
-def flatten_itunes_hierarchy(source_root: Path, cfg: Dict[str, Any], dry_run: bool = False) -> int:
-    """
-    Flatten iTunes-style Genre/Artist/Album structure.
-    Strips the Genre layer so Artist/Album is at source_root level.
-    Returns count of folders moved.
-    """
-    moved = 0
-    for genre_dir in sorted(source_root.iterdir()):
-        if not genre_dir.is_dir(): continue
-        if not _is_itunes_genre_bucket(genre_dir.name): continue
-        out(f"  [iTunes] Flattening genre bucket: {genre_dir.name}", level=VERBOSE)
-        for artist_dir in sorted(genre_dir.iterdir()):
-            if not artist_dir.is_dir(): continue
-            dst = source_root / artist_dir.name
-            if dry_run:
-                out(f"    [dry-run] {genre_dir.name}/{artist_dir.name} → {artist_dir.name}")
-            else:
-                if dst.exists():
-                    # Merge: move each child of artist_dir into dst
-                    for child in artist_dir.iterdir():
-                        cdst = dst / child.name
-                        if not cdst.exists():
-                            try: child.rename(cdst)
-                            except Exception as e: warn(f"Could not move {child}: {e}")
-                else:
-                    try:
-                        artist_dir.rename(dst)
-                        moved += 1
-                    except Exception as e:
-                        warn(f"Could not move {artist_dir}: {e}")
-        # Remove the now-empty genre bucket
-        if not dry_run:
-            try:
-                if genre_dir.exists() and not any(genre_dir.iterdir()):
-                    genre_dir.rmdir()
-            except Exception: pass
-    return moved
-
 
 # ═══════════════════════════════════════════════════════════════════
 # v4.1 — tree command
@@ -7371,8 +7621,8 @@ def _extract_catchall_artist(path: Path, cfg: Dict[str, Any]) -> str:
                     v = t.get(key)
                     if isinstance(v, list): v = v[0] if v else None
                     if v: return str(v).strip()
-        except Exception:
-            pass
+        except Exception as e:
+            out(f"  {C.DIM}Tag read failed: {e}{C.RESET}",level=VERBOSE)
     # Filename parse: "Artist - Title.mp3"
     stem = path.stem.strip()
     m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", stem)
@@ -7493,8 +7743,8 @@ def cmd_catchall(
                     if isinstance(alb, list): alb = alb[0] if alb else None
                     if alb:
                         album_groups.setdefault(str(alb).strip(), []).append(af)
-            except Exception:
-                pass
+            except Exception as e:
+                out(f"  {C.DIM}Tag read failed: {e}{C.RESET}",level=VERBOSE)
     for alb_name, alb_files in album_groups.items():
         if len(alb_files) >= 2:
             out(f"  {C.BLUE}[ALBUM?]{C.RESET}  '{alb_name}' — {len(alb_files)} tracks share this album tag")
@@ -7578,6 +7828,7 @@ Examples:
     sc=sub.add_parser("scan",help="Scan → proposals.json"); sc.add_argument("--profile"); sc.add_argument("--out"); sc.add_argument("--since")
     sc.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
     sc.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
+    sc.add_argument("--session-name",metavar="NAME",help="Human-friendly session name (e.g. 'Bandcamp Friday')")
     ap=sub.add_parser("apply",help="Apply proposals.json"); ap.add_argument("proposals",nargs="?"); ap.add_argument("--last-session",action="store_true"); ap.add_argument("--interactive",action="store_true"); ap.add_argument("--auto-above",type=float); ap.add_argument("--dry-run",action="store_true")
     for nc in ("run","go"):
         c=sub.add_parser(nc,help="Scan + apply (folders + tracks)")
@@ -7590,6 +7841,7 @@ Examples:
         c.add_argument("--sort",choices=["name","date-created","date-modified"],default="name",help="Interactive: folder sort order (default: name)")
         c.add_argument("--force",action="store_true",help="Nuclear option: bypass triage, process all folders without confirmation (original streaming behaviour)")
         c.add_argument("--auto-above",type=float,metavar="SCORE",dest="auto_above",help="Override auto-approve threshold for triage (default: review_rules.auto_approve_threshold)")
+        c.add_argument("--session-name",metavar="NAME",help="Human-friendly session name (e.g. 'Bandcamp Friday')")
     fo=sub.add_parser("folders",help="Folder pass only"); fo.add_argument("--profile"); fo.add_argument("--interactive",action="store_true"); fo.add_argument("--dry-run",action="store_true"); fo.add_argument("--since")
     fo.add_argument("--genre-roots",metavar="ROOTS"); fo.add_argument("--itunes",action="store_true")
     fo.add_argument("--sort",choices=["name","date-created","date-modified"],default="name",help="Interactive: folder sort order")
@@ -7602,7 +7854,7 @@ Examples:
     rp=sub.add_parser("report",help="View session report"); rp.add_argument("--session"); rp.add_argument("--format",default="txt",choices=["txt","csv","html"])
     sub.add_parser("doctor",help="Check config, deps, disk, DJ databases")
     hi=sub.add_parser("history",help="Show history"); hi.add_argument("--last",type=int,default=50); hi.add_argument("--session"); hi.add_argument("--match"); hi.add_argument("--tracks",action="store_true")
-    un=sub.add_parser("undo",help="Undo moves or renames"); un.add_argument("--id"); un.add_argument("--session"); un.add_argument("--from-path"); un.add_argument("--tracks",action="store_true"); un.add_argument("--folder")
+    un=sub.add_parser("undo",help="Undo moves or renames"); un.add_argument("--id"); un.add_argument("--session"); un.add_argument("--last",action="store_true",help="Undo last session (shortcut for --session last)"); un.add_argument("--from-path"); un.add_argument("--tracks",action="store_true"); un.add_argument("--folder")
     se=sub.add_parser("sessions",help="List recent sessions with move counts"); se.add_argument("--last",type=int,default=20)
 
     # dump-tree command (legacy)
@@ -7684,6 +7936,22 @@ def main()->None:
     cfg_path=Path(args.config); cmd=args.cmd
     if cmd=="init": cmd_init(cfg_path); return
     cfg=load_config_with_paths(cfg_path)
+    _validate_config(cfg)
+    # Human-friendly check: warn if no profiles have source_root configured
+    profiles_cfg=cfg.get("profiles",{})
+    has_source=any(isinstance(p,dict) and "source_root" in p for p in profiles_cfg.values())
+    if not has_source:
+        paths_file=cfg_path.parent/"paths.local.yaml"
+        example_file=cfg_path.parent/"paths.local.example.yaml"
+        if not paths_file.exists():
+            err(f"No source paths configured — paths.local.yaml not found.")
+            out(f"  To get started:")
+            if example_file.exists():
+                out(f"    cp {example_file} {paths_file}")
+            else:
+                out(f"    Create {paths_file} with your source_root paths.")
+            out(f"    Then edit it to point at your music folders.")
+            sys.exit(2)
     def gp()->str:
         p=getattr(args,"profile",None) or cfg.get("active_profile")
         if not p: raise ValueError("No profile specified and no active_profile set.")
@@ -7702,14 +7970,14 @@ def main()->None:
         elif tc=="show": cmd_template_show(cfg,args.name)
     elif cmd=="scan":
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
-        cmd_scan(cfg_path,cfg,gp(),args.out,getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)))
+        cmd_scan(cfg_path,cfg,gp(),args.out,getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),session_name=getattr(args,"session_name","") or "")
     elif cmd=="apply":
         pp=load_last_session(cfg) if args.last_session else (Path(args.proposals) if args.proposals else None)
         if not pp: err("Provide proposals.json or --last-session"); sys.exit(1)
         cmd_apply(cfg,pp,interactive=bool(args.interactive),auto_above=args.auto_above,dry_run=bool(args.dry_run))
     elif cmd in("run","go"):
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
-        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),review_threshold=getattr(args,"threshold",None),sort_by=getattr(args,"sort","name"),force=bool(getattr(args,"force",False)),auto_above=getattr(args,"auto_above",None))
+        cmd_go(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),perf_tier=getattr(args,"performance",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),review_threshold=getattr(args,"threshold",None),sort_by=getattr(args,"sort","name"),force=bool(getattr(args,"force",False)),auto_above=getattr(args,"auto_above",None),session_name=getattr(args,"session_name","") or "")
     elif cmd=="folders":
         gr=_parse_genre_roots_arg(getattr(args,"genre_roots",None))
         cmd_folders_only(cfg_path,cfg,gp(),interactive=bool(args.interactive),dry_run=bool(args.dry_run),since=getattr(args,"since",None),genre_roots=gr,itunes_mode=bool(getattr(args,"itunes",False)),sort_by=getattr(args,"sort","name"))
@@ -7722,7 +7990,7 @@ def main()->None:
     elif cmd=="report":   cmd_report(cfg,getattr(args,"session",None),args.format)
     elif cmd=="doctor":   cmd_doctor(cfg_path,cfg)
     elif cmd=="history":  cmd_history(cfg,last=args.last,session=args.session,match=args.match,tracks=bool(args.tracks))
-    elif cmd=="undo":     cmd_undo(cfg,action_id=args.id,session_id=args.session,from_path=args.from_path,tracks=bool(args.tracks),folder=args.folder)
+    elif cmd=="undo":     cmd_undo(cfg,action_id=args.id,session_id=("last" if getattr(args,"last",False) else args.session),from_path=args.from_path,tracks=bool(args.tracks),folder=args.folder)
     elif cmd=="sessions": cmd_sessions(cfg,last=getattr(args,"last",20))
     elif cmd=="dump-tree":
         cmd_dump_tree(
