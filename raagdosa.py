@@ -49,7 +49,7 @@ try:
     from importlib.metadata import version as _pkg_version
     APP_VERSION = _pkg_version("raagdosa")
 except Exception:
-    APP_VERSION = "8.0.0"
+    APP_VERSION = "9.0.0"
 
 # ─────────────────────────────────────────────────────────────────
 # Hardware performance tiers
@@ -646,6 +646,11 @@ def normalize_artist_name(name:str,cfg:Dict[str,Any])->str:
     for alias_key,canonical in merged_aliases.items():
         if alias_key.lower()==s.lower(): return canonical
 
+    # Connector variants: +, and, ×, feat, ft → &
+    s=_normalize_connectors(s)
+    # Restore proper spacing around &
+    s=re.sub(r'\s*&\s*',' & ',s)
+
     # Hyphen variants → ASCII hyphen
     if acfg.get("normalize_hyphens",True):
         s=re.sub(r"[\u2013\u2014\u2010\u2212]","-",s)
@@ -661,12 +666,33 @@ def normalize_artist_name(name:str,cfg:Dict[str,Any])->str:
 
     return s
 
+_CONNECTOR_NORM_PAT=re.compile(r'\s*[&+×]\s*|\s+(?:and|vs\.?|versus|feat\.?|featuring|ft\.?)\s+',re.I)
+
+def _normalize_connectors(s:str)->str:
+    """Normalise collaboration connectors: &, +, ×, and, vs, feat → ' & '."""
+    return _CONNECTOR_NORM_PAT.sub(" & ",s).strip()
+
 def artists_are_same(a:str,b:str,cfg:Dict[str,Any])->bool:
     thresh=float(cfg.get("artist_normalization",{}).get("fuzzy_dedup_threshold",0.92))
     an=normalize_unicode(a.strip().lower()); bn=normalize_unicode(b.strip().lower())
     if an==bn: return True
+    # Normalise connectors before comparison (& / + / and / vs / feat)
+    an=_normalize_connectors(an); bn=_normalize_connectors(bn)
+    if an==bn: return True
     ac=re.sub(r"^the\s+","",an); bc=re.sub(r"^the\s+","",bn)
     if ac==bc: return True
+    # Collab order: "A & B" == "B & A" — split on &, sort parts, compare
+    if " & " in ac and " & " in bc:
+        a_parts=sorted(p.strip() for p in ac.split(" & "))
+        b_parts=sorted(p.strip() for p in bc.split(" & "))
+        if a_parts==b_parts: return True
+    # Lowest priority: comma-separated collabs ("Rusko, Caspa" == "Caspa & Rusko")
+    # Only attempt when at least one side has a comma and the other has a connector
+    if ("," in ac or "," in bc) and (" & " in ac or " & " in bc or "," in ac and "," in bc):
+        def _split_collab(s:str)->List[str]:
+            # Split on commas or &, normalize each part
+            return sorted(p.strip() for p in re.split(r'\s*[,&]\s*',s) if p.strip())
+        if _split_collab(ac)==_split_collab(bc): return True
     aset=set(ac.split()); bset=set(bc.split())
     if not aset or not bset: return False
     return len(aset&bset)/len(aset|bset)>=thresh
@@ -1374,7 +1400,7 @@ def resolve_library_path(base:Path,artist:str,album:str,year:Optional[int],
     lib=_resolve_lib_cfg(profile or {},cfg)
     template=lib.get("template","{artist}/{album}")
     va_folder=lib.get("va_folder","_Various Artists")
-    singles_folder=lib.get("singles_folder","_Singles")
+    singles_folder=lib.get("singles_folder","Singles")
     mixes_folder=lib.get("mixes_folder","_Mixes")
     unknown=lib.get("unknown_artist_label","_Unknown")
     flac_seg=bool(lib.get("flac_segregation",False))
@@ -1672,7 +1698,7 @@ def derive_review_albums_root(profile:Dict,source_root:Path)->Path:
 def derive_duplicates_root(profile:Dict,source_root:Path)->Path:
     return derive_review_root(profile,source_root)/_rname(profile,"duplicates_folder_name","Duplicates")
 
-def ensure_roots(profile:Dict,source_root:Path)->Dict[str,Path]:
+def ensure_roots(profile:Dict,source_root:Path,create:bool=True)->Dict[str,Path]:
     roots={
         "clean_root":    derive_clean_root(profile,source_root),
         "review_root":   derive_review_root(profile,source_root),
@@ -1682,7 +1708,8 @@ def ensure_roots(profile:Dict,source_root:Path)->Dict[str,Path]:
         "duplicates":    derive_duplicates_root(profile,source_root),
         "review_orphans":derive_review_root(profile,source_root)/_rname(profile,"orphans_folder_name","Orphans"),
     }
-    for p in roots.values(): ensure_dir(p)
+    if create:
+        for p in roots.values(): ensure_dir(p)
     return roots
 
 def setup_logging_paths(cfg:Dict[str,Any],profile:Dict[str,Any],source_root:Path,profile_name:str="")->None:
@@ -1765,7 +1792,7 @@ def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
         if cached is not None: return cached
 
     keys=cfg.get("tags",{})
-    result:Dict[str,Optional[str]]={k:None for k in ["album","albumartist","artist","title","tracknumber","discnumber","year","bpm","key","genre","label"]}
+    result:Dict[str,Optional[str]]={k:None for k in ["album","albumartist","artist","title","tracknumber","discnumber","year","bpm","key","genre","label","compilation"]}
     if MutagenFile is None: return result
     try:
         mf=MutagenFile(str(path),easy=True)
@@ -1783,6 +1810,10 @@ def read_audio_tags(path:Path,cfg:Dict[str,Any])->Dict[str,Optional[str]]:
         result["key"]        =mutagen_first(t,keys.get("key_keys",["initialkey","key"]))
         result["genre"]      =mutagen_first(t,keys.get("genre_keys",["genre"]))
         result["label"]      =mutagen_first(t,keys.get("label_keys",["organization","label","publisher"]))
+        # v9.0: compilation flag for DJ crate detection
+        _comp_val=mutagen_first(t,["compilation","TCMP","cpil"])
+        if _comp_val and str(_comp_val).strip() in ("1","true","True","yes","Yes"):
+            result["compilation"]="1"
         for yk in keys.get("year_keys_prefer",["date","year"]):
             if yk in t:
                 yv=t.get(yk); yv=yv[0] if isinstance(yv,list) else yv
@@ -2514,6 +2545,563 @@ def recover_display(norm_key:Optional[str],raw_by_norm:Dict[str,Counter])->Optio
     rc=raw_by_norm.get(norm_key)
     return rc.most_common(1)[0][0] if rc else norm_key
 
+# ─────────────────────────────────────────────
+# v9.0 — DJ Crate detection
+# ─────────────────────────────────────────────
+_CRATE_FOLDER_KW_DEFAULTS=["singles","unsorted","to sort","downloads","incoming",
+    "misc","dump","random","temp","new music","promos","edits","tools","bangers"]
+
+def _is_unknown_album(album:str,cfg:Dict[str,Any])->bool:
+    """Return True if album tag is blank or matches an unknown-album placeholder."""
+    if not album or not album.strip(): return True
+    dc=cfg.get("djcrates",{})
+    patterns=[p.lower() for p in dc.get("unknown_album_patterns",["unknown album","untitled",""])]
+    return album.strip().lower() in patterns
+
+def _folder_matches_set_patterns(folder_name:str,cfg:Dict[str,Any])->bool:
+    """Return True if folder name matches set/gig prep patterns."""
+    dc=cfg.get("djcrates",{})
+    patterns=dc.get("keep_intact_patterns",[])
+    custom=dc.get("custom_set_patterns",[])
+    for pat in patterns+custom:
+        try:
+            if re.search(pat,folder_name): return True
+        except re.error: pass
+    return False
+
+def _folder_matches_crate_keywords(folder_name:str,cfg:Dict[str,Any])->float:
+    """Return 1.0 if folder name matches crate keywords, 0.0 otherwise."""
+    dc=cfg.get("djcrates",{})
+    kw_list=dc.get("folder_name_patterns",_CRATE_FOLDER_KW_DEFAULTS)
+    fn_lower=folder_name.lower()
+    for kw in kw_list:
+        if kw.lower() in fn_lower: return 1.0
+    # Also check custom regex patterns
+    for pat in dc.get("custom_crate_patterns",[]):
+        try:
+            if re.search(pat,folder_name): return 1.0
+        except re.error: pass
+    return 0.0
+
+def detect_djcrate(
+    folder_name:str,
+    albums_norm:Counter,
+    track_artists_norm:Counter,
+    all_tags:List[Dict[str,Optional[str]]],
+    total_tracks:int,
+    dom_alb_share:float,
+    dom_alb_n:Optional[str],
+    dom_aa_share:float,
+    dom_aa_n:Optional[str],
+    cfg:Dict[str,Any]
+)->Tuple[bool,str,float,str]:
+    """
+    Detect whether a folder is a DJ crate (personal organizational container)
+    rather than a true VA compilation.
+
+    Returns (is_crate, crate_type, crate_confidence, reason)
+    Where crate_type is "singles" | "set" | "unknown".
+
+    v9.0 Phase 1: detection only — no explosion routing.
+    """
+    dc=cfg.get("djcrates",{})
+    if not dc.get("enabled",True):
+        return False,"",0.0,"djcrates_disabled"
+
+    min_tracks=int(dc.get("min_tracks",3))
+    if total_tracks<min_tracks:
+        return False,"",0.0,"too_few_tracks"
+
+    # ── Learned veto patterns (from user corrections) ────────────────────
+    for veto_pat in dc.get("crate_veto_patterns",[]):
+        try:
+            if re.search(veto_pat,folder_name): return False,"",0.0,"learned_veto_pattern"
+        except re.error: pass
+
+    # ── Set prep detection (highest priority for crate sub-type) ──────────
+    if _folder_matches_set_patterns(folder_name,cfg):
+        return True,"set",0.9,"set_prep_pattern_match"
+
+    # ── Hard overrides: NOT a crate ──────────────────────────────────────
+
+    veto_threshold=float(dc.get("album_coherence_veto",0.6))
+
+    # 1. Album coherence veto — real album name at high share
+    if dom_alb_share>=veto_threshold and dom_alb_n and not _is_unknown_album(dom_alb_n,cfg):
+        return False,"",0.0,"album_coherence_veto"
+
+    # 2. Compilation flag veto — intentional compilation
+    comp_flags=[t.get("compilation") for t in all_tags if t.get("compilation")]
+    if total_tracks>0:
+        comp_share=len(comp_flags)/total_tracks
+        if comp_share>=0.7 and dom_alb_share>=0.5:
+            return False,"",0.0,"compilation_flag_veto"
+
+    # 3. Properly tagged VA — albumartist=VA + album share >= 0.5
+    _va_kws={"various artists","various","va","v/a","v.a.","v.a","vvaa"}
+    if dom_aa_n and dom_aa_n.lower() in _va_kws and dom_aa_share>=0.8 and dom_alb_share>=0.5:
+        return False,"",0.0,"properly_tagged_va"
+
+    # 4. Sequential track numbering — no gaps, no dupes = intentional release
+    track_nums:List[int]=[]
+    for t in all_tags:
+        tn=t.get("tracknumber")
+        if tn:
+            m=re.match(r"(\d+)",str(tn))
+            if m:
+                try: track_nums.append(int(m.group(1)))
+                except ValueError: pass
+    if len(track_nums)>=total_tracks*0.8 and total_tracks>=3:
+        sorted_nums=sorted(track_nums)
+        unique_nums=sorted(set(track_nums))
+        has_dupes=len(track_nums)!=len(unique_nums)
+        gaps=detect_track_gaps(unique_nums)
+        if not has_dupes and not gaps and unique_nums==list(range(unique_nums[0],unique_nums[-1]+1)):
+            return False,"",0.0,"sequential_tracks_veto"
+
+    # ── Weighted scoring ─────────────────────────────────────────────────
+    # Signal 1: Album diversity (weight 0.35)
+    # Count unique album tags — blank/unknown each count as unique
+    effective_unique=0
+    if total_tracks>0:
+        blank_count=sum(1 for t in all_tags if _is_unknown_album(t.get("album",""),cfg))
+        real_albums=set()
+        for t in all_tags:
+            alb=(t.get("album") or "").strip()
+            if alb and not _is_unknown_album(alb,cfg):
+                real_albums.add(normalize_for_vote(alb,cfg))
+        effective_unique=len(real_albums)+blank_count
+    album_diversity=min(1.0,effective_unique/max(total_tracks,1))
+    s_album_diversity=album_diversity*0.35
+
+    # Signal 2: Album quality (weight 0.20)
+    # Fraction of tracks with blank/unknown/folder-echo album tags
+    low_quality_count=0
+    fn_lower=folder_name.lower().strip()
+    for t in all_tags:
+        alb=(t.get("album") or "").strip()
+        if _is_unknown_album(alb,cfg):
+            low_quality_count+=1
+        elif alb.lower().strip()==fn_lower:
+            low_quality_count+=1  # album tag just echoes folder name
+    album_quality=low_quality_count/max(total_tracks,1)
+    s_album_quality=album_quality*0.20
+
+    # Signal 3: Track number incoherence (weight 0.15)
+    if track_nums and total_tracks>=3:
+        gaps_list=detect_track_gaps(sorted(set(track_nums)))
+        gap_ratio=len(gaps_list)/max(total_tracks,1)
+        dupe_count=len(track_nums)-len(set(track_nums))
+        dupe_ratio=dupe_count/max(total_tracks,1)
+        no_tn_ratio=(total_tracks-len(track_nums))/max(total_tracks,1)
+        track_incoherence=min(1.0,gap_ratio+dupe_ratio+no_tn_ratio)
+    elif not track_nums:
+        track_incoherence=1.0  # no track numbers at all = maximum incoherence
+    else:
+        track_incoherence=0.5
+    s_track_incoherence=track_incoherence*0.15
+
+    # Signal 4: Folder name keywords (weight 0.15)
+    kw_match=_folder_matches_crate_keywords(folder_name,cfg)
+    s_folder_keywords=kw_match*0.15
+
+    # Signal 5: Compilation flag absence (weight 0.15)
+    if total_tracks>0:
+        comp_absent=(total_tracks-len(comp_flags))/total_tracks
+    else:
+        comp_absent=1.0
+    s_comp_absent=comp_absent*0.15
+
+    total_score=s_album_diversity+s_album_quality+s_track_incoherence+s_folder_keywords+s_comp_absent
+
+    # Known label match — raise threshold if album/folder matches known labels
+    threshold=float(dc.get("detection_threshold",0.55))
+    known_labels=[l.lower() for l in cfg.get("reference",{}).get("known_labels",[]) if l]
+    if known_labels and dom_alb_n:
+        if any(lab in dom_alb_n.lower() for lab in known_labels):
+            threshold=0.85
+
+    if total_score>=threshold:
+        reason_parts=[]
+        if s_album_diversity>0.15: reason_parts.append(f"album_diversity({album_diversity:.2f})")
+        if s_album_quality>0.10: reason_parts.append(f"album_quality({album_quality:.2f})")
+        if s_track_incoherence>0.07: reason_parts.append(f"track_incoherence({track_incoherence:.2f})")
+        if kw_match>0: reason_parts.append("folder_keyword_match")
+        if s_comp_absent>0.10: reason_parts.append("no_compilation_flags")
+        reason=", ".join(reason_parts) if reason_parts else "score_above_threshold"
+        return True,"singles",total_score,reason
+
+    return False,"",total_score,"score_below_threshold"
+
+# ─────────────────────────────────────────────
+# v9.0 — DJ Crate explosion plan & execution
+# ─────────────────────────────────────────────
+@dataclasses.dataclass
+class CrateTrackPlan:
+    """Per-track routing plan within a crate explosion."""
+    source_path:str
+    filename:str
+    artist:Optional[str]
+    title:Optional[str]
+    target_path:str
+    destination:str         # "clean" or "review"
+    confidence:float
+    reason:str              # why this track goes to review vs clean
+    embedded_release:Optional[str]=None  # v9.0 Phase 3: album name if part of embedded release
+    track_number:Optional[int]=None      # track number within embedded release
+
+@dataclasses.dataclass
+class EmbeddedRelease:
+    """A coherent album/EP found embedded within a DJ crate."""
+    artist:str              # normalized artist name
+    artist_display:str      # display form
+    album:str               # normalized album name
+    album_display:str       # display form
+    tracks:List[Path]       # audio files belonging to this release
+    track_numbers:List[int] # track numbers (sorted)
+    total_in_album:Optional[int]  # total tracks if known (from "X/Y" format), else None
+    is_partial:bool         # True if not all tracks present
+
+def _normalize_album_for_cluster(album:str,cfg:Dict[str,Any])->str:
+    """Normalize album name for clustering: strip EP/LP suffix, lowercase, strip punctuation."""
+    if not album: return ""
+    a=album.strip().lower()
+    # Strip common suffixes: EP, LP, E.P., etc.
+    a=re.sub(r'\s*[\[\(]\s*e\.?p\.?\s*[\]\)]\s*$','',a,flags=re.I)
+    a=re.sub(r'\s+e\.?p\.?\s*$','',a,flags=re.I)
+    a=re.sub(r'\s*[\[\(]\s*l\.?p\.?\s*[\]\)]\s*$','',a,flags=re.I)
+    a=re.sub(r'\s+l\.?p\.?\s*$','',a,flags=re.I)
+    # Strip punctuation for matching
+    a=re.sub(r'[^\w\s]','',a).strip()
+    # Collapse whitespace
+    a=re.sub(r'\s+',' ',a)
+    return a
+
+def detect_embedded_releases(
+    audio_files:List[Path],
+    cfg:Dict[str,Any],
+    min_tracks:int=3
+)->Tuple[List[EmbeddedRelease],Set[str]]:
+    """
+    Detect coherent album/EP releases hidden within a DJ crate.
+
+    Groups tracks by (normalized_artist, normalized_album). Clusters with
+    min_tracks+ tracks, non-placeholder album, and near-sequential track
+    numbers are flagged as embedded releases.
+
+    Returns (releases, release_file_paths) where release_file_paths is a set
+    of str(Path) for quick membership checks.
+
+    v9.0 Phase 3.
+    """
+    dc=cfg.get("djcrates",{})
+    # Group tracks by (artist_norm, album_norm)
+    groups:Dict[Tuple[str,str],List[Tuple[Path,Dict[str,Optional[str]]]]]={}
+    for f in audio_files:
+        tags=read_audio_tags(f,cfg)
+        artist_raw=(tags.get("artist") or "").strip()
+        album_raw=(tags.get("album") or "").strip()
+        if not artist_raw or not album_raw: continue
+        if _is_unknown_album(album_raw,cfg): continue
+
+        artist_n=normalize_for_vote(artist_raw,cfg)
+        album_n=_normalize_album_for_cluster(album_raw,cfg)
+        if not artist_n or not album_n: continue
+        groups.setdefault((artist_n,album_n),[]).append((f,tags))
+
+    releases:List[EmbeddedRelease]=[]
+    release_paths:Set[str]=set()
+
+    for (artist_n,album_n),tracks_and_tags in groups.items():
+        if len(tracks_and_tags)<min_tracks: continue
+
+        # Extract track numbers
+        track_nums:List[Tuple[int,Path,Dict]]=[]
+        total_in_album:Optional[int]=None
+        for f,tags in tracks_and_tags:
+            tn_raw=tags.get("tracknumber","")
+            if not tn_raw: continue
+            tn_str=str(tn_raw).strip()
+            # Handle "X/Y" format
+            m=re.match(r"(\d+)\s*/\s*(\d+)",tn_str)
+            if m:
+                try:
+                    num=int(m.group(1))
+                    tot=int(m.group(2))
+                    if total_in_album is None: total_in_album=tot
+                    track_nums.append((num,f,tags))
+                except ValueError: pass
+                continue
+            m2=re.match(r"(\d+)",tn_str)
+            if m2:
+                try: track_nums.append((int(m2.group(1)),f,tags))
+                except ValueError: pass
+
+        if len(track_nums)<min_tracks: continue
+
+        # Check for near-sequential numbering (allow 1 gap)
+        nums_sorted=sorted(set(n for n,_,_ in track_nums))
+        if len(nums_sorted)<min_tracks: continue  # dupes reduced count below threshold
+
+        # Compute gaps
+        expected_range=list(range(nums_sorted[0],nums_sorted[-1]+1))
+        gaps=[n for n in expected_range if n not in nums_sorted]
+        max_allowed_gaps=max(1,len(nums_sorted)//4)  # allow ~25% gaps for partial albums
+
+        if len(gaps)>max_allowed_gaps: continue  # too many gaps — not a coherent release
+
+        # Check for duplicates (multiple tracks claiming same number)
+        num_counts=Counter(n for n,_,_ in track_nums)
+        if any(c>1 for c in num_counts.values()): continue  # dupes = not a clean release
+
+        # Build the release
+        # Get display forms from first track's tags
+        first_tags=tracks_and_tags[0][1]
+        artist_display=normalize_artist_name((first_tags.get("artist") or "").strip(),cfg) or artist_n
+        album_display=(first_tags.get("album") or "").strip()
+
+        is_partial=False
+        if total_in_album and len(nums_sorted)<total_in_album:
+            is_partial=True
+        elif not total_in_album and gaps:
+            is_partial=True
+
+        release_files=[f for _,f,_ in sorted(track_nums)]
+        release_nums=[n for n,_,_ in sorted(track_nums)]
+
+        rel=EmbeddedRelease(
+            artist=artist_n,artist_display=artist_display,
+            album=album_n,album_display=album_display,
+            tracks=release_files,track_numbers=release_nums,
+            total_in_album=total_in_album,is_partial=is_partial)
+        releases.append(rel)
+        for f in release_files:
+            release_paths.add(str(f))
+
+    return releases,release_paths
+
+def build_crate_explosion_plan(
+    folder:Path,
+    audio_files:List[Path],
+    cfg:Dict[str,Any],
+    profile:Dict[str,Any],
+    source_root:Path,
+    crate_confidence:float
+)->Tuple[List[CrateTrackPlan],List[EmbeddedRelease]]:
+    """
+    Build per-track routing plan for a DJ crate.
+    Singles route to {base}/{Artist}/Singles/{filename}.
+    Embedded releases route to {base}/{Artist}/{Album}/NN - Title.ext.
+
+    v9.0 Phase 2+3: explosion routing with embedded release detection.
+
+    Returns (plans, embedded_releases).
+    """
+    lib=_resolve_lib_cfg(profile,cfg)
+    singles_folder=lib.get("singles_folder","Singles")
+    unknown_label=lib.get("unknown_artist_label","_Unknown")
+    dc=cfg.get("djcrates",{})
+    default_routing=dc.get("default_routing","review")
+
+    # Determine base paths
+    clean_albums=derive_clean_albums_root(profile,source_root)
+    review_albums=derive_review_albums_root(profile,source_root)
+
+    # Phase 3: detect embedded releases first
+    embedded_releases,release_paths=detect_embedded_releases(audio_files,cfg)
+
+    # Build a lookup: file path -> (release, track_number) for embedded release tracks
+    _release_lookup:Dict[str,Tuple[EmbeddedRelease,int]]={}
+    for rel in embedded_releases:
+        for f,tn in zip(rel.tracks,rel.track_numbers):
+            _release_lookup[str(f)]=(rel,tn)
+
+    plans:List[CrateTrackPlan]=[]
+    for f in sorted(audio_files):
+        tags=read_audio_tags(f,cfg)
+        artist_raw=(tags.get("artist") or "").strip()
+        title_raw=(tags.get("title") or "").strip()
+
+        # Determine artist folder
+        if artist_raw:
+            artist_clean=normalize_artist_name(artist_raw,cfg) or sanitize_name(artist_raw)
+        else:
+            artist_clean=None
+
+        # Per-track confidence
+        t_conf=0.0; t_reasons=[]
+        if artist_raw: t_conf+=0.30
+        else: t_reasons.append("no_artist")
+        if title_raw: t_conf+=0.25
+        else: t_reasons.append("no_title")
+        if tags.get("genre"): t_conf+=0.10
+        if tags.get("year"): t_conf+=0.05
+        if tags.get("bpm"): t_conf+=0.05
+        if artist_raw and not _is_garbage_tag_value(artist_raw): t_conf+=0.15
+        else: t_reasons.append("noisy_artist")
+        if title_raw and not _is_garbage_tag_value(title_raw): t_conf+=0.10
+        else: t_reasons.append("noisy_title")
+        t_conf=min(1.0,t_conf)
+
+        # Route decision
+        min_clean=float(cfg.get("review_rules",{}).get("min_confidence_for_clean",0.85))
+
+        # Check if this track belongs to an embedded release
+        _rel_info=_release_lookup.get(str(f))
+        if _rel_info:
+            rel,track_num=_rel_info
+            # Embedded release: route as album track
+            # Use album-style naming: NN - Title.ext
+            album_display=sanitize_name(rel.album_display)
+            if title_raw:
+                # Zero-pad track number based on total tracks
+                pad=2 if (rel.total_in_album or len(rel.tracks))<100 else 3
+                track_name=f"{track_num:0{pad}d} - {sanitize_name(title_raw)}{f.suffix.lower()}"
+            else:
+                track_name=f.name
+
+            # Embedded releases get a confidence boost — they have album coherence
+            t_conf=min(1.0,t_conf+0.10)
+            if default_routing=="review" or t_conf<min_clean:
+                dest="review"; base=review_albums
+            else:
+                dest="clean"; base=clean_albums
+
+            if artist_clean:
+                target=base/artist_clean/album_display/track_name
+            else:
+                target=base/"_Unsorted"/album_display/track_name
+
+            _partial_note=f" (partial {len(rel.tracks)}/{rel.total_in_album})" if rel.is_partial and rel.total_in_album else ""
+            reason=f"embedded_release: {rel.album_display}{_partial_note}"
+            plans.append(CrateTrackPlan(
+                source_path=str(f),filename=f.name,
+                artist=artist_clean,title=title_raw,
+                target_path=str(target),destination=dest,
+                confidence=t_conf,reason=reason,
+                embedded_release=rel.album_display,track_number=track_num))
+        else:
+            # Regular single — route to Singles/
+            if title_raw:
+                track_name=sanitize_name(title_raw)+f.suffix.lower()
+            else:
+                track_name=f.name
+
+            if default_routing=="review" or not artist_raw or not title_raw or t_conf<min_clean:
+                dest="review"; base=review_albums
+            else:
+                dest="clean"; base=clean_albums
+
+            if artist_clean:
+                target=base/artist_clean/singles_folder/track_name
+            else:
+                target=base/"_Unsorted"/singles_folder/track_name
+
+            reason=", ".join(t_reasons) if t_reasons else "ok"
+            plans.append(CrateTrackPlan(
+                source_path=str(f),filename=f.name,
+                artist=artist_clean,title=title_raw,
+                target_path=str(target),destination=dest,
+                confidence=t_conf,reason=reason))
+
+    return plans,embedded_releases
+
+def _resolve_crate_collision(dst:Path)->Path:
+    """Resolve filename collision by appending a numeric suffix."""
+    if not dst.exists(): return dst
+    n=1
+    while True:
+        cand=dst.with_name(dst.stem+f" ({n})"+dst.suffix)
+        if not cand.exists(): return cand
+        n+=1
+
+def apply_crate_explosion(
+    folder:Path,
+    plans:List[CrateTrackPlan],
+    session_id:str,
+    cfg:Dict[str,Any],
+    dry_run:bool=False,
+    source_root:Optional[Path]=None
+)->List[Dict[str,Any]]:
+    """
+    Execute per-track moves for a crate explosion.
+    Each track is moved individually to its computed target.
+    Returns list of history entries for undo support.
+
+    v9.0 Phase 2.
+    """
+    hist_path=Path(cfg["logging"]["history_log"])
+    skip_path=Path(cfg["logging"]["skipped_log"])
+    applied:List[Dict[str,Any]]=[]
+    use_cs=bool(cfg.get("move",{}).get("use_checksum",False))
+
+    for plan in plans:
+        src=Path(plan.source_path)
+        if not src.exists():
+            append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,
+                "type":"crate_track","reason":"missing_source","src":str(src)})
+            continue
+
+        dst=_resolve_crate_collision(Path(plan.target_path))
+
+        if dry_run:
+            out(f"    {C.DIM}[dry-run]{C.RESET} {src.name}  →  {dst.parent.parent.name}/{dst.parent.name}/{dst.name}  "
+                f"{status_tag(plan.destination)}  conf={conf_color(plan.confidence)}")
+            continue
+
+        ensure_dir(dst.parent)
+        try:
+            # Preserve timestamps
+            src_stat=src.stat()
+            if _same_device(src,dst):
+                src.rename(dst)
+            else:
+                shutil.copy2(str(src),str(dst))
+                src.unlink()
+            # Restore timestamps
+            try: os.utime(str(dst),(src_stat.st_atime,src_stat.st_mtime))
+            except Exception: pass
+            _restore_creation_date(src_stat,dst)
+        except Exception as e:
+            err(f"    ⛔ Track move failed ({src.name}): {e}")
+            append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,
+                "type":"crate_track","reason":f"move_failed:{e}","src":str(src)})
+            continue
+
+        action_id=uuid.uuid4().hex[:10]
+        entry={"action_id":action_id,"timestamp":now_iso(),"session_id":session_id,
+               "type":"crate_explode","move_type":"crate_explode",
+               "original_path":str(src),"original_folder":str(folder),
+               "target_path":str(dst),"destination":plan.destination,
+               "confidence":plan.confidence,"artist":plan.artist,
+               "embedded_release":plan.embedded_release,"track_number":plan.track_number,
+               "source_crate":folder.name,"source_crate_path":str(folder)}
+        append_jsonl(hist_path,entry)
+        applied.append(entry)
+        if plan.embedded_release:
+            out(f"    MOVED {status_tag(plan.destination)} {C.DIM}{src.name}{C.RESET}  →  "
+                f"{dst.parent.parent.name}/{dst.parent.name}/{dst.name}  {C.GREEN}[ALBUM]{C.RESET}  conf={conf_color(plan.confidence)}")
+        else:
+            out(f"    MOVED {status_tag(plan.destination)} {C.DIM}{src.name}{C.RESET}  →  "
+                f"{dst.parent.parent.name}/{dst.parent.name}/{dst.name}  conf={conf_color(plan.confidence)}")
+
+    # Clean up empty source folder after explosion
+    if not dry_run and applied:
+        # Check if source folder is now empty (only non-audio files may remain)
+        remaining=[f for f in folder.iterdir() if f.is_file()]
+        audio_exts=set(cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a",".wav",".aiff",".ogg",".opus"]))
+        remaining_audio=[f for f in remaining if f.suffix.lower() in audio_exts]
+        if not remaining_audio:
+            out(f"    {C.DIM}Source folder empty after explosion{C.RESET}")
+            # Move any leftover non-audio files (artwork, nfo, etc.) to a sidecar
+            if remaining:
+                out(f"    {C.DIM}{len(remaining)} non-audio file(s) remain in source{C.RESET}")
+        if source_root:
+            try: cleanup_empty_parents(folder,source_root)
+            except Exception: pass
+
+    return applied
+
 def detect_va(aa_norm: str, track_artists: Any, cfg: Dict[str, Any]) -> bool:
     """
     Return True if this folder looks like a Various Artists release.
@@ -2671,13 +3259,31 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
             except (TypeError, ValueError): pass
 
     va_label=cfg.get("various_artists",{}).get("label","VA")
+
+    # ── v9.0: DJ Crate detection (runs BEFORE VA detection) ──────────────
+    # If folder is a personal DJ crate, skip VA detection entirely.
+    # Sidecar override takes priority.
+    is_crate=False; crate_type=""; crate_confidence=0.0; crate_reason=""
+    _override_ft=override.get("folder_type","") if override else ""
+    if _override_ft in ("crate_singles","crate_set"):
+        is_crate=True
+        crate_type="set" if _override_ft=="crate_set" else "singles"
+        crate_confidence=1.0; crate_reason="sidecar_override"
+    elif _override_ft not in ("album","va","mix","ep","") and not force_album:
+        pass  # unknown override type — fall through to auto-detection
+    elif not force_album:
+        is_crate,crate_type,crate_confidence,crate_reason=detect_djcrate(
+            folder.name,albums_norm,track_artists_norm,all_tags,total,
+            alb_share,dom_alb_n,aa_share,dom_aa_n,cfg)
+
     # ── VA detection ──────────────────────────────────────────────────────
     # CRITICAL: pass the Counter (not .keys()) so ratio = unique/total tracks.
     # Passing list(Counter.keys()) gives a 1-element list for any single-artist
     # album, yielding ratio=1/1=1.0 ≥ 0.5 → false VA for every real album.
     # v5.5.1: use primary_artists_norm (feat/ft stripped) for VA detection —
     # prevents "Artist feat. X", "Artist feat. Y" from each counting as unique.
-    is_va = detect_va(dom_aa_n or "", primary_artists_norm, cfg)
+    # v9.0: skip VA detection if folder is a DJ crate
+    is_va = False if is_crate else detect_va(dom_aa_n or "", primary_artists_norm, cfg)
 
     # v6.2: folder-name VA prefix override — if folder explicitly starts with
     # "VA -", "VA_", "va -" etc., trust that signal and force VA detection.
@@ -2827,7 +3433,10 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     folder_type=classify_folder_content(audio_files,folder.name,all_tags,cfg)
     is_mix=(folder_type=="mix")
     is_ep =(folder_type=="ep")
-    if is_va and folder_type not in ("mix",): folder_type="va"
+    # v9.0: crate classification overrides VA
+    if is_crate:
+        folder_type="crate_set" if crate_type=="set" else "crate_singles"
+    elif is_va and folder_type not in ("mix",): folder_type="va"
 
     _feat_pat=re.compile(r'\s+(?:feat\.?|ft\.?|featuring)\s+.+$',re.I)
     if is_va:
@@ -2857,7 +3466,12 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
     else:
         artist_for_folder=None
 
-    if not dom_alb or not artist_for_folder: return None
+    # v9.0: crates don't need album/artist for proposal — they use folder name
+    if is_crate:
+        if not dom_alb: dom_alb=folder.name
+        if not artist_for_folder: artist_for_folder=va_label
+    elif not dom_alb or not artist_for_folder:
+        return None
 
     # ── apply title-case fix to album name ──────────────────────────────
     dom_alb=apply_title_case(dom_alb,cfg)
@@ -2961,6 +3575,7 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         "dominant_albumartist":dom_aa_n,"dominant_albumartist_display":dom_aa,"dominant_albumartist_share":aa_share,
         "dominant_artist":dom_art_n,"dominant_artist_share":art_share,
         "is_va":is_va,"is_mix":is_mix,"is_ep":is_ep,"folder_type":folder_type,
+        "is_crate":is_crate,"crate_type":crate_type,"crate_confidence":crate_confidence,"crate_reason":crate_reason,
         "albumartist_display":artist_for_folder,"year":year_val,"year_meta":year_meta,
         "genre":dom_genre,"label":dom_label,"bpm":avg_bpm,"key":dom_key,
         "unreadable_ratio":(unreadable/total) if total else 0.0,
@@ -2968,9 +3583,15 @@ def build_folder_proposal(folder:Path,audio_files:List[Path],source_root:Path,pr
         "garbage_reasons":garbage,"confidence_factors":conf_factors,
         "disc_subfolder":decision_extra_disc,
     }
+    # v9.0: crates always route to Review in Phase 1
+    _dest="clean"
+    if is_crate:
+        _dest="review"
+        # For crates, use the crate confidence as the overall confidence
+        confidence=crate_confidence
     stats=FolderStats(tracks_total=total,tracks_tagged=tagged,tracks_unreadable=unreadable,extensions=dict(extensions),format_duplicates=fmt_dupes)
     return FolderProposal(folder_path=str(folder),folder_name=folder.name,proposed_folder_name=proposed,
-                          target_path=str(target_dir),destination="clean",confidence=float(confidence),decision=decision,stats=stats)
+                          target_path=str(target_dir),destination=_dest,confidence=float(confidence),decision=decision,stats=stats)
 
 # ─────────────────────────────────────────────
 # v7.0 — Review summary & sidecar
@@ -2982,6 +3603,8 @@ _REASON_DESCRIPTIONS:Dict[str,str]={
     "heuristic_fallback":"Name derived from heuristics (no usable tags)",
     "ep":"Detected as EP release",
     "mix_folder":"Detected as DJ mix or chart compilation",
+    "djcrate_singles":"Detected as DJ crate (singles/loose tracks)",
+    "djcrate_set":"Detected as DJ set prep crate (preserved intact)",
 }
 
 _FACTOR_DESCRIPTIONS:Dict[str,str]={
@@ -3108,10 +3731,24 @@ def _route_proposal(p:FolderProposal,cfg:Dict[str,Any],
     if p.decision.get("is_mix") and dest=="clean":
         reasons.append("mix_folder"); ensure_dir(mixes_root)
         p.target_path=str(mixes_root/p.proposed_folder_name)
+    # v9.0: DJ crate routing — always Review in Phase 1
+    if p.decision.get("is_crate"):
+        _ct=p.decision.get("crate_type","singles")
+        dest="review"
+        if _ct=="set":
+            reasons.append("djcrate_set")
+            # Set prep crates go to Review/_Sets/FolderName
+            _sets_folder=cfg.get("djcrates",{}).get("keep_intact_routing","_Sets")
+            p.target_path=str(review_albums.parent/_sets_folder/p.folder_name)
+        else:
+            reasons.append("djcrate_singles")
     p.destination=dest; p.decision["route_reasons"]=reasons
     if reasons:
         p.decision["review_summary"]=_build_review_summary(reasons,p.decision.get("confidence_factors",{}),p.confidence)
-    if dest=="review":    p.target_path=str(review_albums/p.proposed_folder_name)
+    if dest=="review" and not p.decision.get("is_crate"):
+        p.target_path=str(review_albums/p.proposed_folder_name)
+    elif dest=="review" and p.decision.get("is_crate") and p.decision.get("crate_type")!="set":
+        p.target_path=str(review_albums/p.proposed_folder_name)
     elif dest=="duplicate": p.target_path=str(dup_root/p.proposed_folder_name)
     return p
 
@@ -3128,7 +3765,7 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     # v4.1 — resolve effective genre roots (CLI flag + config)
     effective_genre_roots = _resolve_genre_roots(cfg, genre_roots)
 
-    roots=ensure_roots(profile,source_root)
+    roots=ensure_roots(profile,source_root,create=False)
     clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
     # Also skip the wrapper folder itself during walk (it contains Clean/, Review/, logs/)
     wrapper_root_str=str(derive_wrapper_root(profile,source_root).resolve())+os.sep
@@ -3274,6 +3911,39 @@ def scan_folders(cfg:Dict[str,Any],profile_name:str,since:Optional[dt.datetime]=
     if fmt_str:
         out(f"           {C.DIM}{fmt_str}{C.RESET}")
     out(f"{C.BOLD}Routing:{C.RESET}   {C.GREEN}Clean: {clean_n}{C.RESET} | {C.YELLOW}Review: {rev_n}{C.RESET} | {C.RED}Dupes: {dup_n}{C.RESET}")
+    # v9.0: DJ crate summary
+    crate_singles_n=sum(1 for p in proposals if p.decision.get("is_crate") and p.decision.get("crate_type")=="singles")
+    crate_set_n=sum(1 for p in proposals if p.decision.get("is_crate") and p.decision.get("crate_type")=="set")
+    if crate_singles_n or crate_set_n:
+        crate_tracks=sum(p.stats.tracks_total for p in proposals if p.decision.get("is_crate"))
+        parts=[]
+        if crate_singles_n: parts.append(f"singles: {crate_singles_n}")
+        if crate_set_n: parts.append(f"set prep: {crate_set_n}")
+        out(f"{C.BOLD}Crates:{C.RESET}    {', '.join(parts)} ({crate_tracks} tracks)")
+
+    # ── Compact per-folder table (sorted by confidence) ────────────────
+    sorted_props=sorted(proposals,key=lambda p:p.confidence)
+    out(f"\n{C.BOLD}{'Conf':>6}  {'Route':<7}  {'Folder':<45}  {'Tracks':>6}  Format{C.RESET}")
+    out(f"{C.DIM}{'─'*90}{C.RESET}")
+    for p in sorted_props:
+        dest_color=C.GREEN if p.destination=="clean" else (C.YELLOW if p.destination=="review" else C.RED)
+        dest_label={"clean":"Clean","review":"Review","duplicate":"Dupe"}.get(p.destination,p.destination)
+        exts_str="+".join(k.upper().lstrip(".") for k in sorted(p.stats.extensions or {})) or "--"
+        crate_flag=" [CRATE]" if p.decision.get("is_crate") else ""
+        va_flag=" [VA]" if p.decision.get("is_va") else ""
+        flags=f"{crate_flag}{va_flag}"
+        name_display=p.folder_name[:43]+".." if len(p.folder_name)>45 else p.folder_name
+        out(f"  {conf_color(p.confidence):>6}  {dest_color}{dest_label:<7}{C.RESET}  {name_display:<45}  {p.stats.tracks_total:>4}    {exts_str}{flags}")
+        # Verbose: show why confidence is high or low
+        reasons=p.decision.get("route_reasons",[])
+        factors=p.decision.get("confidence_factors",{})
+        if reasons and _verbosity>=VERBOSE:
+            # Show weak factors (below 0.5) and route reasons
+            weak=[f"{_FACTOR_DESCRIPTIONS.get(k,k)}: {v:.0%}" for k,v in factors.items() if v<0.5]
+            reason_strs=[_REASON_DESCRIPTIONS.get(r.split(":")[0],r) for r in reasons]
+            detail_parts=reason_strs+weak
+            if detail_parts:
+                out(f"          {C.DIM}  └ {' · '.join(detail_parts)}{C.RESET}")
 
     # Tag coverage summary — shows how well populated the tags are for the active template
     lib=_resolve_lib_cfg(profile,cfg)
@@ -4248,6 +4918,139 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
                 if halt_dj:
                     prog.tick(_cur_size,src.name)
                     append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"folder","reason":"dj_halt","src":str(src)}); continue
+        # ── v9.0: DJ Crate explosion (per-track routing) ────────────────
+        _is_crate_explode=(p.decision.get("is_crate") and p.decision.get("crate_type")=="singles"
+                           and cfg.get("djcrates",{}).get("explode_to_artist_folders",False))
+        if _is_crate_explode:
+            # Get audio files from source folder
+            _audio_exts=set(e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a",".wav",".aiff",".ogg",".opus"]))
+            _audio_files=sorted([f for f in src.iterdir() if f.is_file() and f.suffix.lower() in _audio_exts])
+            if not _audio_files:
+                prog.tick(_cur_size,src.name)
+                append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"crate","reason":"no_audio_files","src":str(src)}); continue
+
+            # Build explosion plan
+            _profile=cfg.get("profiles",{}).get(cfg.get("active_profile","incoming"),{})
+            _src_root=Path(_profile.get("source_root",src.parent)).expanduser()
+            _plans,_embedded=build_crate_explosion_plan(src,_audio_files,cfg,_profile,_src_root,p.confidence)
+
+            # Count unique artist destinations
+            _unique_artists=len(set(tp.artist or "_Unsorted" for tp in _plans))
+            _review_count=sum(1 for tp in _plans if tp.destination=="review")
+            _embedded_count=sum(1 for tp in _plans if tp.embedded_release)
+            _singles_count=len(_plans)-_embedded_count
+
+            # Interactive confirmation for crate explosion
+            should_prompt=(interactive or req_confirm) and not(auto_above is not None and p.confidence>=auto_above)
+            if should_prompt:
+                print(f"\n  {C.BOLD}DJ CRATE DETECTED{C.RESET}  {src.name}/")
+                print(f"    {len(_audio_files)} tracks → {_unique_artists} artist folders")
+                if _embedded:
+                    print(f"    {C.GREEN}Embedded releases found: {len(_embedded)}{C.RESET}")
+                    for rel in _embedded:
+                        _partial=f" (partial {len(rel.tracks)}/{rel.total_in_album})" if rel.is_partial and rel.total_in_album else ""
+                        print(f"      {rel.artist_display} - {rel.album_display} ({len(rel.tracks)} tracks){_partial}")
+                    print(f"    Remaining singles: {_singles_count}")
+                if _review_count: print(f"    {C.YELLOW}{_review_count} track(s) need review{C.RESET}")
+                print(f"    Crate confidence: {conf_color(p.confidence)}")
+                print(f"    {C.DIM}Reason: {p.decision.get('crate_reason','')}{C.RESET}")
+                # Show first few track plans
+                print(f"    {C.DIM}{'─'*50}{C.RESET}")
+                for tp in _plans[:5]:
+                    _art=tp.artist or "_Unsorted"
+                    if tp.embedded_release:
+                        print(f"    {tp.filename[:40]:40s} → {_art}/{tp.embedded_release}/")
+                    else:
+                        print(f"    {tp.filename[:40]:40s} → {_art}/Singles/")
+                if len(_plans)>5:
+                    print(f"    {C.DIM}... and {len(_plans)-5} more{C.RESET}")
+                print()
+                _choice=input("  [e] Explode as crate  [v] Keep as VA  [s] Skip  [d] Show all tracks  > ").strip().lower()
+                if _choice=="d":
+                    for tp in _plans:
+                        _art=tp.artist or "_Unsorted"
+                        if tp.embedded_release:
+                            _dest_label=f"{_art}/{tp.embedded_release}/{tp.track_number:02d} - {tp.title or tp.filename}"
+                        else:
+                            _dest_label=f"{_art}/Singles/{tp.title or tp.filename}"
+                        print(f"    {tp.filename[:40]:40s} → {_dest_label}  "
+                              f"conf={conf_color(tp.confidence)}")
+                    _choice=input("  [e] Explode  [v] Keep as VA  [s] Skip  > ").strip().lower()
+                if _choice=="v":
+                    # Reclassify as VA and fall through to normal folder move
+                    p.decision["is_crate"]=False; p.decision["folder_type"]="va"; p.decision["is_va"]=True
+                    # Offer to learn — find sibling folders with similar suffix/prefix
+                    _fn=p.folder_name
+                    _parent=src.parent
+                    _siblings=[d.name for d in _parent.iterdir() if d.is_dir() and d.name!=_fn] if _parent.exists() else []
+                    _learned=False
+                    for sep in [" - ","_"," "]:
+                        parts=_fn.rsplit(sep,1)
+                        if len(parts)==2 and len(parts[1])>=3:
+                            _suffix=parts[1].lower()
+                            _matching=[s for s in _siblings if s.lower().endswith(_suffix)]
+                            if _matching:
+                                print(f"\n    {C.CYAN}Other folders ending with '{_suffix}': {', '.join(_matching[:5])}{C.RESET}")
+                                _learn_ans=input(f"    [l] Learn '*{_suffix}' as NOT crate  [n] No, one-off  > ").strip().lower()
+                                if _learn_ans=="l":
+                                    _veto_pat=rf".*[\s_\-]{re.escape(_suffix)}$"
+                                    _dc=cfg.setdefault("djcrates",{})
+                                    _veto_list=_dc.setdefault("crate_veto_patterns",[])
+                                    if _veto_pat not in _veto_list:
+                                        _veto_list.append(_veto_pat)
+                                        _cp=cfg.get("_cfg_path")
+                                        if _cp: write_yaml(Path(_cp),cfg)
+                                        print(f"    {C.GREEN}✓ Added veto pattern to config{C.RESET}")
+                                    _learned=True
+                                break
+                    pass  # will fall through to normal move logic below
+                elif _choice!="e":
+                    prog.tick(_cur_size,src.name)
+                    append_jsonl(skip_path,{"timestamp":now_iso(),"session_id":session_id,"type":"crate","reason":"user_skipped","src":str(src)}); continue
+                else:
+                    # User chose explode — offer to learn crate pattern
+                    _fn=p.folder_name
+                    _parent=src.parent
+                    _siblings=[d.name for d in _parent.iterdir() if d.is_dir() and d.name!=_fn] if _parent.exists() else []
+                    for sep in [" - ","_"," "]:
+                        parts=_fn.rsplit(sep,1)
+                        if len(parts)==2 and len(parts[1])>=3:
+                            _suffix=parts[1].lower()
+                            _matching=[s for s in _siblings if s.lower().endswith(_suffix)]
+                            if _matching:
+                                print(f"\n    {C.CYAN}Other folders ending with '{_suffix}': {', '.join(_matching[:5])}{C.RESET}")
+                                _learn_ans=input(f"    [l] Learn '*{_suffix}' as crate pattern  [n] No, one-off  > ").strip().lower()
+                                if _learn_ans=="l":
+                                    _crate_pat=rf".*[\s_\-]{re.escape(_suffix)}$"
+                                    _dc=cfg.setdefault("djcrates",{})
+                                    _crate_list=_dc.setdefault("custom_crate_patterns",[])
+                                    if _crate_pat not in _crate_list:
+                                        _crate_list.append(_crate_pat)
+                                        _cp=cfg.get("_cfg_path")
+                                        if _cp: write_yaml(Path(_cp),cfg)
+                                        print(f"    {C.GREEN}✓ Added crate pattern to config{C.RESET}")
+                                break
+                    pass  # proceed to explosion
+
+            # Only explode if user confirmed or non-interactive
+            if p.decision.get("is_crate"):
+                _emb_note=f", {len(_embedded)} embedded release(s)" if _embedded else ""
+                if dry_run:
+                    out(f"\n  {C.DIM}[dry-run]{C.RESET} {C.BOLD}CRATE EXPLODE{C.RESET}: {src.name}  ({len(_plans)} tracks → {_unique_artists} artist folders{_emb_note})")
+                    _crate_applied=apply_crate_explosion(src,_plans,session_id,cfg,dry_run=True,source_root=source_root)
+                else:
+                    out(f"\n  {C.BOLD}CRATE EXPLODE{C.RESET}: {src.name}  ({len(_plans)} tracks → {_unique_artists} artist folders{_emb_note})")
+                    _crate_applied=apply_crate_explosion(src,_plans,session_id,cfg,dry_run=False,source_root=source_root)
+                    applied.extend(_crate_applied)
+                    _emb_moved=sum(1 for a in _crate_applied if a.get("embedded_release"))
+                    _sin_moved=len(_crate_applied)-_emb_moved
+                    _parts=[f"{_sin_moved} singles"]
+                    if _emb_moved: _parts.append(f"{_emb_moved} album tracks")
+                    out(f"    {C.GREEN}✓ {len(_crate_applied)}/{len(_plans)} tracks moved ({', '.join(_parts)}){C.RESET}")
+                prog.tick(_cur_size,src.name)
+                continue
+
+        # ── Normal folder move logic ─────────────────────────────────────
         dst2=collision_resolve(dst,policy,sfmt)
         if dst2 is None:
             warn(f"Collision skip: {dst.name}")
@@ -4259,9 +5062,10 @@ def apply_folder_moves(cfg:Dict[str,Any],proposals:List[FolderProposal],interact
             # v6.1: Show richer context for review decisions
             _art_info=f"  artist: {p.decision.get('albumartist_display','?')}" if p.decision.get("albumartist_display") else ""
             _va_info=f"  {C.YELLOW}[VA]{C.RESET}" if p.decision.get("is_va") else ""
+            _crate_info=f"  {C.YELLOW}[CRATE]{C.RESET}" if p.decision.get("is_crate") else ""
             _reasons=", ".join(p.decision.get("route_reasons",[]))
             print(f"\n  {C.DIM}FROM:{C.RESET} {src.name}")
-            print(f"  {C.DIM}  TO:{C.RESET} {dst2.name}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}{_va_info}")
+            print(f"  {C.DIM}  TO:{C.RESET} {dst2.name}  {status_tag(p.destination)}  conf={conf_color(p.confidence)}{_va_info}{_crate_info}")
             if _art_info or _reasons:
                 print(f"  {C.DIM}    {_art_info}{'  |  ' if _art_info and _reasons else ''}{_reasons}{C.RESET}")
             if p.decision.get("used_heuristic"): warn("name from heuristic — no tags")
@@ -4752,11 +5556,43 @@ def cmd_show(cfg:Dict[str,Any],folder_path:str,profile_name:str,show_tracks:bool
     out(f"  Proposed name:      {C.GREEN}{prop.proposed_folder_name}{C.RESET}")
     out(f"  Target path:        {prop.target_path}")
     out(f"  Confidence:         {conf_color(prop.confidence)}")
-    out(f"  Folder type:        {d.get('folder_type','album')}{'  [EP]' if d.get('is_ep') else ''}{'  [MIX]' if d.get('is_mix') else ''}")
+    _ft_extra=""
+    if d.get("is_ep"): _ft_extra+="  [EP]"
+    if d.get("is_mix"): _ft_extra+="  [MIX]"
+    if d.get("is_crate"): _ft_extra+=f"  [CRATE: {d.get('crate_type','singles')}]"
+    out(f"  Folder type:        {d.get('folder_type','album')}{_ft_extra}")
     out(f"  album tag:          '{d.get('dominant_album_display')}' ({d.get('dominant_album_share',0):.0%} dominance)")
     out(f"  albumartist tag:    '{d.get('dominant_albumartist_display')}' ({d.get('dominant_albumartist_share',0):.0%} dominance)")
     out(f"  year:               {d.get('year') or 'not included'}")
     out(f"  VA:                 {'yes' if d.get('is_va') else 'no'}")
+    if d.get("is_crate"):
+        out(f"  DJ Crate:           {d.get('crate_type','singles')} (confidence: {d.get('crate_confidence',0):.2f})")
+        out(f"  Crate reason:       {d.get('crate_reason','')}")
+        # v9.0: show explosion preview for singles crates
+        if d.get("crate_type")=="singles" and cfg.get("djcrates",{}).get("explode_to_artist_folders",False):
+            _audio_exts=set(e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a",".wav",".aiff",".ogg",".opus"]))
+            _show_files=sorted([f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in _audio_exts])
+            if _show_files:
+                _plans,_embedded=build_crate_explosion_plan(folder,_show_files,cfg,profile,source_root,d.get("crate_confidence",0.5))
+                _unique=len(set(tp.artist or "_Unsorted" for tp in _plans))
+                _emb_count=sum(1 for tp in _plans if tp.embedded_release)
+                _sin_count=len(_plans)-_emb_count
+                out(f"\n{C.BOLD}Explosion preview:{C.RESET}  {len(_plans)} tracks → {_unique} artist folders")
+                if _embedded:
+                    out(f"  {C.GREEN}Embedded releases:{C.RESET}")
+                    for rel in _embedded:
+                        _partial=f" (partial {len(rel.tracks)}/{rel.total_in_album})" if rel.is_partial and rel.total_in_album else ""
+                        out(f"    {rel.artist_display} - {rel.album_display} ({len(rel.tracks)} tracks){_partial}")
+                    out(f"  Remaining singles: {_sin_count}")
+                for tp in _plans[:10]:
+                    _art=tp.artist or "_Unsorted"
+                    if tp.embedded_release:
+                        _dest=f"{_art}/{tp.embedded_release}/{tp.track_number:02d} - {(tp.title or tp.filename)[:25]}"
+                    else:
+                        _dest=f"{_art}/Singles/{(tp.title or tp.filename)[:30]}"
+                    out(f"    {tp.filename[:40]:40s} → {_dest}  conf={conf_color(tp.confidence)}")
+                if len(_plans)>10:
+                    out(f"    {C.DIM}... and {len(_plans)-10} more{C.RESET}")
     out(f"  FLAC only:          {'yes' if d.get('is_flac_only') else 'no'}")
     out(f"  heuristic:          {'yes (no tags found)' if d.get('used_heuristic') else 'no'}")
 
@@ -4817,7 +5653,7 @@ def cmd_verify(cfg:Dict[str,Any],profile_name:str)->None:
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
+    roots=ensure_roots(profile,source_root,create=False); clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     manifest=read_manifest(cfg); mf_entries=manifest.get("entries",{})
     issues:List[str]=[]; ok_count=0
@@ -5042,6 +5878,240 @@ def cmd_learn(cfg_path:Path,cfg:Dict[str,Any],session_id:Optional[str])->None:
 
 
 # ─────────────────────────────────────────────
+# learn-crates — discover crate naming patterns from existing folders
+# ─────────────────────────────────────────────
+def _scan_folder_for_crate_signals(folder:Path,cfg:Dict[str,Any],min_tracks:int)->Optional[Dict[str,Any]]:
+    """Lightweight scan of a folder for crate heuristics without full tag read."""
+    audio_exts={".mp3",".flac",".m4a",".aiff",".wav",".ogg",".opus",".wma"}
+    audio_files=[f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in audio_exts]
+    if len(audio_files)<min_tracks: return None
+    # Check for nested subfolders with audio — true albums have flat structure too, skip if has deep nesting
+    has_subfolders=any(d.is_dir() and not d.name.startswith(".") for d in folder.iterdir())
+    # Read tags from a sample (up to 20 tracks for speed)
+    sample=audio_files[:20]
+    tags=[]
+    for af in sample:
+        try: tags.append(read_audio_tags(af,cfg))
+        except Exception: pass
+    if len(tags)<min_tracks: return None
+    # Album diversity
+    albums:Counter=Counter()
+    blank_count=0
+    for t in tags:
+        alb=(t.get("album") or "").strip()
+        if not alb or _is_unknown_album(alb,cfg):
+            blank_count+=1
+        else:
+            albums[normalize_for_vote(alb,cfg)]+=1
+    effective_unique=len(albums)+blank_count
+    album_diversity=effective_unique/max(len(tags),1)
+    # Dominant album share
+    dom_alb_share=albums.most_common(1)[0][1]/len(tags) if albums else 0.0
+    dom_alb_name=albums.most_common(1)[0][0] if albums else None
+    # Sequential track numbering check
+    track_nums:List[int]=[]
+    for t in tags:
+        tn=t.get("tracknumber")
+        if tn:
+            m=re.match(r"(\d+)",str(tn))
+            if m:
+                try: track_nums.append(int(m.group(1)))
+                except ValueError: pass
+    sequential=False
+    if len(track_nums)>=len(tags)*0.8 and len(tags)>=3:
+        unique_nums=sorted(set(track_nums))
+        has_dupes=len(track_nums)!=len(unique_nums)
+        if not has_dupes and unique_nums==list(range(unique_nums[0],unique_nums[-1]+1)):
+            sequential=True
+    # Compilation flag check
+    comp_count=sum(1 for t in tags if t.get("compilation")=="1")
+    comp_share=comp_count/len(tags) if tags else 0.0
+    # Score: high album diversity + low dom share + non-sequential = likely crate
+    is_likely_crate=(
+        album_diversity>=0.4
+        and dom_alb_share<0.6
+        and not sequential
+        and not (comp_share>=0.7 and dom_alb_share>=0.5)
+    )
+    # Also check folder name keywords
+    kw_match=_folder_matches_crate_keywords(folder.name,cfg)>0
+    set_match=_folder_matches_set_patterns(folder.name,cfg)
+    if kw_match or set_match:
+        is_likely_crate=True
+    if not is_likely_crate: return None
+    return {
+        "path":folder,"name":folder.name,"total_tracks":len(audio_files),"sampled":len(tags),
+        "album_diversity":album_diversity,"dom_alb_share":dom_alb_share,"dom_alb_name":dom_alb_name,
+        "sequential":sequential,"has_subfolders":has_subfolders,"comp_share":comp_share,
+        "kw_match":kw_match,"set_match":set_match,
+    }
+
+def _extract_naming_patterns(crate_infos:List[Dict[str,Any]])->List[Dict[str,Any]]:
+    """Group detected crates by common naming patterns (suffixes/prefixes)."""
+    patterns:List[Dict[str,Any]]=[]
+    names=[c["name"] for c in crate_infos]
+    # Try common suffix patterns
+    suffix_groups:Dict[str,List[Dict[str,Any]]]={}
+    for c in crate_infos:
+        n=c["name"]
+        # Check for "_suffix" or " - suffix" or " suffix" patterns
+        for sep in [" - ","_"," "]:
+            parts=n.rsplit(sep,1)
+            if len(parts)==2 and len(parts[1])>=3:
+                suffix=parts[1].lower()
+                suffix_groups.setdefault(suffix,[]).append(c)
+    # Only keep suffixes that appear 2+ times
+    for suffix,members in suffix_groups.items():
+        if len(members)>=2:
+            # Determine likely type
+            crate_type="crate_set" if any(m["set_match"] for m in members) else "crate_singles"
+            regex_pat=rf".*[\s_\-]{re.escape(suffix)}$"
+            patterns.append({
+                "suffix":suffix,"regex":regex_pat,"type":crate_type,
+                "matches":members,"count":len(members),
+            })
+    # Check for prefix patterns too
+    prefix_groups:Dict[str,List[Dict[str,Any]]]={}
+    for c in crate_infos:
+        n=c["name"]
+        for sep in [" - ","_"," "]:
+            parts=n.split(sep,1)
+            if len(parts)==2 and len(parts[0])>=3:
+                prefix=parts[0].lower()
+                prefix_groups.setdefault(prefix,[]).append(c)
+    for prefix,members in prefix_groups.items():
+        if len(members)>=2:
+            crate_type="crate_set" if any(m["set_match"] for m in members) else "crate_singles"
+            regex_pat=rf"^{re.escape(prefix)}[\s_\-].*"
+            # Avoid duplicate patterns that match same folders
+            existing_match_sets=[set(m["name"] for m in p["matches"]) for p in patterns]
+            member_names=set(m["name"] for m in members)
+            if member_names not in existing_match_sets:
+                patterns.append({
+                    "prefix":prefix,"regex":regex_pat,"type":crate_type,
+                    "matches":members,"count":len(members),
+                })
+    # Standalone crates (no pattern group)
+    patterned_names:Set[str]=set()
+    for p in patterns:
+        for m in p["matches"]: patterned_names.add(m["name"])
+    standalone=[c for c in crate_infos if c["name"] not in patterned_names]
+    return patterns
+
+def cmd_learn_crates(cfg_path:Path,cfg:Dict[str,Any],scan_path:str,min_tracks:int=3)->None:
+    """Scan a directory tree for crate-like folders and learn naming patterns."""
+    root=Path(scan_path)
+    if not root.exists():
+        err(f"Path does not exist: {scan_path}"); return
+    if not root.is_dir():
+        err(f"Not a directory: {scan_path}"); return
+
+    out(f"\n{C.BOLD}{'═'*60}{C.RESET}")
+    out(f"{C.BOLD}raagdosa learn-crates{C.RESET}")
+    out(f"{'═'*60}")
+    out(f"Scanning: {root}")
+    out(f"Min tracks: {min_tracks}\n")
+
+    # Walk directory tree — only look at leaf-ish folders (those containing audio)
+    crate_candidates:List[Dict[str,Any]]=[]
+    folder_count=0
+    for dirpath,dirnames,filenames in os.walk(str(root)):
+        # Skip hidden dirs
+        dirnames[:]=[d for d in dirnames if not d.startswith(".")]
+        dp=Path(dirpath)
+        folder_count+=1
+        if folder_count%50==0: out(f"  Scanned {folder_count} folders...",level=VERBOSE)
+        result=_scan_folder_for_crate_signals(dp,cfg,min_tracks)
+        if result:
+            crate_candidates.append(result)
+
+    if not crate_candidates:
+        out(f"\nNo crate-like folders found in {folder_count} folders scanned.")
+        return
+
+    out(f"\n{C.GREEN}Found {len(crate_candidates)} crate-like folder(s){C.RESET} in {folder_count} folders scanned.\n")
+
+    # Extract naming patterns
+    patterns=_extract_naming_patterns(crate_candidates)
+
+    # Show grouped patterns first
+    added_crate:List[str]=[]
+    added_set:List[str]=[]
+
+    if patterns:
+        out(f"{C.BOLD}Discovered naming patterns:{C.RESET}\n")
+        for i,pat in enumerate(patterns,1):
+            label=pat.get("suffix") or pat.get("prefix","?")
+            ptype="set prep" if pat["type"]=="crate_set" else "singles"
+            out(f"  {C.CYAN}Pattern {i}: *{label}*{C.RESET}  ({ptype}, {pat['count']} matches)")
+            out(f"  Regex: {pat['regex']}")
+            for m in pat["matches"][:5]:
+                out(f"    {m['name']}/  ({m['total_tracks']} tracks, album diversity {m['album_diversity']:.0%})")
+            if len(pat["matches"])>5:
+                out(f"    ... and {len(pat['matches'])-5} more")
+            out(f"\n  [a] Add to config  [s] Skip  [e] Edit pattern")
+            ans=input("  → ").strip().lower()
+            if ans=="a":
+                if pat["type"]=="crate_set":
+                    added_set.append(pat["regex"])
+                else:
+                    added_crate.append(pat["regex"])
+                out(f"  {C.GREEN}✓ Added{C.RESET}\n")
+            elif ans=="e":
+                out(f"  Current regex: {pat['regex']}")
+                new_pat=input("  New regex: ").strip()
+                if new_pat:
+                    # Validate regex
+                    try:
+                        re.compile(new_pat)
+                        if pat["type"]=="crate_set":
+                            added_set.append(new_pat)
+                        else:
+                            added_crate.append(new_pat)
+                        out(f"  {C.GREEN}✓ Added custom pattern{C.RESET}\n")
+                    except re.error as e:
+                        out(f"  {C.RED}Invalid regex: {e}{C.RESET}\n")
+                else:
+                    out(f"  Skipped.\n")
+            else:
+                out(f"  Skipped.\n")
+
+    # Show standalone crates (not matching any pattern)
+    patterned_names:Set[str]=set()
+    for p in patterns:
+        for m in p["matches"]: patterned_names.add(m["name"])
+    standalone=[c for c in crate_candidates if c["name"] not in patterned_names]
+
+    if standalone:
+        out(f"\n{C.BOLD}Standalone crate folders (no shared pattern):{C.RESET}\n")
+        for c in standalone:
+            ptype="set prep" if c["set_match"] else "singles"
+            out(f"  {c['name']}/  ({c['total_tracks']} tracks, album diversity {c['album_diversity']:.0%}, {ptype})")
+        out(f"\n  These folders were detected as crates but don't share a naming pattern.")
+        out(f"  They'll be detected automatically by the scoring engine during scan.\n")
+
+    # Persist to config
+    if added_crate or added_set:
+        dc=cfg.setdefault("djcrates",{})
+        if added_crate:
+            existing=dc.setdefault("custom_crate_patterns",[])
+            for p in added_crate:
+                if p not in existing: existing.append(p)
+        if added_set:
+            existing=dc.setdefault("custom_set_patterns",[])
+            for p in added_set:
+                if p not in existing: existing.append(p)
+        write_yaml(cfg_path,cfg)
+        out(f"\n{C.GREEN}Config updated:{C.RESET}")
+        if added_crate: out(f"  Added {len(added_crate)} pattern(s) to djcrates.custom_crate_patterns")
+        if added_set: out(f"  Added {len(added_set)} pattern(s) to djcrates.custom_set_patterns")
+        out(f"\n{C.DIM}Saved: {cfg_path}{C.RESET}")
+    elif patterns or standalone:
+        out("No patterns added to config.")
+    out("")
+
+
+# ─────────────────────────────────────────────
 # dump-tree — export raw folder/file tree for training/debug
 # ─────────────────────────────────────────────
 def cmd_dump_tree(
@@ -5060,7 +6130,7 @@ def cmd_dump_tree(
 
     profile = profiles[profile_name]
     source_root = Path(profile["source_root"]).expanduser().resolve()
-    roots = ensure_roots(profile, source_root)
+    roots = ensure_roots(profile, source_root,create=False)
 
     if not source_root.exists():
         raise FileNotFoundError(f"source_root missing: {source_root}")
@@ -5148,7 +6218,7 @@ def cmd_orphans(cfg:Dict[str,Any],profile_name:str)->None:
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root)
+    roots=ensure_roots(profile,source_root,create=False)
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     orphans:List[Path]=[]
     for root_key in ("clean_albums","review_albums"):
@@ -5180,7 +6250,7 @@ def cmd_artists(cfg:Dict[str,Any],profile_name:str,list_mode:bool,find_query:Opt
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
+    roots=ensure_roots(profile,source_root,create=False); clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
     out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa artists — {profile_name}{C.RESET}\n{'═'*60}")
@@ -5221,7 +6291,7 @@ def cmd_review_list(cfg:Dict[str,Any],profile_name:str,older_than_days:Optional[
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root); review_albums=roots["review_albums"]
+    roots=ensure_roots(profile,source_root,create=False); review_albums=roots["review_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
     out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa review-list — {profile_name}{C.RESET}\n{'═'*60}")
@@ -5302,7 +6372,7 @@ def cmd_review_promote(cfg:Dict[str,Any],profile_name:str,folder_query:str,dry_r
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root)
+    roots=ensure_roots(profile,source_root,create=not dry_run)
     review_albums=roots["review_albums"]; clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
@@ -5478,7 +6548,7 @@ def cmd_clean_report(cfg:Dict[str,Any],profile_name:str)->None:
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root); clean_albums=roots["clean_albums"]
+    roots=ensure_roots(profile,source_root,create=False); clean_albums=roots["clean_albums"]
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
 
     out(f"\n{C.BOLD}{'═'*60}{C.RESET}\n{C.BOLD}raagdosa clean-report — {profile_name}{C.RESET}\n{'═'*60}")
@@ -5532,7 +6602,7 @@ def cmd_extract_by_artist(cfg:Dict[str,Any],profile_name:str,folder_path:str,dry
     profiles=cfg.get("profiles",{})
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
-    roots=ensure_roots(profile,source_root)
+    roots=ensure_roots(profile,source_root,create=not dry_run)
     folder=Path(folder_path).expanduser().resolve()
     if not folder.exists(): err(f"Folder not found: {folder}"); sys.exit(1)
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
@@ -5552,13 +6622,13 @@ def cmd_extract_by_artist(cfg:Dict[str,Any],profile_name:str,folder_path:str,dry
     out(f"\nWould extract {len(by_artist)} artist group(s) into Clean/Albums:\n")
     clean_albums=roots["clean_albums"]
     for artist,files in sorted(by_artist.items()):
-        dest=clean_albums/sanitize_name(artist)/"_Singles"
+        dest=clean_albums/sanitize_name(artist)/"Singles"
         out(f"  {C.GREEN}{artist:<40}{C.RESET}  {len(files):3d} track(s)  →  {dest}")
     if dry_run: out(f"\n{C.DIM}[dry-run] No files moved.{C.RESET}"); return
     if input("\nProceed? [y/N] ").strip().lower()!="y": out("Aborted."); return
     moved=0
     for artist,files in by_artist.items():
-        dest=clean_albums/sanitize_name(artist)/"_Singles"; ensure_dir(dest)
+        dest=clean_albums/sanitize_name(artist)/"Singles"; ensure_dir(dest)
         for f in files:
             target=dest/f.name
             if target.exists(): target=dest/(f.stem+" (extracted)"+f.suffix)
@@ -5680,7 +6750,7 @@ def cmd_status(cfg:Dict[str,Any],profile_name:str)->None:
     if profile_name not in profiles: raise ValueError(f"Unknown profile: {profile_name}")
     profile=profiles[profile_name]; source_root=Path(profile["source_root"]).expanduser()
     setup_logging_paths(cfg, profile, source_root)
-    roots=ensure_roots(profile,source_root)
+    roots=ensure_roots(profile,source_root,create=False)
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     def count_in(path:Path)->Tuple[int,int]:
         if not path.exists(): return 0,0
@@ -5724,66 +6794,145 @@ def cmd_status(cfg:Dict[str,Any],profile_name:str)->None:
 # init
 # ─────────────────────────────────────────────
 def cmd_init(cfg_path:Path)->None:
-    out(f"\n{C.BOLD}🍛 RaagDosa v{APP_VERSION} — Setup Wizard{C.RESET}\n{'='*50}")
-    if cfg_path.exists():
-        if input(f"\n  {cfg_path} exists. Overwrite? [y/N] ").strip().lower()!="y":
+    paths_file=cfg_path.parent/"paths.local.yaml"
+    is_first_run=not cfg_path.exists()
+    is_adding_profile=cfg_path.exists() and paths_file.exists()
+
+    out(f"\n{C.BOLD}RaagDosa v{APP_VERSION} — Setup{C.RESET}")
+    out(f"{'═'*50}")
+
+    if is_adding_profile:
+        out(f"\n  Existing setup detected. Adding a new profile.\n")
+        paths_data=read_yaml(paths_file)
+        existing_profiles=list((paths_data.get("profiles") or {}).keys())
+        if existing_profiles:
+            out(f"  Current profiles: {', '.join(existing_profiles)}")
+    else:
+        out("")
+        paths_data={}
+
+    # ── 1. Source folder ─────────────────────────────────────────────────
+    source=input("  Source folder (where your unsorted music lives):\n  → ").strip()
+    if not source: err("Source folder is required."); sys.exit(1)
+    source_path=Path(source).expanduser().resolve()
+    if not source_path.exists():
+        out(f"\n  {C.YELLOW}Warning: {source_path} does not exist yet.{C.RESET}")
+        if input("  Continue anyway? [Y/n] ").strip().lower() in ("n","no"):
             out("Aborted."); return
-    source=input("\n  Source root (your messy music folder): ").strip()
-    if not source: err("Source root is required."); sys.exit(1)
-    out("\n  Library template:\n    [1] artist/album  (recommended)\n    [2] album only  (flat)")
-    template="{artist}/{album}" if (input("  Choose [1]: ").strip() or "1")=="1" else "{album}"
-    flac_seg=input("\n  Segregate FLAC into artist/FLAC/album/? [y/N] ").strip().lower()=="y"
-    out("\n  'The' prefix policy:\n    [1] keep-front (The Beatles)  [2] move-to-end (Beatles, The)  [3] strip (Beatles)")
-    the_map={"1":"keep-front","2":"move-to-end","3":"strip"}
-    the_policy=the_map.get(input("  Choose [1]: ").strip(),"keep-front")
-    new_cfg={"app":{"name":"RaagDosa","version":APP_VERSION},
-             "profiles":{"incoming":{"source_root":source,"clean_mode":"inside_root",
+
+    # ── 2. Profile name ──────────────────────────────────────────────────
+    out(f"\n  Profiles let you run RaagDosa on different source folders independently.")
+    out(f"  {C.DIM}Examples: bandcamp, beatport, promos, soulseek, vinyl-rips{C.RESET}")
+    default_name=source_path.name.lower().replace(" ","_")
+    # Avoid colliding with existing profiles
+    existing=set((paths_data.get("profiles") or {}).keys())
+    if default_name in existing:
+        n=2
+        while f"{default_name}_{n}" in existing: n+=1
+        default_name=f"{default_name}_{n}"
+    profile_name=input(f"\n  Profile name [{default_name}]: ").strip() or default_name
+    profile_name=profile_name.lower().replace(" ","_")
+
+    # ── 3. Clean mode ────────────────────────────────────────────────────
+    _src_short=source_path.name
+    out(f"\n  {C.BOLD}Where should sorted output go?{C.RESET}")
+    out(f"    [1] Inside source  — {_src_short}/raagdosa/Clean/  {C.DIM}(default, most setups){C.RESET}")
+    out(f"    [2] Next to source — {source_path.parent.name}/raagdosa/Clean/  {C.DIM}(keeps source untouched){C.RESET}")
+    out(f"    [?] Show folder tree examples")
+    mode_choice=input("\n  Choose [1]: ").strip()
+    if mode_choice=="?":
+        out(f"\n    {C.CYAN}[1] Inside source folder{C.RESET}")
+        out(f"        {_src_short}/")
+        out(f"        ├── (your music files)")
+        out(f"        └── raagdosa/")
+        out(f"            ├── Clean/Albums/   ← sorted, high confidence")
+        out(f"            └── Review/Albums/  ← needs your eyes\n")
+        out(f"    {C.CYAN}[2] Next to source folder{C.RESET}")
+        out(f"        {source_path.parent.name}/")
+        out(f"        ├── {_src_short}/        ← source (untouched)")
+        out(f"        └── raagdosa/")
+        out(f"            ├── Clean/Albums/")
+        out(f"            └── Review/Albums/\n")
+        mode_choice=input("  Choose [1]: ").strip()
+    clean_mode="inside_parent" if mode_choice=="2" else "inside_root"
+
+    # ── 4. Write paths.local.yaml ────────────────────────────────────────
+    if clean_mode=="inside_parent":
+        wrapper=source_path.parent/"raagdosa"
+    else:
+        wrapper=source_path/"raagdosa"
+
+    # ── 5. Write paths.local.yaml ────────────────────────────────────────
+    if "profiles" not in paths_data:
+        paths_data["profiles"]={}
+    paths_data["profiles"][profile_name]={"source_root":str(source_path),"clean_mode":clean_mode}
+    paths_data["active_profile"]=profile_name
+    write_yaml(paths_file,paths_data)
+
+    # ── 6. Write config.yaml (first run only) ────────────────────────────
+    if is_first_run:
+        new_cfg={
+            "app":{"name":"RaagDosa","version":APP_VERSION},
+            "profiles":{profile_name:{
                 "wrapper_folder_name":"raagdosa",
                 "clean_folder_name":"Clean","review_folder_name":"Review",
                 "clean_albums_folder_name":"Albums","clean_tracks_folder_name":"Tracks",
                 "review_albums_folder_name":"Albums","duplicates_folder_name":"Duplicates","orphans_folder_name":"Orphans"}},
-             "active_profile":"incoming",
-             "library":{"template":template,"flac_segregation":flac_seg,"singles_folder":"_Singles","va_folder":"_Various Artists","unknown_artist_label":"_Unknown"},
-             "artist_normalization":{"enabled":True,"the_prefix":the_policy,"normalize_hyphens":True,"fuzzy_dedup_threshold":0.92,"unicode_map":{},"aliases":{}},
-             "scan":{"audio_extensions":[".mp3",".flac",".m4a",".aiff",".wav"],"leaf_folders_only":True,"min_tracks":3,"max_unreadable_track_ratio":0.25,"follow_symlinks":False,
-                     "skip_sidecar_extensions":[".sfk",".asd",".reapeaks",".pkf",".db",".lrc"],
-                     "skip_system_folders":["__MACOSX","__macosx"]},
-             "ep_detection":{"enabled":True,"min_tracks":2,"max_tracks":6},
-             "ignore":{"ignore_folder_names":["Singles","One-Offs","Dump","_dump","Clean","Review","raagdosa"]},
-             "tags":{"album_keys":["album"],"albumartist_keys":["albumartist","album_artist","album artist"],
-                     "artist_keys":["artist"],"title_keys":["title"],"tracknumber_keys":["tracknumber","track"],
-                     "discnumber_keys":["discnumber","disc"],"year_keys_prefer":["originaldate","date","year"],
-                     "bpm_keys":["bpm","tbpm"],"key_keys":["initialkey","key","tkey"]},
-             "normalize":{"lower_case":True,"strip_whitespace":True,"collapse_whitespace":True,
-                          "strip_punctuation_for_voting":True,"strip_bracketed_phrases_for_voting":True,
-                          "strip_common_suffixes_for_voting":["deluxe edition","expanded edition","remaster","remastered","anniversary edition","bonus tracks","explicit","special edition"]},
-             "fuzzy":{"enabled":True,"similarity_threshold":0.88,"prompt_threshold":0.75},
-             "decision":{"album_dominance_threshold":0.75,"allow_artist_fallback":True,"require_confirmation":True,"auto_approve_above":0.92,"interactive_below":0.92},
-             "various_artists":{"label":"VA","albumartist_matches":["various artists","various","va","v/a"],"enable_heuristics":True,"unique_artist_ratio_above":0.75},
-             "year":{"enabled":True,"allowed_range":{"min":1900,"max":2030},"require_presence_ratio":0.50,"agreement_threshold":0.70},
-             "format":{"pattern_no_year":"{albumartist} - {album}","pattern_with_year":"{albumartist} - {album} ({year})","replace_illegal_chars_with":" - ","trim_trailing_dots_spaces":True},
-             "format_suffix":{"enabled":True,"only_if_all_same_extension":True,"ignore_extension":".mp3","style":"brackets_upper"},
-             "review_rules":{"min_confidence_for_clean":0.85,"route_duplicates":True,"route_cross_run_duplicates":True,"route_questionable_to_review":True,"route_heuristic_to_review":True},
-             "move":{"enabled":True,"on_collision":"suffix","suffix_format":" ({n})","use_checksum":False},
-             "dj_safety":{"detect_dj_databases":True,"warn_on_dj_databases":True,"halt_on_dj_databases":False,
-                          "database_patterns":["export.pdb","database2","rekordbox.xml","_Serato_","Serato Scratch","Serato DJ","PIONEER"]},
-             "track_rename":{"enabled":True,"scope":"clean_only","allowed_extensions":[".mp3",".flac",".m4a"],"skip_extensions":[".wav",".aiff"],
-                             "patterns":{"album":"{disc_prefix}{track:02d} - {title}{mix_suffix}{ext}","various":"{disc_prefix}{track:02d} - {artist} - {title}{mix_suffix}{ext}","mixed":"{artist} - {title}{mix_suffix}{ext}"},
-                             "disc":{"enabled":True,"only_if_multi_disc":True,"format":"{disc}-"},
-                             "track_numbers":{"required_for_album":True,"required_for_various":True,"pad_width":2,"fallback_to_filename_order":False}},
-             "artists":{"feature_handling":{"enabled":True,"style":"keep_in_artist","normalize_tokens":True}},
-             "mix_info":{"enabled":True,"detect_keywords":["remix","edit","mix","version","rework","bootleg","dub","original mix","extended mix","extended version","club mix","radio edit","instrumental","acapella","vip","flip"],"style":"parenthetical"},
-             "title_cleanup":{"enabled":True,"strip_trailing_domains":True,"strip_trailing_handles":True,
-                              "strip_trailing_phrases":["official video","official music video","official audio","lyrics","lyric video","free download","download","uploaded by","ripped by","encoded by","320kbps","lossless","hi-res","soundcloud","youtube","bandcamp","spotify","prod. by","prod by","clip","teaser","preview"],
-                              "keep_parenthetical_if_contains":["live","remaster","edit","mix","version","instrumental","acapella","demo","mono","stereo","original","extended","club","radio","vip","dub","feat"],
-                              "normalize":{"replace_underscores":True,"collapse_whitespace":True,"trim_dots_spaces":True}},
-             "logging":{"root_dir":"logs","session_dir":"logs/sessions","history_log":"logs/history.jsonl",
-                        "skipped_log":"logs/skipped.jsonl","track_history_log":"logs/track-history.jsonl",
-                        "track_skipped_log":"logs/track-skipped.jsonl","write_human_report":True,"report_filename":"report.txt","rotate_log_max_mb":10.0},
-             "undo":{"allow_undo_by_id":True,"allow_undo_by_original_path":True,"allow_undo_by_session":True,"allow_undo_by_folder":True}}
-    write_yaml(cfg_path,new_cfg)
-    out(f"\n{C.GREEN}✓ Config written: {cfg_path}{C.RESET}")
-    out("\nNext steps:\n  1. Review config.yaml — especially artist_normalization.aliases\n  2. raagdosa doctor\n  3. raagdosa go --dry-run\n  4. raagdosa go")
+            "library":{"template":"{artist}/{album}","flac_segregation":False,"singles_folder":"Singles","va_folder":"_Various Artists","unknown_artist_label":"_Unknown"},
+            "artist_normalization":{"enabled":True,"the_prefix":"keep-front","normalize_hyphens":True,"fuzzy_dedup_threshold":0.92,"unicode_map":{},"aliases":{}},
+            "scan":{"audio_extensions":[".mp3",".flac",".m4a",".aiff",".wav"],"leaf_folders_only":True,"min_tracks":3,"max_unreadable_track_ratio":0.25,"follow_symlinks":False,
+                    "skip_sidecar_extensions":[".sfk",".asd",".reapeaks",".pkf",".db",".lrc"],
+                    "skip_system_folders":["__MACOSX","__macosx"]},
+            "ep_detection":{"enabled":True,"min_tracks":2,"max_tracks":6},
+            "ignore":{"ignore_folder_names":["Singles","One-Offs","Dump","_dump","Clean","Review","raagdosa"]},
+            "tags":{"album_keys":["album"],"albumartist_keys":["albumartist","album_artist","album artist"],
+                    "artist_keys":["artist"],"title_keys":["title"],"tracknumber_keys":["tracknumber","track"],
+                    "discnumber_keys":["discnumber","disc"],"year_keys_prefer":["originaldate","date","year"],
+                    "bpm_keys":["bpm","tbpm"],"key_keys":["initialkey","key","tkey"]},
+            "normalize":{"lower_case":True,"strip_whitespace":True,"collapse_whitespace":True,
+                         "strip_punctuation_for_voting":True,"strip_bracketed_phrases_for_voting":True,
+                         "strip_common_suffixes_for_voting":["deluxe edition","expanded edition","remaster","remastered","anniversary edition","bonus tracks","explicit","special edition"]},
+            "fuzzy":{"enabled":True,"similarity_threshold":0.88,"prompt_threshold":0.75},
+            "decision":{"album_dominance_threshold":0.75,"allow_artist_fallback":True,"require_confirmation":True,"auto_approve_above":0.92,"interactive_below":0.92},
+            "various_artists":{"label":"VA","albumartist_matches":["various artists","various","va","v/a"],"enable_heuristics":True,"unique_artist_ratio_above":0.75},
+            "year":{"enabled":True,"allowed_range":{"min":1900,"max":2030},"require_presence_ratio":0.50,"agreement_threshold":0.70},
+            "format":{"pattern_no_year":"{albumartist} - {album}","pattern_with_year":"{albumartist} - {album} ({year})","replace_illegal_chars_with":" - ","trim_trailing_dots_spaces":True},
+            "format_suffix":{"enabled":True,"only_if_all_same_extension":True,"ignore_extension":".mp3","style":"brackets_upper"},
+            "review_rules":{"min_confidence_for_clean":0.85,"route_duplicates":True,"route_cross_run_duplicates":True,"route_questionable_to_review":True,"route_heuristic_to_review":True},
+            "move":{"enabled":True,"on_collision":"suffix","suffix_format":" ({n})","use_checksum":False},
+            "dj_safety":{"detect_dj_databases":True,"warn_on_dj_databases":True,"halt_on_dj_databases":False,
+                         "database_patterns":["export.pdb","database2","rekordbox.xml","_Serato_","Serato Scratch","Serato DJ","PIONEER"]},
+            "track_rename":{"enabled":True,"scope":"clean_only","allowed_extensions":[".mp3",".flac",".m4a"],"skip_extensions":[".wav",".aiff"],
+                            "patterns":{"album":"{disc_prefix}{track:02d} - {title}{mix_suffix}{ext}","various":"{disc_prefix}{track:02d} - {artist} - {title}{mix_suffix}{ext}","mixed":"{artist} - {title}{mix_suffix}{ext}"},
+                            "disc":{"enabled":True,"only_if_multi_disc":True,"format":"{disc}-"},
+                            "track_numbers":{"required_for_album":True,"required_for_various":True,"pad_width":2,"fallback_to_filename_order":False}},
+            "artists":{"feature_handling":{"enabled":True,"style":"keep_in_artist","normalize_tokens":True}},
+            "mix_info":{"enabled":True,"detect_keywords":["remix","edit","mix","version","rework","bootleg","dub","original mix","extended mix","extended version","club mix","radio edit","instrumental","acapella","vip","flip"],"style":"parenthetical"},
+            "title_cleanup":{"enabled":True,"strip_trailing_domains":True,"strip_trailing_handles":True,
+                             "strip_trailing_phrases":["official video","official music video","official audio","lyrics","lyric video","free download","download","uploaded by","ripped by","encoded by","320kbps","lossless","hi-res","soundcloud","youtube","bandcamp","spotify","prod. by","prod by","clip","teaser","preview"],
+                             "keep_parenthetical_if_contains":["live","remaster","edit","mix","version","instrumental","acapella","demo","mono","stereo","original","extended","club","radio","vip","dub","feat"],
+                             "normalize":{"replace_underscores":True,"collapse_whitespace":True,"trim_dots_spaces":True}},
+            "logging":{"root_dir":"logs","session_dir":"logs/sessions","history_log":"logs/history.jsonl",
+                       "skipped_log":"logs/skipped.jsonl","track_history_log":"logs/track-history.jsonl",
+                       "track_skipped_log":"logs/track-skipped.jsonl","write_human_report":True,"report_filename":"report.txt","rotate_log_max_mb":10.0},
+            "undo":{"allow_undo_by_id":True,"allow_undo_by_original_path":True,"allow_undo_by_session":True,"allow_undo_by_folder":True}}
+        write_yaml(cfg_path,new_cfg)
+        out(f"  {C.GREEN}✓ Config written: {cfg_path}{C.RESET}")
+    elif not is_adding_profile:
+        # config.yaml exists but no paths.local.yaml — just created paths.local.yaml
+        out(f"  {C.DIM}config.yaml already exists — not modified.{C.RESET}")
+
+    # ── 7. Summary + next steps ──────────────────────────────────────────
+    out(f"\n  {C.GREEN}✓ Profile '{profile_name}' ready{C.RESET}")
+    out(f"    Source:  {source_path}")
+    out(f"    Output:  {wrapper}/Clean/  and  {wrapper}/Review/")
+    out(f"\n  {C.BOLD}Next steps:{C.RESET}")
+    out(f"    raagdosa doctor                        ← verify setup")
+    out(f"    raagdosa go --profile {profile_name} --dry-run  ← preview")
+    out(f"    raagdosa go --profile {profile_name}            ← do it")
+    if is_first_run:
+        out(f"\n  {C.DIM}config.yaml has sensible defaults. Tweak later if needed.{C.RESET}")
+    out(f"  {C.DIM}Run 'raagdosa init' again to add another source folder.{C.RESET}\n")
 
 # ─────────────────────────────────────────────
 # High-level flows
@@ -5813,7 +6962,7 @@ def cmd_apply(cfg:Dict[str,Any],proposals_path:Path,interactive:bool,auto_above:
     profiles=cfg.get("profiles",{})
     if profile_name in profiles:
         prof=profiles[profile_name]; source_root=Path(prof["source_root"]).expanduser()
-        roots=ensure_roots(prof,source_root)
+        roots=ensure_roots(prof,source_root,create=not dry_run)
         viols=validate_proposal_paths(raw_props,[roots["clean_albums"],roots["review_albums"],roots["duplicates"]])
         if viols: err("⛔ Path validation failed:"); [err(f"  {v}") for v in viols]; sys.exit(1)
     folder_props=[fp_from_dict(fp) for fp in raw_props]
@@ -5853,7 +7002,7 @@ def _run_core(cfg_path:Path,cfg:Dict[str,Any],profile:str,interactive:bool,dry_r
     setup_logging_paths(cfg, profile_obj, source_root)
     _init_skip_sets(cfg)
 
-    roots=ensure_roots(profile_obj,source_root)
+    roots=ensure_roots(profile_obj,source_root,create=not dry_run)
     clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
     clean_root_str =str(roots["clean_root"].resolve())+os.sep
     review_root_str=str(roots["review_root"].resolve())+os.sep
@@ -6193,7 +7342,7 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
     setup_logging_paths(cfg, profile_obj, source_root)
     _init_skip_sets(cfg)
     effective_genre_roots = _resolve_genre_roots(cfg, genre_roots)
-    roots=ensure_roots(profile_obj,source_root)
+    roots=ensure_roots(profile_obj,source_root,create=not dry_run)
     clean_albums=roots["clean_albums"]; review_albums=roots["review_albums"]; dup_root=roots["duplicates"]
     wrapper_root_str=str(derive_wrapper_root(profile_obj,source_root).resolve())+os.sep
     clean_root_str =str(derive_clean_root(profile_obj,source_root).resolve())+os.sep
@@ -6244,12 +7393,15 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
     candidates=[rp for rp in candidates if not folder_matches_ignore(rp.name,ignore_patterns)]
 
     # Sort candidates based on user preference
+    _conf_sort=sort_by in ("confidence","confidence-desc")
     if sort_by=="date-created":
         candidates.sort(key=lambda p:p.stat().st_birthtime if hasattr(p.stat(),"st_birthtime") else p.stat().st_ctime)
         sort_label="date created"
     elif sort_by=="date-modified":
         candidates.sort(key=lambda p:p.stat().st_mtime)
         sort_label="date modified"
+    elif _conf_sort:
+        sort_label="confidence (hardest first)" if sort_by=="confidence" else "confidence (easiest first)"
     else:
         # Default: name — symbols first, then numbers, then letters (natural sort)
         candidates.sort(key=lambda p:p.name.lower())
@@ -6259,11 +7411,33 @@ def _interactive_streaming(cfg:Dict[str,Any],profile_name:str,dry_run:bool=False
     if total==0:
         out(f"\n  {C.DIM}No candidate folders found.{C.RESET}"); return
 
+    # Confidence sort requires pre-scanning all folders to get scores
+    _prescan_proposals:Optional[Dict[str,FolderProposal]]=None
+    if _conf_sort:
+        out(f"\n  Pre-scanning {total} folders for confidence sort...")
+        _prescan_list:List[Tuple[Path,FolderProposal]]=[]
+        _prog=Progress(total,"Pre-scanning")
+        for rp in candidates:
+            audio_files=list_audio_files(rp,exts,follow_sym)
+            if len(audio_files)>=min_tracks:
+                p=build_folder_proposal(rp,audio_files,source_root,profile_obj,cfg)
+                if p:
+                    _route_proposal(p,cfg,Counter(),existing_clean,manifest_entries,
+                                    review_albums,dup_root,mixes_root)
+                    _prescan_list.append((rp,p))
+            _prog.tick(rp.name)
+        _prog.done()
+        # Sort by confidence
+        reverse=sort_by=="confidence-desc"
+        _prescan_list.sort(key=lambda x:x[1].confidence,reverse=reverse)
+        candidates=[rp for rp,_ in _prescan_list]
+        total=len(candidates)
+
     # Session header
     print(f"\n{'═'*66}")
     print(f"  {C.BOLD}RAAGDOSA v{APP_VERSION}  ·  Interactive Review  ·  Session {session_id[:12]}{C.RESET}")
     print(f"{'─'*66}")
-    print(f"  Candidates: {total} folder(s)  ·  Scanning one at a time  ·  Sort: {sort_label}")
+    print(f"  Candidates: {total} folder(s)  ·  Sort: {sort_label}")
     if threshold: print(f"  Threshold: only review folders below {threshold:.2f}")
     if dry_run: print(f"  {C.YELLOW}DRY RUN — nothing will be moved{C.RESET}")
     print(f"  Press ? for help at any prompt.")
@@ -6962,7 +8136,7 @@ def cmd_tracks_only(cfg:Dict[str,Any],profile:str,interactive:bool,dry_run:bool)
     prof=profiles[profile]; source_root=Path(prof["source_root"]).expanduser()
     setup_logging_paths(cfg, prof, source_root)
     _init_skip_sets(cfg)
-    roots=ensure_roots(prof,source_root); clean_albums=roots["clean_albums"]
+    roots=ensure_roots(prof,source_root,create=not dry_run); clean_albums=roots["clean_albums"]
     sid=make_session_id(profile); out(f"Session: {sid} (tracks-only)"); register_stop_handler()
     exts=[e.lower() for e in cfg.get("scan",{}).get("audio_extensions",[".mp3",".flac",".m4a"])]
     for folder in sorted([p for p in clean_albums.rglob("*") if p.is_dir()]):
@@ -7139,6 +8313,7 @@ def cmd_undo(cfg:Dict[str,Any],action_id:Optional[str],session_id:Optional[str],
         if not selected: out("Nothing selected."); return
     if not selected: err("No matches."); return
     selected=sorted(selected,key=lambda x:x.get("timestamp",""),reverse=True); undone=0
+    _cleanup_dirs: Set[Path] = set()
     for h in selected:
         src=Path(h["target_path"]); dst=Path(h["original_path"])
         if not src.exists(): out(f"  SKIP (missing): {src.name}"); continue
@@ -7149,9 +8324,25 @@ def cmd_undo(cfg:Dict[str,Any],action_id:Optional[str],session_id:Optional[str],
                 if not cand.exists(): dst=cand; break
                 n+=1
         try:
-            ensure_dir(dst.parent); src.rename(dst) if tracks else shutil.move(str(src),str(dst))
+            ensure_dir(dst.parent)
+            if tracks:
+                src.rename(dst)
+            elif h.get("type") in ("crate_explode","catchall"):
+                # v9.0: crate explosion / catchall undo — move individual file back
+                shutil.move(str(src),str(dst))
+                _cleanup_dirs.add(src.parent)
+                _cleanup_dirs.add(src.parent.parent)
+            else:
+                shutil.move(str(src),str(dst))
             undone+=1; out(f"  UNDONE: {h.get('action_id')}  {src.name}  →  {dst.name}")
         except Exception as e: err(f"  FAILED: {h.get('action_id')} — {e}")
+    # Clean up empty dirs left behind (deepest first so parents become empty too)
+    for d in sorted(_cleanup_dirs, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if d.exists() and not any(d.iterdir()):
+                d.rmdir()
+                out(f"  REMOVED empty: {d.name}/")
+        except Exception: pass
     out(f"\nUndo complete. Reverted: {undone}")
 
 # ─────────────────────────────────────────────
@@ -7181,7 +8372,7 @@ def cmd_doctor(cfg_path:Path,cfg:Dict[str,Any])->None:
         # v5.5 — resolve logging and skip sets before anything that might use them
         setup_logging_paths(cfg, prof, source_root)
         _init_skip_sets(cfg)
-        roots=ensure_roots(prof,source_root)
+        roots=ensure_roots(prof,source_root,create=False)
         wrapper=derive_wrapper_root(prof,source_root)
         out(f"Wrapper: {wrapper}")
         try:
@@ -7607,10 +8798,64 @@ _CATCHALL_FOLDER_NAMES = {
     "chroma download",
 }
 
+def _clean_catchall_stem(stem: str) -> str:
+    """Clean a filename stem for catchall parsing: strip noise, underscores, brackets."""
+    # Strip bracket-wrapped prefixes: [www.site.com], [TAG], (01), etc.
+    s = re.sub(r"^\[.*?\]\s*", "", stem).strip()
+    s = re.sub(r"^\(.*?\)\s*", "", s).strip()
+    # Underscores → spaces
+    s = s.replace("_", " ")
+    # Collapse multiple spaces/dashes
+    s = re.sub(r"\s+", " ", s).strip()
+    # Strip leading track numbers: "05 ", "01. "
+    # But NOT Camelot/Open Key notation: 1A–12B, 1m–12d
+    _camelot_pat = re.compile(r"^(1[0-2]|[1-9])[ABab]\s*[-–.\s]")
+    _openkey_pat = re.compile(r"^(1[0-2]|[1-9])[dDmM]\s*[-–.\s]")
+    if not _camelot_pat.match(s) and not _openkey_pat.match(s):
+        s = re.sub(r"^(\d{1,3}[a-zA-Z]?[\s.\-]+)", "", s).strip()
+    else:
+        # Still strip pure numeric prefix (not the key): "05 6A Artist" → "6A Artist"
+        s = re.sub(r"^(\d{1,3}[\s.\-]+)(?=\d)", "", s).strip()
+    # Vinyl side notation: A1, B2 (uppercase letter + digit, not a word)
+    s = re.sub(r"^([A-Z]\d{1,2}[\s.\-]+)(?=[A-Z])", "", s).strip()
+    # Strip duplicate dashes left from cleanup ("- - " → " - ")
+    s = re.sub(r"[-–]\s*[-–]", "-", s).strip()
+    s = re.sub(r"^\s*[-–]\s*", "", s).strip()
+    return s
+
+def _parse_artist_from_stem(stem: str) -> Optional[str]:
+    """
+    Parse artist from a cleaned filename stem.
+    Handles: "Artist - Title", "Artist - Artist - Title" (deduplicated prefix).
+    Returns None if no valid artist found.
+    """
+    # Try "A - A - B" pattern (duplicated artist): take A
+    m3 = re.match(r"^(.+?)\s*[-–]\s*\1\s*[-–]\s*(.+)$", stem, re.I)
+    if m3:
+        candidate = m3.group(1).strip()
+        if len(candidate) > 1 and not candidate.isdigit():
+            return candidate
+    # Try "A - B - C" pattern: A is artist, skip if A looks like a track number
+    m2 = re.match(r"^(.+?)\s*[-–]\s*(.+?)\s*[-–]\s*(.+)$", stem)
+    if m2:
+        candidate = m2.group(1).strip()
+        # If first segment is very short and looks like a track ID, use second segment
+        if len(candidate) <= 3 and (candidate.isdigit() or re.match(r"^\d+[a-zA-Z]$", candidate)):
+            candidate = m2.group(2).strip()
+        if len(candidate) > 1 and not candidate.isdigit():
+            return candidate
+    # Simple "A - B" pattern
+    m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", stem)
+    if m:
+        candidate = m.group(1).strip()
+        if len(candidate) > 1 and not candidate.isdigit():
+            return candidate
+    return None
+
 def _extract_catchall_artist(path: Path, cfg: Dict[str, Any]) -> str:
     """
     Extract artist from a loose audio file for catchall grouping.
-    Priority: albumartist tag → artist tag → filename parse → parent folder name.
+    Priority: albumartist tag → artist tag → title tag parse → filename parse → _Unknown.
     """
     if MutagenFile is not None:
         try:
@@ -7620,18 +8865,83 @@ def _extract_catchall_artist(path: Path, cfg: Dict[str, Any]) -> str:
                 for key in ["albumartist", "artist"]:
                     v = t.get(key)
                     if isinstance(v, list): v = v[0] if v else None
-                    if v: return str(v).strip()
+                    if v and str(v).strip():
+                        # Clean underscores in tag values too (some taggers use them)
+                        val = str(v).strip().replace("_", " ")
+                        return val
+                # No artist tag — try parsing artist from title tag ("Artist - Title")
+                title_v = t.get("title")
+                if isinstance(title_v, list): title_v = title_v[0] if title_v else None
+                if title_v:
+                    cleaned = _clean_catchall_stem(str(title_v).strip())
+                    parsed = _parse_artist_from_stem(cleaned)
+                    if parsed:
+                        return smart_title_case(parsed)
         except Exception as e:
             out(f"  {C.DIM}Tag read failed: {e}{C.RESET}",level=VERBOSE)
-    # Filename parse: "Artist - Title.mp3"
-    stem = path.stem.strip()
-    m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", stem)
-    if m:
-        candidate = m.group(1).strip()
-        if len(candidate) > 1 and not candidate.isdigit():
-            return smart_title_case(candidate)
-    # Fall back to parent folder
-    return path.parent.name or "_Unknown"
+    # Filename parse
+    stem = _clean_catchall_stem(path.stem)
+    parsed = _parse_artist_from_stem(stem)
+    if parsed:
+        return smart_title_case(parsed)
+    return "_Unknown"
+
+def _build_catchall_track_name(path: Path, artist: str, cfg: Dict[str, Any]) -> str:
+    """Build a clean track filename for catchall moves: 'Artist - Title.ext'."""
+    tags = read_audio_tags(path, cfg)
+    title_raw = (tags.get("title") or "").strip()
+    artist_raw = (tags.get("artist") or "").strip()
+
+    # Clean underscores in tag values
+    if title_raw: title_raw = title_raw.replace("_", " ")
+    if artist_raw: artist_raw = artist_raw.replace("_", " ")
+
+    # Use tag artist if available, otherwise the grouped artist
+    display_artist = artist_raw or artist
+
+    if not title_raw:
+        # Parse from filename using shared cleanup
+        stem = _clean_catchall_stem(path.stem)
+        # Try to extract title (the part after the artist)
+        # "Artist - Artist - Title" → deduplicated
+        m3 = re.match(r"^(.+?)\s*[-–]\s*\1\s*[-–]\s*(.+)$", stem, re.I)
+        if m3:
+            title_raw = m3.group(2).strip()
+        else:
+            # "A - B - C" → title is last segment (C)
+            m2 = re.match(r"^(.+?)\s*[-–]\s*(.+?)\s*[-–]\s*(.+)$", stem)
+            if m2:
+                title_raw = m2.group(3).strip()
+            else:
+                m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", stem)
+                if m:
+                    title_raw = m.group(2).strip()
+                else:
+                    title_raw = stem
+
+    # Strip artist prefix from title if duplicated ("Pendulum - Fasten Your Seatbelts" → just title)
+    _art_lower = (display_artist or "").strip().lower()
+    _title_check = title_raw.strip()
+    _title_m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", _title_check)
+    if _title_m and _art_lower and _title_m.group(1).strip().lower() == _art_lower:
+        title_raw = _title_m.group(2).strip()
+
+    # Normalize artist and title
+    display_artist = smart_title_case(sanitize_name(display_artist), cfg)
+    title_clean = smart_title_case(sanitize_name(title_raw), cfg)
+
+    # Apply title cleanup if available
+    tc = cfg.get("title_cleanup", {})
+    if tc.get("enabled", True):
+        # Strip trailing noise phrases
+        for phrase in tc.get("strip_trailing_phrases", []):
+            _pat = re.compile(r"[\s\-–]*" + re.escape(phrase) + r"\s*$", re.IGNORECASE)
+            title_clean = _pat.sub("", title_clean).strip()
+
+    if not title_clean:
+        title_clean = path.stem
+
+    return f"{display_artist} - {title_clean}{path.suffix.lower()}"
 
 def cmd_catchall(
     cfg: Dict[str, Any],
@@ -7641,14 +8951,12 @@ def cmd_catchall(
     genre_roots: Optional[List[str]] = None,
 ) -> None:
     """
-    Process a flat dump folder: group loose files by artist into subfolders.
-    Artists with ≥ group_threshold tracks get their own folder.
-    Artists with fewer tracks go into _Singles/.
+    Process a flat dump folder: route loose files into Artist/Singles/ or Artist/Album/.
+    Every track gets an artist folder. Tracks sharing an album tag are grouped together.
     Cross-references with Clean/ to propose merges for known artists.
+    All moves are sessioned and undoable via `raagdosa undo --session <id>`.
     """
     cc = cfg.get("catchall", {})
-    group_threshold = int(cc.get("group_threshold", 3))
-    create_singles = bool(cc.get("create_singles_bucket", True))
     cross_ref = bool(cc.get("cross_reference_clean", True))
 
     # Auto-recognise catchall folder names
@@ -7666,6 +8974,13 @@ def cmd_catchall(
 
     exts = {e.lower() for e in cfg.get("scan", {}).get("audio_extensions", [".mp3", ".flac", ".m4a"])}
 
+    # Session setup — logs go to app log folder, not source folder
+    session_id = make_session_id("catchall", str(scan_path))
+    session_dir = Path(cfg["logging"]["session_dir"]) / session_id
+    if not dry_run:
+        ensure_dir(session_dir)
+    hist_path = Path(cfg["logging"]["history_log"])
+
     # Collect loose audio files (non-recursive — catchall is a flat dump)
     audio_files: List[Path] = []
     for f in scan_path.iterdir():
@@ -7678,28 +8993,116 @@ def cmd_catchall(
 
     out(f"  Found {len(audio_files)} audio files")
 
-    # Group by artist
-    by_artist: Dict[str, List[Path]] = {}
+    # ── Read tags once for all files ──────────────────────────────────
+    file_meta: Dict[Path, Dict[str, str]] = {}
     for af in audio_files:
         artist = _extract_catchall_artist(af, cfg)
-        by_artist.setdefault(artist, []).append(af)
+        album = ""
+        if MutagenFile:
+            try:
+                mf = MutagenFile(str(af), easy=True)
+                if mf and mf.tags:
+                    alb = mf.tags.get("album")
+                    if isinstance(alb, list): alb = alb[0] if alb else None
+                    if alb and str(alb).strip():
+                        album = str(alb).strip()
+            except Exception:
+                pass
+        file_meta[af] = {"artist": artist, "album": album}
 
-    # Classify
-    group_artists = {a: fs for a, fs in by_artist.items() if len(fs) >= group_threshold}
-    singles_files = [f for a, fs in by_artist.items() if len(fs) < group_threshold for f in fs]
+    # ── Group by artist (fuzzy — merge connector variants) ───────────
+    by_artist: Dict[str, List[Path]] = {}
+    _artist_canonical: Dict[str, str] = {}  # normalized key → chosen display name
+    for af, meta in file_meta.items():
+        raw = meta["artist"]
+        # Find existing group that matches this artist
+        matched_key = None
+        for existing_key in by_artist:
+            if artists_are_same(raw, existing_key, cfg):
+                matched_key = existing_key
+                break
+        if matched_key:
+            by_artist[matched_key].append(af)
+        else:
+            by_artist[raw] = [af]
 
-    # Cross-reference with Clean/ for merge proposals
+    # ── Cross-reference with Clean/ for merge proposals ───────────────
     clean_root: Optional[Path] = None
     if cross_ref and profile_name in cfg.get("profiles", {}):
         prof = cfg["profiles"][profile_name]
         source_root = Path(prof["source_root"]).expanduser()
         clean_root = derive_clean_root(prof, source_root)
 
+    # ── Build per-file routing plans ──────────────────────────────────
+    # Each file → Artist/Singles/ or Artist/Album/
     proposals: List[Dict[str, Any]] = []
+    artist_stats: Dict[str, Dict[str, int]] = {}  # artist → {albums: N, singles: N}
 
-    # Build proposals for grouped artists
-    for artist, files in sorted(group_artists.items()):
-        dst = scan_path / sanitize_name(artist)
+    for artist, files in sorted(by_artist.items()):
+        artist_clean = sanitize_name(normalize_artist_name(artist, cfg) or artist)
+        artist_dir = scan_path / artist_clean
+
+        # Sub-group by album within this artist
+        album_groups: Dict[str, List[Path]] = {}  # album → files
+        singles: List[Path] = []
+        for f in files:
+            alb = file_meta[f]["album"]
+            if alb:
+                album_groups.setdefault(alb, []).append(f)
+            else:
+                singles.append(f)
+
+        # Albums need ≥2 tracks sharing the same album tag to be treated as albums
+        confirmed_albums: Dict[str, List[Path]] = {}
+        for alb, alb_files in album_groups.items():
+            if len(alb_files) >= 2:
+                confirmed_albums[alb] = alb_files
+            else:
+                # Single track with album tag → treat as single
+                singles.extend(alb_files)
+
+        a_stats = {"albums": 0, "singles": 0}
+
+        # Build album proposals
+        for alb, alb_files in sorted(confirmed_albums.items()):
+            alb_clean = sanitize_name(smart_title_case(alb, cfg))
+            dst = artist_dir / alb_clean
+            file_plans = []
+            for f in alb_files:
+                new_name = _build_catchall_track_name(f, artist, cfg)
+                file_plans.append({"source": str(f), "target_name": new_name})
+            proposals.append({
+                "type": "catchall_album",
+                "artist": artist,
+                "artist_clean": artist_clean,
+                "album": alb,
+                "album_clean": alb_clean,
+                "files": file_plans,
+                "count": len(alb_files),
+                "destination": str(dst),
+            })
+            a_stats["albums"] += 1
+            out(f"  {C.BLUE}[ALBUM ]{C.RESET}  {artist_clean}/{alb_clean}/ ({len(alb_files)} tracks)")
+
+        # Build singles proposals → Artist/Singles/
+        if singles:
+            dst = artist_dir / "Singles"
+            file_plans = []
+            for f in singles:
+                new_name = _build_catchall_track_name(f, artist, cfg)
+                file_plans.append({"source": str(f), "target_name": new_name})
+            proposals.append({
+                "type": "catchall_singles",
+                "artist": artist,
+                "artist_clean": artist_clean,
+                "files": file_plans,
+                "count": len(singles),
+                "destination": str(dst),
+            })
+            a_stats["singles"] = len(singles)
+
+        artist_stats[artist_clean] = a_stats
+
         # Check if artist already exists in Clean/
         merge_target: Optional[Path] = None
         if clean_root and clean_root.exists():
@@ -7707,78 +9110,180 @@ def cmd_catchall(
                 if existing.is_dir() and artists_are_same(existing.name, artist, cfg):
                     merge_target = existing
                     break
-        props = {
-            "type": "catchall_group",
-            "artist": artist,
-            "files": [str(f) for f in files],
-            "count": len(files),
-            "destination": str(dst),
-            "merge_target": str(merge_target) if merge_target else None,
-        }
-        proposals.append(props)
+
+        total = len(files)
+        alb_count = a_stats["albums"]
+        sin_count = a_stats["singles"]
+        parts = []
+        if alb_count: parts.append(f"{alb_count} album{'s' if alb_count>1 else ''}")
+        if sin_count: parts.append(f"{sin_count} single{'s' if sin_count>1 else ''}")
+        detail = ", ".join(parts)
+
         if merge_target:
-            out(f"  {C.YELLOW}[MERGE?]{C.RESET}  {artist} ({len(files)} tracks) → {C.DIM}{merge_target}{C.RESET}")
-        else:
-            out(f"  {C.GREEN}[GROUP ]{C.RESET}  {artist} ({len(files)} tracks) → {dst.name}/")
-
-    # Singles bucket
-    if singles_files:
-        singles_dst = scan_path / "_Singles"
-        out(f"  {C.DIM}[SINGLE ]{C.RESET}  {len(singles_files)} tracks → _Singles/")
-        proposals.append({
-            "type": "catchall_singles",
-            "files": [str(f) for f in singles_files],
-            "count": len(singles_files),
-            "destination": str(singles_dst),
-        })
-
-    # Album detection: tracks sharing an album tag → propose album folder
-    album_groups: Dict[str, List[Path]] = {}
-    for af in audio_files:
-        if MutagenFile:
-            try:
-                mf = MutagenFile(str(af), easy=True)
-                if mf and mf.tags:
-                    alb = mf.tags.get("album")
-                    if isinstance(alb, list): alb = alb[0] if alb else None
-                    if alb:
-                        album_groups.setdefault(str(alb).strip(), []).append(af)
-            except Exception as e:
-                out(f"  {C.DIM}Tag read failed: {e}{C.RESET}",level=VERBOSE)
-    for alb_name, alb_files in album_groups.items():
-        if len(alb_files) >= 2:
-            out(f"  {C.BLUE}[ALBUM?]{C.RESET}  '{alb_name}' — {len(alb_files)} tracks share this album tag")
+            out(f"  {C.YELLOW}[MERGE?]{C.RESET}  {artist_clean} ({total} tracks: {detail}) → {C.DIM}{merge_target}{C.RESET}")
+        elif not confirmed_albums:
+            out(f"  {C.GREEN}[ARTIST]{C.RESET}  {artist_clean}/Singles/ ({total} tracks)")
 
     if dry_run:
-        out(f"\n  {C.DIM}--dry-run: no changes made. {len(proposals)} proposals generated.{C.RESET}")
+        out(f"\n  {C.DIM}--dry-run: no changes made. {len(proposals)} proposals.{C.RESET}")
+        # Show rename preview per proposal
+        for prop in proposals:
+            dst_short = Path(prop["destination"]).relative_to(scan_path)
+            out(f"  {C.DIM}→ {dst_short}/{C.RESET}")
+            for fp in prop["files"][:3]:
+                src_name = Path(fp["source"]).name
+                if src_name != fp["target_name"]:
+                    out(f"    {C.DIM}{src_name[:40]:<40} → {fp['target_name']}{C.RESET}")
+                else:
+                    out(f"    {C.DIM}{src_name}{C.RESET}")
+            if len(prop["files"]) > 3:
+                out(f"    {C.DIM}... and {len(prop['files']) - 3} more{C.RESET}")
         return
 
-    # Apply moves
-    applied = 0
+    # ── Apply moves with history logging ──────────────────────────────
+    applied: List[Dict[str, Any]] = []
+    created_dirs: Set[str] = set()
+    dupe_count = 0
     for prop in proposals:
         dst_path = Path(prop["destination"])
-        for f_str in prop["files"]:
-            f = Path(f_str)
-            if not f.exists(): continue
+        for fp in prop["files"]:
+            f = Path(fp["source"])
+            if not f.exists():
+                continue
             try:
                 ensure_dir(dst_path)
-                tgt = dst_path / f.name
+                created_dirs.add(str(dst_path))
+                tgt = dst_path / fp["target_name"]
+                # Collision resolution — detect true duplicates vs name clashes
                 if tgt.exists():
-                    tgt = dst_path / (f.stem + "_" + uuid.uuid4().hex[:4] + f.suffix)
+                    # Check if same file size (likely duplicate)
+                    if f.stat().st_size == tgt.stat().st_size:
+                        dupe_count += 1
+                        out(f"  {C.YELLOW}[DUPE?]{C.RESET}  {f.name} — same size as existing {tgt.name}, skipped")
+                        continue
+                    n = 1
+                    while True:
+                        cand = tgt.with_name(tgt.stem + f" ({n})" + tgt.suffix)
+                        if not cand.exists():
+                            tgt = cand
+                            break
+                        n += 1
+                # Preserve timestamps
+                src_stat = f.stat()
                 f.rename(tgt)
-                applied += 1
+                try:
+                    os.utime(str(tgt), (src_stat.st_atime, src_stat.st_mtime))
+                except Exception:
+                    pass
+
+                action_id = uuid.uuid4().hex[:10]
+                entry = {
+                    "action_id": action_id,
+                    "timestamp": now_iso(),
+                    "session_id": session_id,
+                    "type": "catchall",
+                    "move_type": "catchall",
+                    "original_path": str(f),
+                    "original_folder": str(scan_path),
+                    "target_path": str(tgt),
+                    "artist": prop.get("artist", "_Unknown"),
+                    "album": prop.get("album", ""),
+                    "proposal_type": prop["type"],
+                }
+                append_jsonl(hist_path, entry)
+                applied.append(entry)
             except Exception as e:
                 warn(f"Could not move {f.name}: {e}")
 
-    # Save proposals JSON
-    proposals_out = scan_path / "catchall_proposals.json"
-    write_json(proposals_out, {
-        "raagdosa_version": APP_VERSION,
-        "generated_at": now_iso(),
-        "source_folder": str(scan_path),
-        "proposals": proposals,
-    })
-    ok_msg(f"Applied {applied} moves  |  proposals saved: {proposals_out.name}")
+    # Save proposals to session log folder (not source folder)
+    if applied:
+        proposals_out = session_dir / "catchall_proposals.json"
+        write_json(proposals_out, {
+            "raagdosa_version": APP_VERSION,
+            "generated_at": now_iso(),
+            "session_id": session_id,
+            "source_folder": str(scan_path),
+            "proposals": proposals,
+            "created_dirs": list(created_dirs),
+        })
+
+    moved_n = len(applied)
+    renamed_n = sum(1 for a in applied if Path(a["original_path"]).name != Path(a["target_path"]).name)
+    unique_artists = len(artist_stats)
+    out(f"\n  {C.GREEN}✓ {moved_n} tracks moved{C.RESET} → {unique_artists} artist folder{'s' if unique_artists!=1 else ''}" +
+        (f", {renamed_n} renamed" if renamed_n else "") +
+        (f", {C.YELLOW}{dupe_count} duplicates skipped{C.RESET}" if dupe_count else ""))
+    out(f"  {C.DIM}Session: {session_id}{C.RESET}")
+    out(f"  {C.DIM}Undo: raagdosa undo --session {session_id}{C.RESET}")
+
+
+# ─────────────────────────────────────────────
+# help — grouped command reference
+# ─────────────────────────────────────────────
+def cmd_help()->None:
+    """Print a well-organised command reference grouped by workflow."""
+    _groups=[
+        ("Getting started",[
+            ("init",            "Guided setup — creates config.yaml + paths.local.yaml"),
+            ("doctor",          "Verify config, dependencies, disk space, DJ databases"),
+            ("status",          "Library overview (folder counts, sizes)"),
+        ]),
+        ("Core workflow",[
+            ("go",              "Scan + triage + move + rename  (the main command)"),
+            ("go --dry-run",    "Preview what would happen — nothing moves"),
+            ("go -i",           "Interactive mode — review each folder one by one"),
+            ("go -i --sort confidence","Interactive, hardest folders first"),
+            ("scan",            "Scan only → saves proposals.json"),
+            ("apply",           "Apply a saved proposals.json"),
+            ("folders",         "Folder pass only (no track rename)"),
+            ("tracks",          "Track rename pass only"),
+            ("resume",          "Resume an interrupted session"),
+        ]),
+        ("Inspect & debug",[
+            ("show <folder>",   "Deep-dive a single folder (scores, tags, routing)"),
+            ("show <folder> --tracks","Include per-track rename preview"),
+            ("report",          "View session report (txt/csv/html)"),
+            ("sessions",        "List recent sessions with move counts"),
+            ("history",         "Show move/rename history"),
+            ("tree <path>",     "Snapshot a directory tree"),
+            ("tree --diff A B", "Diff two snapshots"),
+            ("compare A B",     "Compare two folders side by side"),
+            ("diff A B",        "Diff two session reports"),
+        ]),
+        ("Library management",[
+            ("artists --list",  "List all artists in Clean library"),
+            ("artists --find Q","Fuzzy-find an artist"),
+            ("review-list",     "Summarise Review folder contents"),
+            ("review-promote",  "Re-evaluate a Review folder (VA → album)"),
+            ("clean-report",    "Stats and health report for Clean library"),
+            ("verify",          "Audit Clean library health"),
+            ("orphans",         "Find loose audio files in Clean/Review"),
+            ("extract",         "Extract tracks from a VA/mix folder"),
+            ("catchall <path>", "Group loose files in a dump folder by artist"),
+        ]),
+        ("Learning & config",[
+            ("learn",           "Suggest config improvements from past sessions"),
+            ("learn-crates",    "Discover crate naming patterns from a folder tree"),
+            ("genre add/list/remove","Manage genre root declarations"),
+            ("profile list/add/set", "Manage source profiles"),
+            ("template list/show",   "Browse library organisation templates"),
+            ("reference",       "Manage musical reference (aliases, labels, patterns)"),
+            ("cache",           "Manage tag cache (status/clear/evict)"),
+        ]),
+        ("Undo",[
+            ("undo --session last",  "Undo the last session"),
+            ("undo --id <ID>",       "Undo a specific move by action ID"),
+            ("undo --folder <name>", "Undo all moves for a folder"),
+        ]),
+    ]
+    out(f"\n{C.BOLD}RaagDosa v{APP_VERSION} — Command Reference{C.RESET}")
+    out(f"{'═'*55}")
+    for group_name,commands in _groups:
+        out(f"\n  {C.BOLD}{group_name}{C.RESET}")
+        for cmd,desc in commands:
+            out(f"    {C.CYAN}{cmd:<28}{C.RESET} {desc}")
+    out(f"\n  {C.DIM}Use 'raagdosa <command> --help' for detailed options.{C.RESET}")
+    out(f"  {C.DIM}Use '--verbose' with any command for extra detail.{C.RESET}\n")
 
 
 # ─────────────────────────────────────────────
@@ -7812,6 +9317,7 @@ Examples:
     p.add_argument("--config",default="config.yaml"); p.add_argument("--version",action="version",version=f"raagdosa {APP_VERSION}")
     p.add_argument("--verbose",action="store_true"); p.add_argument("--quiet",action="store_true")
     sub=p.add_subparsers(dest="cmd",required=True)
+    sub.add_parser("help",help="Grouped command reference")
     sub.add_parser("init",help="Guided first-time setup")
     sp=sub.add_parser("profile",help="Manage profiles"); psub=sp.add_subparsers(dest="profile_cmd",required=True)
     psub.add_parser("list"); psub.add_parser("show").add_argument("name")
@@ -7838,19 +9344,22 @@ Examples:
         c.add_argument("--genre-roots",metavar="ROOTS",help="Comma-separated genre root folder names (session-only)")
         c.add_argument("--itunes",action="store_true",help="Strip iTunes Genre/ layer before scanning")
         c.add_argument("--threshold",type=float,metavar="SCORE",help="Interactive: only review folders below this confidence score")
-        c.add_argument("--sort",choices=["name","date-created","date-modified"],default="name",help="Interactive: folder sort order (default: name)")
+        c.add_argument("--sort",choices=["name","date-created","date-modified","confidence","confidence-desc"],default="name",help="Sort order: name, date-created, date-modified, confidence (hardest first), confidence-desc (easiest first)")
         c.add_argument("--force",action="store_true",help="Nuclear option: bypass triage, process all folders without confirmation (original streaming behaviour)")
         c.add_argument("--auto-above",type=float,metavar="SCORE",dest="auto_above",help="Override auto-approve threshold for triage (default: review_rules.auto_approve_threshold)")
         c.add_argument("--session-name",metavar="NAME",help="Human-friendly session name (e.g. 'Bandcamp Friday')")
     fo=sub.add_parser("folders",help="Folder pass only"); fo.add_argument("--profile"); fo.add_argument("--interactive",action="store_true"); fo.add_argument("--dry-run",action="store_true"); fo.add_argument("--since")
     fo.add_argument("--genre-roots",metavar="ROOTS"); fo.add_argument("--itunes",action="store_true")
-    fo.add_argument("--sort",choices=["name","date-created","date-modified"],default="name",help="Interactive: folder sort order")
+    fo.add_argument("--sort",choices=["name","date-created","date-modified","confidence","confidence-desc"],default="name",help="Sort order")
     tr=sub.add_parser("tracks",help="Track rename pass"); tr.add_argument("--profile"); tr.add_argument("--interactive",action="store_true"); tr.add_argument("--dry-run",action="store_true")
     sub.add_parser("status",help="Library overview").add_argument("--profile")
     rs=sub.add_parser("resume",help="Resume interrupted session"); rs.add_argument("session_id"); rs.add_argument("--interactive",action="store_true"); rs.add_argument("--dry-run",action="store_true")
     sh=sub.add_parser("show",help="Debug a single folder"); sh.add_argument("folder"); sh.add_argument("--profile"); sh.add_argument("--tracks",action="store_true",help="Also show per-track rename preview")
     sub.add_parser("verify",help="Audit Clean library health").add_argument("--profile")
     le=sub.add_parser("learn",help="Suggest config improvements"); le.add_argument("--session")
+    lc=sub.add_parser("learn-crates",help="Discover crate naming patterns from existing folders")
+    lc.add_argument("path",help="Directory to scan for crate patterns")
+    lc.add_argument("--min-tracks",type=int,default=3,help="Minimum audio files to consider a folder (default: 3)")
     rp=sub.add_parser("report",help="View session report"); rp.add_argument("--session"); rp.add_argument("--format",default="txt",choices=["txt","csv","html"])
     sub.add_parser("doctor",help="Check config, deps, disk, DJ databases")
     hi=sub.add_parser("history",help="Show history"); hi.add_argument("--last",type=int,default=50); hi.add_argument("--session"); hi.add_argument("--match"); hi.add_argument("--tracks",action="store_true")
@@ -7934,8 +9443,10 @@ def main()->None:
     if getattr(args,"verbose",False): set_verbosity(VERBOSE)
     elif getattr(args,"quiet",False): set_verbosity(QUIET)
     cfg_path=Path(args.config); cmd=args.cmd
+    if cmd=="help": cmd_help(); return
     if cmd=="init": cmd_init(cfg_path); return
     cfg=load_config_with_paths(cfg_path)
+    cfg["_cfg_path"]=str(cfg_path)  # runtime-only, for learning features
     _validate_config(cfg)
     # Human-friendly check: warn if no profiles have source_root configured
     profiles_cfg=cfg.get("profiles",{})
@@ -7987,6 +9498,7 @@ def main()->None:
     elif cmd=="show":     cmd_show(cfg,args.folder,getattr(args,"profile",None) or cfg.get("active_profile",""),show_tracks=bool(getattr(args,"tracks",False)))
     elif cmd=="verify":   cmd_verify(cfg,gp())
     elif cmd=="learn":    cmd_learn(cfg_path,cfg,getattr(args,"session",None))
+    elif cmd=="learn-crates": cmd_learn_crates(cfg_path,cfg,args.path,min_tracks=getattr(args,"min_tracks",3))
     elif cmd=="report":   cmd_report(cfg,getattr(args,"session",None),args.format)
     elif cmd=="doctor":   cmd_doctor(cfg_path,cfg)
     elif cmd=="history":  cmd_history(cfg,last=args.last,session=args.session,match=args.match,tracks=bool(args.tracks))

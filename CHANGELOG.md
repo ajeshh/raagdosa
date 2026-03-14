@@ -5,6 +5,130 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [9.0.0] — 2026-03-14
+
+### Release summary
+
+v9.0 is the **"DJ Crate Intelligence"** release. The most common misclassification in v8 was personal
+DJ crates — singles dumps, genre bins, download folders — being treated as Various Artists compilations.
+v9 fixes this with a new detection and routing subsystem. Detected crates can be "exploded" so each
+track routes to the right artist folder, while embedded albums found within crates stay together. Set
+prep folders are preserved intact. Artist matching is also significantly smarter: collaboration
+connectors and ordering no longer cause duplicate folders.
+
+---
+
+### New — DJ Crate detection
+
+RaagDosa now distinguishes personal DJ crates from true VA compilations. A folder of unrelated tracks
+by different artists — a Beatport download dump, a genre bin, a "New Music" folder — is no longer
+misclassified as a VA compilation. Crate detection uses five weighted signals: album diversity (how
+many different albums are represented), album tag quality (blank or placeholder tags), track number
+incoherence (gaps, duplicates, or missing numbers), folder name keywords (matching names like
+"singles", "downloads", "unsorted"), and compilation flag absence.
+
+Detected crates are tagged `[CRATE]` in scan output and summarised in session results.
+
+Configurable via the new `djcrates:` section in `config.yaml`:
+
+```yaml
+djcrates:
+  enabled: true
+  detection_threshold: 0.55    # weighted score threshold
+  album_coherence_veto: 0.6    # album share above this = never a crate
+  explode_to_artist_folders: true
+```
+
+### New — Crate explosion
+
+Instead of moving a crate folder as one unit, each track routes to `Artist/Singles/` based on its
+tags. If the crate contains tracks from a coherent album or EP (tracks sharing the same album tag
+with sequential track numbers), those tracks are kept together as a release rather than split into
+Singles.
+
+```
+BEFORE (source):
+  Downloads-March/
+    Artist A - Track 1.flac
+    Artist A - Track 2.flac
+    Artist B - Some Remix.flac
+    Artist C - Night Drive 01.flac   (album: "Night Drive EP")
+    Artist C - Night Drive 02.flac   (album: "Night Drive EP")
+
+AFTER (Clean/):
+  Artist A/Singles/Track 1.flac
+  Artist A/Singles/Track 2.flac
+  Artist B/Singles/Some Remix.flac
+  Artist C/Night Drive EP/Night Drive 01.flac
+  Artist C/Night Drive EP/Night Drive 02.flac
+```
+
+In interactive mode, crate folders show a dedicated prompt:
+
+| Key | Action |
+|-----|--------|
+| `e` | Explode — route each track to its artist folder |
+| `v` | Keep as VA — treat as compilation |
+| `s` | Skip |
+| `d` | Show all tracks |
+
+Controlled by `djcrates.explode_to_artist_folders` (default: `true`). Always preview with `--dry-run`
+first — crate explosion is a significant organizational change.
+
+### New — Set prep detection
+
+Folders matching gig/set prep patterns — "closing set", "warm up", "b2b", "gig", "party", "prep" —
+are preserved intact and routed to `Review/_Sets/` instead of being exploded or treated as VA. These
+represent intentional curation that should not be scattered across artist folders.
+
+Configurable via `djcrates.keep_intact_patterns` and `djcrates.custom_set_patterns` in `config.yaml`.
+
+### New — `learn-crates` command
+
+Scans a directory tree, finds folders that look like DJ crates, groups them by naming pattern, and
+offers to save discovered patterns to `config.yaml`. Run once when first setting up RaagDosa, or
+after reorganising your incoming folder structure.
+
+```bash
+raagdosa learn-crates /Volumes/bass/DJ\ Genres/
+raagdosa learn-crates /path --min-tracks 5
+```
+
+### New — `help` command
+
+`raagdosa help` prints a grouped command reference organised by workflow — core, inspect, library,
+sessions, learning, profiles. Faster than scrolling `--help`.
+
+### New — Smarter artist matching
+
+**Connector normalisation:** `+`, `and`, `×`, `feat`, `ft`, `vs` all normalise to `&` before artist
+comparison. "Solomun + Tale Of Us" now matches "Solomun & Tale Of Us" instead of creating separate
+folders.
+
+**Collab order independence:** "A & B" now matches "B & A". Comma-separated collabs also match:
+"Rusko, Caspa" matches "Caspa & Rusko".
+
+This is matching only — tags are never modified.
+
+### New — Per-folder crate override
+
+The `.raagdosa` sidecar file now accepts `folder_type: crate_singles` or `folder_type: crate_set`
+to force crate classification on any folder, bypassing automatic detection.
+
+### Changed
+
+- **Singles folder default:** `library.singles_folder` default changed from `_Singles` to `Singles`.
+  Existing configs that specify `_Singles` are unaffected — the value is read from your config at
+  runtime. Existing `_Singles/` folders on disk are not renamed.
+- **`--sort` flag on `folders` subcommand:** Same sort options as `go` — name, date-created,
+  date-modified, confidence, confidence-desc.
+- **Catchall command:** Improved artist parsing from filenames and better track name formatting.
+- **Compilation flag reading:** Tags `compilation`, `TCMP`, `cpil` are now read from audio files.
+  Used as a signal in crate detection — presence of compilation flags indicates an intentional VA
+  release, not a personal crate.
+
+---
+
 ## [8.5.0] — 2026-03-14
 
 ### Release summary

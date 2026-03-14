@@ -8,14 +8,15 @@
 2. [How it works](#how-it-works)
 3. [The triage workflow](#the-triage-workflow)
 4. [Interactive review](#interactive-review)
-5. [Profiles](#profiles)
-6. [Library templates](#library-templates)
-7. [Understanding the confidence score](#understanding-the-confidence-score)
-8. [Configuration](#configuration)
-9. [Sessions and history](#sessions-and-history)
-10. [Undoing a run](#undoing-a-run)
-11. [Debug a single folder](#debug-a-single-folder)
-12. [DJ workflow notes](#dj-workflow-notes)
+5. [DJ Crates](#dj-crates)
+6. [Profiles](#profiles)
+7. [Library templates](#library-templates)
+8. [Understanding the confidence score](#understanding-the-confidence-score)
+9. [Configuration](#configuration)
+10. [Sessions and history](#sessions-and-history)
+11. [Undoing a run](#undoing-a-run)
+12. [Debug a single folder](#debug-a-single-folder)
+13. [DJ workflow notes](#dj-workflow-notes)
 
 ---
 
@@ -111,6 +112,7 @@ RaagDosa runs the same six-step pipeline on every folder in your source:
   5. ROUTE     score ≥ threshold  →  Clean/
                score < threshold  →  Review/
                name collision     →  Review/Duplicates/
+               DJ crate detected  →  explode or Review/_Sets/
 
   6. MOVE      Same filesystem  →  atomic os.rename() (~1ms per folder)
                Cross-device     →  copy → verify checksum → delete source
@@ -136,10 +138,11 @@ RaagDosa runs the same six-step pipeline on every folder in your source:
           CD1/
           CD2/
     _Mixes/
-    _Singles/
+    Singles/
   Review/
     Albums/
     Duplicates/
+    _Sets/
   logs/
     history.jsonl
     sessions/
@@ -259,6 +262,139 @@ raagdosa go --interactive --threshold 0.8
 raagdosa go --interactive --sort name            # alphabetical (default)
 raagdosa go --interactive --sort date-modified   # most recently touched first
 raagdosa go --interactive --sort date-created    # newest in folder first
+```
+
+---
+
+## DJ Crates
+
+Every DJ has folders that are not albums: a "New Techno" genre bin, a "Downloads March" dump, a "Bangers" playlist folder, a "Closing Set Fabric" prep folder. These contain tracks from many different artists but they are not Various Artists compilations — they are personal organisational crates.
+
+RaagDosa v9.0 detects these automatically and handles them differently from albums and VA releases.
+
+### How detection works
+
+RaagDosa scores each folder on five signals:
+
+| Signal | Weight | What it checks |
+|--------|--------|---------------|
+| Album diversity | 0.35 | How many different album tags are present — crates have many |
+| Album quality | 0.20 | Fraction of tracks with blank, placeholder, or folder-echo album tags |
+| Track incoherence | 0.15 | Gaps, duplicates, or missing track numbers — real albums are sequential |
+| Folder keywords | 0.15 | Names like "singles", "downloads", "unsorted", "promos", "edits" |
+| Compilation absence | 0.15 | No compilation flag set — real VA releases usually have this tag |
+
+If the weighted score exceeds the threshold (default 0.55), the folder is classified as a crate. Hard vetoes prevent false positives: if most tracks share the same real album name, or have the compilation flag set, or have sequential track numbers with no gaps, the folder is never classified as a crate.
+
+### Crate vs VA — worked examples
+
+**This is a crate** (detected, will be exploded):
+```
+New House Downloads/
+  Disclosure - You & Me.mp3        [album: —]
+  Bicep - Glue.flac                [album: —]
+  Four Tet - Baby.mp3              [album: —]
+  Floating Points - Ratio.flac     [album: "Ratio"]
+  → 4 artists, no shared album, no track numbers = crate
+```
+
+**This is NOT a crate** (real VA compilation, left intact):
+```
+Fabric 100/
+  Track 01.flac   [album: "Fabric 100", compilation: 1]
+  Track 02.flac   [album: "Fabric 100", compilation: 1]
+  Track 03.flac   [album: "Fabric 100", compilation: 1]
+  → Shared album tag, compilation flag, sequential tracks = VA
+```
+
+### Crate explosion
+
+When a crate is detected, RaagDosa can "explode" it: instead of moving the whole folder as one unit, each track routes individually to `Artist/Singles/` based on its tags.
+
+If the crate contains tracks from a coherent album or EP — tracks that share the same album tag with sequential numbering — those tracks are kept together as a release.
+
+```
+BEFORE (source):
+  Downloads-March/
+    Artist A - Track 1.flac
+    Artist A - Track 2.flac
+    Artist B - Some Remix.flac
+    Artist C - Night Drive 01.flac   (album: "Night Drive EP", track: 1)
+    Artist C - Night Drive 02.flac   (album: "Night Drive EP", track: 2)
+
+AFTER (Clean/):
+  Artist A/Singles/Track 1.flac
+  Artist A/Singles/Track 2.flac
+  Artist B/Singles/Some Remix.flac
+  Artist C/Night Drive EP/Night Drive 01.flac
+  Artist C/Night Drive EP/Night Drive 02.flac
+```
+
+Always preview with `--dry-run` before exploding crates. If you have already imported these tracks into Rekordbox, Serato, or Traktor, explosion will break all library references, cue points, and beatgrids for those tracks.
+
+Controlled by `djcrates.explode_to_artist_folders` in `config.yaml` (default: `true`). Set to `false` to detect crates without exploding them — they route to Review/ as whole folders instead.
+
+### Interactive crate prompts
+
+In interactive mode (`-i`), when a crate is detected you see a dedicated prompt:
+
+```
+  [Crate detected] Downloads-March/ (28 tracks, 22 artists)
+  Confidence: 0.31  |  Crate score: 0.89
+
+  (e) Explode — route each track to its artist folder
+  (v) Keep as VA — treat as compilation
+  (s) Skip — do nothing
+  (d) Show tracks — list contents
+
+  > d
+
+  1. Artist A - Track 1          [album: —]
+  2. Artist A - Track 2          [album: —]
+  3. Artist C - Night Drive 01   [album: Night Drive EP]
+  4. Artist C - Night Drive 02   [album: Night Drive EP]
+  ...
+
+  > e
+  Exploding: 26 tracks → Singles/, 2 tracks → Artist C/Night Drive EP/
+```
+
+These keys replace the standard review keys only when a crate is detected. For non-crate folders, `e` still means "edit album title".
+
+### Set prep folders
+
+Folders matching set/gig prep patterns are preserved intact — no explosion, no renaming. They route to `Review/_Sets/` as whole folders, because they represent intentional curation you will want to revisit.
+
+Default patterns: "set", "gig", "party", "closing", "opening", "warm up", "prep", "b2b".
+
+Add your own in `config.yaml`:
+
+```yaml
+djcrates:
+  custom_set_patterns:
+    - "(?i)headline"
+    - "(?i)afters"
+    - "(?i)residency"
+```
+
+### Teaching RaagDosa your crate patterns
+
+Run `learn-crates` once when setting up, or after reorganising your folder structure:
+
+```bash
+raagdosa learn-crates /Volumes/bass/DJ\ Genres/
+raagdosa learn-crates /path --min-tracks 5
+```
+
+This scans the directory tree, finds folders that look like crates, groups them by naming pattern, and offers to save discovered patterns to `config.yaml`.
+
+### Per-folder override
+
+Drop a `.raagdosa` file inside any folder to force crate classification:
+
+```yaml
+folder_type: crate_singles   # force crate detection and explosion
+folder_type: crate_set       # force set prep (preserved intact)
 ```
 
 ---
@@ -612,6 +748,12 @@ This shows you tag votes, confidence breakdown, proposed name, and routing decis
 4. Inspect Clean/ — verify the structure looks right
 5. Import Clean/ into Rekordbox / Serato / Traktor as a new collection
 6. Re-analyse in your DJ software — fresh waveforms, accurate BPM, consistent cue points
+
+### Crate explosion and DJ software
+
+Crate explosion is especially risky for tracks already in your DJ software. When RaagDosa explodes a crate, every track moves to a new path — `Artist/Singles/filename`. If those tracks are in your Rekordbox collection, all cue points, memory cues, beatgrids, hot cues, and play history for those tracks will break.
+
+**Rule of thumb:** only explode crates that have not been imported into your DJ software yet. If you have already analysed and cued tracks in a crate folder, either skip it or export your DJ software database first.
 
 ### If you break DJ software links
 

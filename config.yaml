@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # RaagDosa — Configuration
-# v7.0
+# v9.0
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # Run `raagdosa init` to set this file up interactively.
@@ -71,7 +71,7 @@ library:
   # true → all-FLAC folders go to Artist/FLAC/Album/ (archival masters separate)
   flac_segregation: false
 
-  singles_folder:       _Singles
+  singles_folder:       Singles
   va_folder:            _Various Artists
   mixes_folder:         _Mixes
   unknown_artist_label: _Unknown
@@ -302,6 +302,73 @@ format_suffix:
   only_if_all_same_extension: true
   ignore_extension: ".mp3"
   style: brackets_upper
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DJ CRATES DETECTION  (v9.0)
+# Detects personal DJ organizational folders (singles dumps, genre bins, set
+# prep crates, download dumps) and classifies them separately from true VA
+# compilations.  Phase 1: detection only — crates route to Review/ as whole
+# folders with folder_type="crate_singles" or "crate_set".
+# ──────────────────────────────────────────────────────────────────────────────
+djcrates:
+  enabled: true
+  min_tracks: 3
+  # Weighted score threshold — folders scoring above this are classified as crates
+  detection_threshold: 0.55
+  # Album share above this = never a crate (hard veto)
+  album_coherence_veto: 0.6
+  # true = explode crate folders into per-artist _Singles/ subfolders
+  # false = detect only, route crate folders as whole units to Review/
+  explode_to_artist_folders: true
+  # Default routing for crates (review = always review, clean = allow clean if track quality ok)
+  default_routing: "review"
+
+  # Built-in crate keyword patterns (matched case-insensitively against folder name)
+  folder_name_patterns:
+    - "singles"
+    - "unsorted"
+    - "to sort"
+    - "downloads"
+    - "incoming"
+    - "misc"
+    - "dump"
+    - "random"
+    - "temp"
+    - "new music"
+    - "promos"
+    - "edits"
+    - "tools"
+    - "bangers"
+
+  # User-defined crate patterns (regex, populated by learn-crates or manual)
+  custom_crate_patterns: []
+
+  # User-defined set prep patterns (regex)
+  custom_set_patterns: []
+
+  # Learned veto patterns — folders matching these are NOT treated as crates
+  # (populated by interactive correction learning)
+  crate_veto_patterns: []
+
+  # Album tags treated as placeholders (indicate no real album identity)
+  unknown_album_patterns:
+    - "unknown album"
+    - "untitled"
+    - ""
+
+  # Built-in set/gig prep patterns — folders matching these are preserved intact
+  keep_intact_patterns:
+    - "(?i)set\\b"
+    - "(?i)gig\\b"
+    - "(?i)party\\b"
+    - "(?i)closing"
+    - "(?i)opening"
+    - "(?i)warm.?up"
+    - "(?i)prep\\b"
+    - "(?i)b2b"
+
+  # Where preserved set-prep crates go under Review/
+  keep_intact_routing: "_Sets"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EP DETECTION
