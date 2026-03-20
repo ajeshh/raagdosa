@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raagdosa"
-version = "8.5.0"
+version = "10.0.0"
 description = "Deterministic music library cleanup for DJs and collectors — CLI-first, safe-by-default, undoable."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -47,4 +47,5 @@ Repository = "https://github.com/raagdosa/raagdosa"
 Changelog = "https://github.com/ajeshh/raagdosa/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-py-modules = ["raagdosa"]
+packages = ["raagdosa"]
+py-modules = ["raagdosa_scanner", "raagdosa_tags"]

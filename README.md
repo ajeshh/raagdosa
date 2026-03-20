@@ -11,7 +11,7 @@
 
 **A tag-aware folder organiser for DJs and music collectors.**
 
-[![Version](https://img.shields.io/badge/version-9.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-10.0.0-brightgreen?style=flat-square&color=0d1117&labelColor=21262d)](CHANGELOG.md)
 [![Python versions](https://img.shields.io/pypi/pyversions/raagdosa?style=flat-square&color=0d1117&labelColor=21262d&logo=python&logoColor=f5f5f5)](https://pypi.org/project/raagdosa/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square&color=0d1117&labelColor=21262d)](LICENSE)
 
@@ -78,7 +78,7 @@ It reads every audio tag in every file — artist, album, year, genre, BPM, key,
 
 ## What RaagDosa does not do
 
-- Does not modify audio tags — tags are read-only input
+- Does not modify audio tags during folder organising — tags are read-only input for the move pipeline. The separate [tag fix workflow](guide/GUIDE.md#tag-fixing) can write tag corrections, but only when you explicitly review and approve each change.
 - Does not transcode or convert files
 - Does not connect to Discogs, MusicBrainz, or any external service
 - Does not delete anything, ever
@@ -102,7 +102,7 @@ Every file move is logged to `logs/history.jsonl`. Undo is always available by s
 
 | Guide | What it covers |
 |-------|---------------|
-| [User Guide](guide/GUIDE.md) | Setup, triage, interactive review, DJ crates, profiles, templates, scoring, config, sessions, undo |
+| [User Guide](guide/GUIDE.md) | Setup, triage, interactive review, DJ crates, profiles, templates, scoring, config, sessions, undo, tag fixing |
 | [Commands Reference](RaagDosa-Commands.md) | Every command and flag |
 | [Changelog](CHANGELOG.md) | Release history |
 

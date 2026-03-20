@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [10.0.0] — 2026-03-19
+
+### Release summary
+
+**The Modularisation Release.** RaagDosa's 9,550-line monolith (`raagdosa.py`) has been fully replaced by a clean 24-module Python package (`raagdosa/`), and v10 adds a **tag fix workflow** — a separate pipeline for reviewing and applying tag corrections to your audio files. The scanner generates fix proposals (whitespace cleanup, missing albumartist, BPM extraction, genre normalisation, and more); you review them interactively, apply the ones you accept, and undo any time. This is entirely separate from RaagDosa's folder organising pipeline. Your files are never modified unless you explicitly approve each change.
+
+---
+
+### Added — Tag fix pipeline
+
+- **`tags status`** — summary of scanner proposals grouped by risk tier (safe/moderate/destructive) and status (pending/accepted/rejected/applied)
+- **`tags review`** — interactive per-proposal review with accept/reject/skip/quit. Supports filtering by `--risk`, `--fix-type`, `--folder`
+- **`tags review --auto`** — auto-accept proposals matching configured risk tier and confidence threshold. Disabled by default (`auto_approve_threshold: 1.0`)
+- **`tags apply`** — write accepted tag changes to audio files. Every original value is snapshotted in the scanner database before writing. Confirmation gate before any file is modified
+- **`tags apply --dry-run`** — preview all changes without writing to files
+- **`tags apply --max-batch N`** — limit batch size (default 50) to keep apply sessions manageable
+- **`tags undo --last`** — revert the most recent apply session from snapshots
+- **`tags undo --session <id>`** — revert a specific apply session
+- **Risk tiers**: safe (whitespace, noise removal, comment cleanup, original mix strip, feat normalise), moderate (fill albumartist, BPM/key extraction, genre normalise, fill from folder), destructive (artist normalise, encoding repair, ID3 upgrade)
+- **Protected fields**: title and artist are excluded from bulk operations by default. Use `--include-protected` to opt in
+- **`tag_fix:` config section** — controls enabled fix types, protected fields, batch size, auto-approve threshold, and risk tier auto-accept list
+
+### Changed
+
+- Default `auto_approve_threshold` set to `1.0` (auto-approve disabled until you explicitly lower it)
+- Default `protected_fields` now includes both `title` and `artist`
+- Commands reference updated to v10.0
+
+### Internal — Monolith → Package
+
+- **Deleted `raagdosa.py`** (9,550 lines) — the entire monolith is gone
+- **New `raagdosa/` package** with 24 focused modules: `__init__`, `__main__`, `artists`, `cli`, `commands`, `config`, `core`, `crates`, `files`, `interactive`, `library`, `moves`, `naming`, `orchestration`, `pipeline`, `proposal`, `review`, `scanning`, `scoring`, `session`, `tagreader`, `tags`, `tags_cmd`, `tracks`, `ui`
+- Each module owns a single concern following a strict dependency DAG
+- Entry points preserved — `raagdosa` CLI and `python -m raagdosa` work identically
+- **`raagdosa_tags.py`** — backward-compatible shim for external scripts referencing the old layout
+- **`raagdosa_scanner.py`** — standalone tag scanner training tool
+
+---
+
 ## [9.0.0] — 2026-03-14
 
 ### Release summary

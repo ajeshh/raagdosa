@@ -130,3 +130,9 @@ CLAUDE.md
 
 # Local documentation used by agents
 docs/
+
+# ─────────────────────────────
+# Deprecated monolith files
+# ─────────────────────────────
+
+deprecated/

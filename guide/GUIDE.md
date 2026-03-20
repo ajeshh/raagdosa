@@ -17,6 +17,7 @@
 11. [Undoing a run](#undoing-a-run)
 12. [Debug a single folder](#debug-a-single-folder)
 13. [DJ workflow notes](#dj-workflow-notes)
+14. [Tag fixing](#tag-fixing)
 
 ---
 
@@ -777,6 +778,174 @@ library:
 **Camelot key mapping:**
 
 The `{camelot_key}` template token converts raw key tags (Am, A minor, A min, F#m, Ebm) to Camelot notation (1A–12B). All 24 keys and enharmonic equivalents are mapped.
+
+---
+
+## Tag fixing
+
+Tag fixing is a separate pipeline from folder organising. RaagDosa's core workflow reads tags but never modifies them. The tag fix pipeline is opt-in: you review every proposed change before anything is written, and every write is undoable.
+
+### What it does
+
+The scanner (`raagdosa-scanner scan`) analyses your audio files and generates fix proposals — things like trailing whitespace in artist names, missing albumartist tags, extractable BPM values, or genre normalisation. These proposals sit in a SQLite database. The `tags` command family lets you review, apply, and undo them.
+
+No tags are modified until you explicitly run `tags apply` and confirm.
+
+### Risk tiers
+
+Every proposal has a risk tier that reflects how likely it is to be correct and how impactful a wrong change would be:
+
+| Tier | Fix types | What they do |
+|------|-----------|-------------|
+| **Safe** | `whitespace`, `noise_removal`, `comment_cleanup`, `original_mix_strip`, `feat_normalize` | Remove trailing spaces, strip scene tags, clean comment fields, normalise "(Original Mix)" to nothing, standardise "feat." formatting |
+| **Moderate** | `fill_album_artist`, `bpm_extraction`, `key_extraction`, `genre_normalize`, `fill_from_folder` | Fill missing albumartist from artist, extract BPM/key from filename or comments, normalise genre spelling, derive tags from folder name |
+| **Destructive** | `artist_normalize`, `encoding_repair`, `id3_upgrade` | Canonicalise artist names via alias table, fix mojibake encoding, upgrade ID3v1 to ID3v2.4 |
+
+**Worked examples:**
+
+- **Safe** — `whitespace`: artist tag `"Burial "` → `"Burial"` (trailing space removed)
+- **Moderate** — `fill_album_artist`: albumartist is empty, artist is `"Four Tet"` → albumartist set to `"Four Tet"`
+- **Destructive** — `artist_normalize`: artist `"aphex twin"` → `"Aphex Twin"` (from alias table)
+
+### The workflow
+
+```
+raagdosa-scanner scan ~/Music/Incoming    # 1. scan files, generate proposals
+raagdosa tags status                      # 2. see what was found
+raagdosa tags review --risk safe          # 3. review safe proposals first
+raagdosa tags apply --dry-run             # 4. preview what would be written
+raagdosa tags apply                       # 5. write accepted changes (with confirmation)
+raagdosa tags undo --last                 # 6. revert if needed
+```
+
+### Reviewing proposals
+
+`tags review` shows each proposal one at a time. You accept, reject, skip, or quit:
+
+```
+  Burial - Untrue (2007)/
+
+    [safe] whitespace              artist       0.99
+      File:   01 - Archangel.flac
+      Old:    "Burial "
+      New:    "Burial"
+      Why:    trailing whitespace
+
+      [a]ccept  [r]eject  [s]kip  [q]uit  > a
+      ✓ Accepted
+```
+
+**Filtering options:**
+
+```bash
+raagdosa tags review --risk safe          # only safe-tier proposals
+raagdosa tags review --risk moderate      # only moderate-tier
+raagdosa tags review --fix-type whitespace  # only one fix type
+raagdosa tags review --folder /path/to/album  # only one folder
+raagdosa tags review --include-protected  # include title and artist (normally excluded)
+```
+
+**Auto-accept:** `raagdosa tags review --auto` auto-accepts proposals in configured risk tiers above the confidence threshold. By default, auto-approve is disabled (`auto_approve_threshold: 1.0`). Lower it in `config.yaml` once you trust the scanner's output:
+
+```yaml
+tag_fix:
+  auto_approve_threshold: 0.95   # enable auto-accept for safe proposals above 0.95
+```
+
+### Protected fields
+
+Title and artist are excluded from bulk review and apply by default. These fields are too important to change accidentally — a wrong artist rename can cascade through your whole library.
+
+To review proposals that touch protected fields, use `--include-protected`:
+
+```bash
+raagdosa tags review --include-protected
+```
+
+Configure which fields are protected in `config.yaml`:
+
+```yaml
+tag_fix:
+  protected_fields:
+    - title
+    - artist
+```
+
+### Applying changes
+
+Always preview first:
+
+```bash
+raagdosa tags apply --dry-run
+```
+
+```
+  DRY  01 - Archangel.flac              artist       [safe] 'Burial ' → 'Burial'
+  DRY  02 - Near Dark.flac              artist       [safe] 'Burial ' → 'Burial'
+```
+
+When you're ready:
+
+```bash
+raagdosa tags apply
+```
+
+RaagDosa shows the count and asks for confirmation before writing anything. Every original value is snapshotted in the scanner database before the new value is written.
+
+**Batch limiting:** By default, only 50 proposals are applied per session. This keeps each session reviewable and undoable in manageable chunks. Change with `--max-batch` or in config:
+
+```yaml
+tag_fix:
+  max_batch_size: 50
+```
+
+### Undoing tag changes
+
+```bash
+raagdosa tags undo --last                 # revert the most recent apply session
+raagdosa tags undo --session <id>         # revert a specific session
+raagdosa tags undo                        # list recent sessions to pick from
+```
+
+Undo reads the snapshot table and writes the original values back. Proposals revert to "accepted" status so you can re-apply them if needed.
+
+### When to fix tags
+
+**Before importing into DJ software.** If you fix tags after importing tracks into Rekordbox, Serato, or Traktor, the DJ software may not pick up the changes — or worse, tag writes can interfere with embedded cue point data (especially in Serato, which stores cues in ID3 tags).
+
+The recommended order:
+1. Scan and organise folders (`raagdosa go`)
+2. Fix tags (`tags review` → `tags apply`)
+3. Import into your DJ software
+
+### Configuration reference
+
+The full `tag_fix:` section in `config.yaml`:
+
+```yaml
+tag_fix:
+  scanner_db: raagdosa_scanner.db         # path to scanner database
+  protected_fields:                        # fields excluded from bulk apply
+    - title
+    - artist
+  max_batch_size: 50                       # max proposals per apply session
+  auto_approve_risk_tiers:                 # risk tiers eligible for --auto
+    - safe
+  auto_approve_threshold: 1.0             # confidence required (1.0 = disabled)
+  enabled_fixes:                           # comment out any to skip
+    - noise_removal
+    - whitespace
+    - comment_cleanup
+    - original_mix_strip
+    - feat_normalize
+    - fill_album_artist
+    - bpm_extraction
+    - bpm_cleanup
+    - key_extraction
+    - key_prefix_strip
+    - genre_normalize
+    - fill_from_folder
+```
 
 ---
 
